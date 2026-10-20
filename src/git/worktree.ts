@@ -850,8 +850,9 @@ export async function removeWorktree(
   worktreePath: string,
   branch: string,
   o: { deleteBranch?: boolean; force?: boolean } = {},
-): Promise<void> {
+): Promise<{ branchKept: boolean }> {
   const root = await realpath(repoRoot);
+  let branchKept = false;
   await withRepoLock(root, async () => {
     const real = await realpathLoose(worktreePath);
     const all = await listWorktrees(root);
@@ -868,10 +869,14 @@ export async function removeWorktree(
       if (!branch.startsWith(BRANCH_PREFIX)) throw new Error(`refusing to delete non-conductor branch ${JSON.stringify(branch)}`);
       assertRev(branch, 'branch');
       if (await refExists(root, `refs/heads/${branch}`)) {
-        await gitOk(root, ['branch', o.force ? '-D' : '-d', '--', branch]);
+        const r = await git(root, ['branch', o.force ? '-D' : '-d', '--', branch]);
+        // git refuses to delete a branch that is not fully merged: that is the intended safety net (the work is kept), not a failure
+        if (r.code !== 0 && !/not fully merged/i.test(r.stderr + r.stdout)) throw new Error(`git branch ${o.force ? '-D' : '-d'} failed: ${(r.stderr || r.stdout).trim()}`);
+        branchKept = r.code !== 0;
       }
     }
   });
+  return { branchKept };
 }
 
 // ───────────────────────────── instruction-file ancestors ─────────────────────────────

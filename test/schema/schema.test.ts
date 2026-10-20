@@ -211,3 +211,30 @@ test('v2 refuses a v1 data folder in place (home marker) but accepts empty folde
   assert.doesNotThrow(() => assertHomeIsUsable(empty), 'a folder with the marker is fine even when it has content');
   process.env.CONDUCTOR_HOME = home;
 });
+
+test('review blocker: a read-only RunStore refuses EVERY mutator and changes nothing on disk', () => {
+  cpSync(join(FIX, 'runs'), paths.runs(), { recursive: true });
+  const f = join(paths.run('ENG-7'), 'run.json');
+  const before = readFileSync(f, 'utf8');
+  const ro = new RunStore(paths.runs(), { readOnly: true });
+  const run = ro.get('ENG-7')!;
+  const deny = (fn: () => unknown) => assert.throws(fn, (e: any) => e.code === 'read_only');
+  deny(() => ro.create({ ...run, key: 'ENG-99' }));
+  deny(() => ro.update('ENG-7', (r) => void (r.title = 'x')));
+  deny(() => ro.appendEvent('ENG-7', { agent: 'conductor', stage: 'engine', kind: 'note', text: 'x' }));
+  deny(() => ro.writeArtifact('ENG-7', 'x.json', {}));
+  deny(() => ro.writeText('ENG-7', 'x.md', 'x'));
+  deny(() => ro.ensureDir('ENG-8'));
+  assert.equal(readFileSync(f, 'utf8'), before, 'run.json untouched');
+  assert.deepEqual(readdirSync(paths.run('ENG-7')).sort(), ['run.json'], 'no stray files');
+  assert.equal(existsSync(paths.run('ENG-8')), false);
+  assert.equal(existsSync(paths.run('ENG-99')), false);
+});
+
+test('an empty v2 skeleton (logs/run/runs) is accepted; the same folder with a stray data file is not', () => {
+  const h = mkdtempSync(join(tmpdir(), 'cond-skel-'));
+  for (const d of ['logs', 'run', 'runs']) mkdirSync(join(h, d));
+  assert.doesNotThrow(() => assertHomeIsUsable(h));
+  writeFileSync(join(h, 'runs', 'X-1.json'), '{}');
+  assert.throws(() => assertHomeIsUsable(h), /conductor migrate/);
+});

@@ -194,17 +194,6 @@ test('board API: cards are created/commented/moved only through server-side auth
   assert.equal((await raw('/api/projects', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'ABC', name: 'x', repo: '../../etc' }) })).status, 400);
 });
 
-test('approve needs the plan revision: a missing or stale revision is refused, the current one approves', async () => {
-  const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
-  const created = await raw('/api/tasks', { method: 'POST', headers: mut(), body: JSON.stringify({ title: 'Needs approval', description: 'large', repo: 'demo-app' }) });
-  const key = JSON.parse(created.text).key;
-  void key;
-  const waiting = (await runs()).find((r) => r.canApprove);
-  if (!waiting) return; // the demo's first-plan gate may already be consumed — the E2E test below covers the approving path
-  assert.equal((await raw(`/api/runs/${waiting.key}/approve`, { method: 'POST', headers: mut(), body: '{}' })).status, 400, 'rev is required');
-  assert.equal((await raw(`/api/runs/${waiting.key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: waiting.rev + 5 }) })).status, 409, 'a stale rev is refused');
-});
-
 test('end-to-end through the API: first plan waits for approval → Approve → ready; New task works', async () => {
   const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
   const planReady = await waitFor(async () => (await runs()).find((r) => r.column === 'plan_ready'));
@@ -232,6 +221,19 @@ test('demo scenarios: the bug-fix loop and the blocked question both surface', a
   // DEMO-2 has a plan-approval gate only for the first plan (DEMO-1 consumed it) → it runs, fails verification once, fixes, passes
   const two = await waitFor(async () => (await runs()).find((r) => r.key === 'DEMO-2' && r.status === 'ready'), 60_000);
   assert.equal(two.loop, 2);
+});
+
+test('approve needs the plan revision: a missing or stale revision is refused, the current one approves', async () => {
+  const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
+  demo.rt.cfgRef.current.pipeline.planApproval = 'manual'; // force an approval gate regardless of what earlier tests consumed
+  const created = await raw('/api/tasks', { method: 'POST', headers: mut(), body: JSON.stringify({ title: 'Needs approval', description: 'x', repo: 'demo-app' }) });
+  const key = JSON.parse(created.text).key;
+  const waiting = await waitFor(async () => (await runs()).find((r) => r.key === key && r.canApprove), 40_000);
+  assert.equal((await raw(`/api/runs/${key}/approve`, { method: 'POST', headers: mut(), body: '{}' })).status, 400, 'rev is required');
+  assert.equal((await raw(`/api/runs/${key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: waiting.rev + 5 }) })).status, 409, 'a stale rev is refused');
+  assert.equal((await raw(`/api/runs/${key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: waiting.rev }) })).status, 200, 'the current rev approves');
+  assert.equal((await raw(`/api/runs/${key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: waiting.rev }) })).status, 409, 'a second approval is refused');
+  demo.rt.cfgRef.current.pipeline.planApproval = 'first';
 });
 
 test('logout revokes the session', async () => {

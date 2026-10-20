@@ -28,7 +28,17 @@ export const paths = {
 export function assertHomeIsUsable(home: string = paths.home()): void {
   if (!existsSync(home)) return;
   if (existsSync(join(home, 'home.json'))) return;
-  const entries = readdirSync(home).filter((n) => !n.startsWith('.'));
+  // an empty skeleton of v2's own folders (what earlier builds created before the marker existed) is not v1 data
+  const SKELETON = new Set(['logs', 'run', 'runs', 'board', 'providers', 'projects']);
+  const entries = readdirSync(home).filter((n) => {
+    if (n.startsWith('.')) return false;
+    if (!SKELETON.has(n)) return true;
+    try {
+      return readdirSync(join(home, n)).length > 0;
+    } catch {
+      return true;
+    }
+  });
   if (entries.length === 0) return;
   throw new Error(`${home} contains data from Conductor v1 (or another tool), not a v2 data folder. v2 never modifies it in place — run "conductor migrate" to import it side-by-side, or point CONDUCTOR_HOME at an empty folder.`);
 }

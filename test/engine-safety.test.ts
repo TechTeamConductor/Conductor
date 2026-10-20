@@ -250,3 +250,41 @@ test('baseline masking: a gate already failing at baseline cannot hide new failu
   }
 });
 void mkdirSync; void makeRepo;
+
+test('a REAL storage failure (the journal cannot be written) keeps every effect pending, raises the banner, and a restart applies each exactly once', async () => {
+  const clock = new TestClock();
+  let failing = false;
+  const h = await makeHarness({ clock, board: { fault: (p: string) => { if (failing && p === 'journal:before-fsync') throw new Error('EIO: i/o error'); } } });
+  try {
+    const key = h.issue('Disk trouble');
+    await h.engine.tick(); // claimed while the disk is fine
+    failing = true;
+    await h.settle(); // the pipeline completes locally; every board write now fails with storage_failed (a real BoardError)
+    assert.equal(h.run(key).status, 'ready');
+    const pending = h.engine.effects.pendingCount(key);
+    assert.ok(pending > 0, 'the narration and the lane projection are still pending — none was dropped as "permanent"');
+    clock.advance(30_000);
+    await h.engine.tick();
+    assert.match(h.engine.status().storageProblem ?? '', /could not be written/, 'the dashboard banner is raised');
+    assert.ok(h.engine.effects.pendingCount(key) >= pending, 'still pending after a retry');
+
+    // restart: a new board instance on the same folder + a new engine on the same run store
+    h.board.close();
+    failing = false;
+    const { Board } = await import('../src/board/index.ts');
+    const { Engine } = await import('../src/pipeline/engine.ts');
+    const board2 = Board.open({ dir: join(h.home, 'board') });
+    const e2 = new Engine({ getConfig: () => h.cfg, store: h.store, board: board2, agents: h.agents, notify: () => undefined, persistent: { load: () => ({ repos: {} }), save: () => undefined } });
+    await e2.tick();
+    assert.equal(e2.effects.pendingCount(key), 0);
+    assert.equal(board2.item(key)!.lane, 'review');
+    const bodies = board2.comments(key).map((c) => c.body);
+    assert.equal(bodies.filter((b) => b.includes('Ready for review')).length, 1, 'applied exactly once');
+    assert.equal(bodies.filter((b) => b.includes('Conductor plan')).length, 1);
+    await e2.tick();
+    assert.equal(board2.comments(key).length, bodies.length, 'a further pass adds nothing');
+    board2.close();
+  } finally {
+    await h.cleanup();
+  }
+});

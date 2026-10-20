@@ -52,6 +52,10 @@ export class RunStore {
     if (!this.readOnly) mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
+  private writable(): void {
+    if (this.readOnly) throw new RunStoreError('read_only', 'This run store was opened read-only.');
+  }
+
   static validKey(key: string): boolean {
     return KEY_RE.test(key);
   }
@@ -79,6 +83,7 @@ export class RunStore {
 
   /** Atomically claims a key: throws RunStoreError('exists') if a run already exists. */
   create(run: Run): void {
+    this.writable();
     const dir = this.dir(run.key);
     try {
       mkdirSync(dir, { recursive: false, mode: 0o700 }); // EEXIST = already claimed
@@ -137,6 +142,7 @@ export class RunStore {
 
   /** Synchronous read-modify-write. `fn` may mutate the run in place. */
   update(key: string, fn: (run: Run) => void): Run {
+    this.writable();
     const cur = this.get(key);
     if (!cur) throw new RunStoreError('missing', `run ${key} not found`);
     fn(cur);
@@ -190,6 +196,7 @@ export class RunStore {
   }
 
   appendEvent(key: string, ev: Omit<LogEvent, 'seq' | 'ts'> & { ts?: number }): LogEvent {
+    this.writable();
     const full: LogEvent = { ...ev, ts: ev.ts ?? Date.now(), seq: this.nextSeq(key) };
     const f = this.eventsFile(key);
     try {
@@ -227,6 +234,7 @@ export class RunStore {
 
   // ───────────── artifacts (plan, verdicts, gates, …) ─────────────
   writeArtifact(key: string, name: string, data: unknown): void {
+    this.writable();
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(name)) throw new RunStoreError('bad_name', 'bad artifact name');
     const body = typeof data === 'string' ? data : JSON.stringify(data, null, 2) + '\n';
     atomicWriteFile(join(this.dir(key), name), body, 0o600);
@@ -251,12 +259,14 @@ export class RunStore {
   }
   /** Touch helper for tests/doctor: ensure a key directory exists. */
   ensureDir(key: string): string {
+    this.writable();
     const d = this.dir(key);
     mkdirSync(d, { recursive: true, mode: 0o700 });
     return d;
   }
   /** Write a raw text artifact (prompts etc.) without JSON encoding. */
   writeText(key: string, name: string, text: string): void {
+    this.writable();
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(name)) throw new RunStoreError('bad_name', 'bad artifact name');
     mkdirSync(this.dir(key), { recursive: true, mode: 0o700 });
     writeFileSync(join(this.dir(key), name), text, { mode: 0o600 });

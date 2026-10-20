@@ -64,7 +64,8 @@ function safeDecode(s: string): string {
 function boardStatus(code: string): number {
   if (code === 'not_found') return 404;
   if (code.startsWith('forbidden')) return 403;
-  if (code === 'exists' || code === 'cycle' || code === 'archived' || code === 'read_only') return 409;
+  if (code === 'storage_failed' || code === 'closed') return 503;
+  if (code === 'exists' || code === 'cycle' || code === 'archived' || code === 'read_only' || code === 'full') return 409;
   return 400;
 }
 
@@ -172,7 +173,7 @@ export class Api {
 
   /** Everything the board view needs: projects + top-level items (children are fetched with the item). */
   boardView(): { projects: ReturnType<Board['projects']>; items: ReturnType<Board['items']>; milestones: ReturnType<Board['milestones']> } {
-    return { projects: this.d.board.projects(), items: this.d.board.items().slice(0, 2000), milestones: this.d.board.milestones() };
+    return { projects: this.d.board.projects(), items: this.d.board.items().slice(-2000), milestones: this.d.board.milestones() };
   }
 
   itemView(key: string) {

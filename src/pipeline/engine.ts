@@ -578,9 +578,10 @@ export class Engine {
     if (!(HUMAN_MOVES as readonly string[]).includes(lane)) {
       throw new EngineError('bad_lane', `You can move cards to ${HUMAN_MOVES.join(', ')} only — Conductor owns the other lanes.`);
     }
-    const run = this.d.store.get(key);
+    const asked = this.board.item(key); // accept a key or an id; the run is always looked up by the card's KEY
+    const run = this.d.store.get(asked?.key ?? key);
     if (!run) {
-      const item = this.board.item(key);
+      const item = asked;
       if (!item) throw new EngineError('missing', 'Unknown card.');
       try {
         this.board.user.moveLane(item.id, lane);
@@ -591,6 +592,7 @@ export class Engine {
       this.tickSoon();
       return;
     }
+    key = run.key;
     const s = run.status;
     switch (lane as HumanMove) {
       case 'backlog':
@@ -702,10 +704,10 @@ export class Engine {
     if (!['ready', 'finished', 'aborted'].includes(run.status)) throw new EngineError('bad_state', 'Only finished runs can be cleaned up.');
     const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
     if (repo && run.worktree) {
-      await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: true }); // git refuses unless fully merged
+      const { branchKept } = await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: true }); // git refuses to delete an unmerged branch: the work is kept
       this.d.store.update(key, (r) => {
         r.worktree = '';
-        r.history.push({ ts: this.clock.now(), text: 'Worktree removed (branch kept)' });
+        r.history.push({ ts: this.clock.now(), text: branchKept ? 'Worktree removed (the branch is kept: it is not merged yet)' : 'Worktree removed (merged branch deleted)' });
       });
     }
   }

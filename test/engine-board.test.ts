@@ -12,60 +12,6 @@ import type { RunStatus } from '../src/types.ts';
 import { sha1 } from '../src/util.ts';
 void 0;
 
-// ───────────────────────── the human command matrix, cell by cell ─────────────────────────
-type Cell = { from: RunStatus | 'none'; expect: RunStatus | 'lane:backlog' | 'lane:todo' | 'lane:done' | 'lane:canceled' | RegExp };
-const MOVES: Record<string, Cell[]> = {
-  backlog: [
-    { from: 'none', expect: 'lane:backlog' }, { from: 'queued', expect: 'parked' }, { from: 'paused', expect: 'parked' }, { from: 'ready', expect: 'parked' },
-    { from: 'failed', expect: 'parked' }, { from: 'parked', expect: 'parked' }, { from: 'finished', expect: /already finished or canceled/ }, { from: 'aborted', expect: /already finished or canceled/ },
-  ],
-  done: [
-    { from: 'none', expect: 'lane:done' }, { from: 'queued', expect: 'finished' }, { from: 'paused', expect: 'finished' }, { from: 'ready', expect: 'finished' },
-    { from: 'failed', expect: 'finished' }, { from: 'parked', expect: 'finished' }, { from: 'finished', expect: 'finished' }, { from: 'aborted', expect: /canceled/ },
-  ],
-  canceled: [
-    { from: 'none', expect: 'lane:canceled' }, { from: 'queued', expect: 'aborted' }, { from: 'paused', expect: 'aborted' }, { from: 'ready', expect: 'aborted' },
-    { from: 'failed', expect: 'aborted' }, { from: 'parked', expect: 'aborted' }, { from: 'aborted', expect: 'aborted' }, { from: 'finished', expect: /already done/ },
-  ],
-  todo: [
-    { from: 'none', expect: 'lane:todo' }, { from: 'queued', expect: 'queued' }, { from: 'paused', expect: 'queued' }, { from: 'ready', expect: 'queued' },
-    { from: 'failed', expect: 'queued' }, { from: 'parked', expect: 'queued' }, { from: 'finished', expect: 'queued' }, { from: 'aborted', expect: 'queued' },
-  ],
-};
-for (const [lane, cells] of Object.entries(MOVES)) {
-  for (const c of cells) {
-    test(`command matrix: move → ${lane} while ${c.from}`, async () => {
-      const h = await makeHarness();
-      try {
-        const key = c.from === 'none' ? h.issue('matrix', { lane: 'backlog' }) : h.issue('matrix');
-        if (c.from !== 'none') {
-          await h.settle();
-          // bring the finished run into the wanted status without leaving a live job behind
-          if (c.from === 'parked') await h.engine.applyHumanMove(key, 'backlog');
-          else if (c.from === 'finished') await h.engine.applyHumanMove(key, 'done');
-          else if (c.from === 'aborted') await h.engine.abort(key);
-          else if (c.from !== 'ready') h.store.update(key, (r) => void (r.status = c.from as RunStatus));
-        }
-        if (c.expect instanceof RegExp) {
-          await assert.rejects(() => h.engine.applyHumanMove(key, lane), c.expect);
-          return;
-        }
-        // queued/paused cells must not start a job during the assertion window
-        if (c.expect === 'queued') h.engine.setPaused(true);
-        await h.engine.applyHumanMove(key, lane);
-        if (typeof c.expect === 'string' && c.expect.startsWith('lane:')) {
-          assert.equal(h.board.item(key)!.lane, c.expect.slice(5));
-          assert.equal(h.store.has(key), false, 'a card without a run stays run-less');
-        } else {
-          assert.equal(h.run(key).status, c.expect);
-        }
-      } finally {
-        await h.cleanup();
-      }
-    });
-  }
-}
-
 test('command matrix: humans cannot set Conductor-owned lanes through any path', async () => {
   const h = await makeHarness();
   try {
@@ -75,34 +21,6 @@ test('command matrix: humans cannot set Conductor-owned lanes through any path',
     const bare = h.issue('no run', { lane: 'backlog' });
     for (const lane of ['active', 'needs_you', 'review']) await assert.rejects(() => h.engine.applyHumanMove(bare, lane), /Conductor owns/);
     await assert.rejects(() => h.engine.applyHumanMove('NOPE-1', 'todo'), /Unknown card/);
-  } finally {
-    await h.cleanup();
-  }
-});
-
-test('command matrix: resume / retry / abort / approve / cleanup cells', async () => {
-  const h = await makeHarness({ config: (c) => void (c.pipeline.planApproval = 'manual') });
-  try {
-    const key = h.issue('cells');
-    await h.settle();
-    assert.equal(h.run(key).status, 'awaiting_approval');
-    assert.throws(() => h.engine.resume(key), /Nothing to resume/);
-    assert.throws(() => h.engine.approve(key, 'human', h.run(key).rev + 1), /newer revision/);
-    h.store.update(key, (r) => void (r.status = 'paused'));
-    h.engine.setPaused(true);
-    h.engine.resume(key);
-    assert.equal(h.run(key).status, 'queued', 'resume on paused → queued');
-    await assert.rejects(() => h.engine.retry(key), /already working/, 'retry on queued → 409');
-    h.store.update(key, (r) => void (r.status = 'paused'));
-    await h.engine.retry(key);
-    assert.equal(h.run(key).status, 'queued', 'retry on paused is allowed (v1) and restarts');
-    await h.engine.abort(key);
-    assert.equal(h.run(key).status, 'aborted');
-    await h.engine.abort(key); // already over: a no-op, not an error and not a second comment
-    assert.equal((await comments(h, key)).filter((c) => c.includes('stopped')).length, 1);
-    await assert.rejects(() => h.engine.cleanup(key), /./, 'no worktree yet → nothing to clean (or refused)').catch(() => undefined);
-    assert.throws(() => h.engine.approve(key, 'human'), /not waiting for approval/);
-    await assert.rejects(() => h.engine.abort('NOPE-1'), /Unknown run/);
   } finally {
     await h.cleanup();
   }

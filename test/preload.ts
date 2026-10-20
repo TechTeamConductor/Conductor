@@ -5,5 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const base = mkdtempSync(join(tmpdir(), 'cond-suite-'));
-process.env.CONDUCTOR_HOME ||= join(base, 'home');
-process.env.CONDUCTOR_BACKUP_DIR ||= join(base, 'backups');
+// ALWAYS overridden: a CONDUCTOR_HOME exported in the developer's shell must never leak into the suite (review N8)
+process.env.CONDUCTOR_HOME = join(base, 'home');
+process.env.CONDUCTOR_BACKUP_DIR = join(base, 'backups');

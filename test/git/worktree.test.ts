@@ -965,7 +965,7 @@ describe('removeWorktree', () => {
     assert.equal((await listWorktrees(r.dir)).length, 1);
   });
 
-  it('deleteBranch removes a fully merged branch; refuses an unmerged one unless force', async () => {
+  it('deleteBranch removes a fully merged branch; keeps an unmerged one (reported) unless force', async () => {
     const r = makeRepo();
     const merged = await mkWt(r, 'ENG-1');
     await removeWorktree(r.dir, merged.path, merged.branch, { deleteBranch: true });
@@ -973,7 +973,9 @@ describe('removeWorktree', () => {
 
     const unmerged = await mkWt(r, 'ENG-2');
     await commitAllIn(unmerged.path, 'unmerged work', { 'w.txt': 'w' });
-    await assert.rejects(removeWorktree(r.dir, unmerged.path, unmerged.branch, { deleteBranch: true }), /not fully merged|failed/);
+    // an unmerged branch is KEPT (the work is the point) — reported, not thrown, and the worktree is gone either way
+    assert.deepEqual(await removeWorktree(r.dir, unmerged.path, unmerged.branch, { deleteBranch: true }), { branchKept: true });
+    assert.equal(existsSync(unmerged.path), false);
     assert.equal(sgTry(r.dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${unmerged.branch}`]).code, 0, 'unmerged branch kept');
     await removeWorktree(r.dir, unmerged.path, unmerged.branch, { deleteBranch: true, force: true });
     assert.notEqual(sgTry(r.dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${unmerged.branch}`]).code, 0);

@@ -11,6 +11,8 @@ const log = logger('effects');
 const COMMENT_LIMIT = 30_000;
 /** An effect still failing this long after its first failure is reported as a storage problem (a brief hiccup is not). */
 const STUCK_MS = 15_000;
+/** BoardError codes that no amount of retrying fixes. Everything else (storage_failed, closed, read_only, full, raw I/O errors) is transient. */
+const PERMANENT = new Set(['not_found', 'bad_input', 'too_long', 'bad_key', 'bad_parent', 'bad_dependency', 'archived', 'cycle', 'too_deep', 'too_many', 'exists', 'forbidden', 'forbidden_lane']);
 
 /** Agent-written text is untrusted: no remote images (tracking/exfil) in rendered markdown. */
 function neutralise(s: string): string {
@@ -190,7 +192,9 @@ export class Effects {
       });
     } catch (e) {
       const msg = redact(errMsg(e), this.deps.secrets(run));
-      const permanent = e instanceof BoardError && e.code !== 'read_only'; // e.g. the target item vanished: retrying cannot succeed
+      // Only errors that retrying can never fix are permanent (the target card vanished, the text is invalid). Storage failures —
+      // a failed/closed/read-only board, a full board, any I/O error — are transient: the effect stays pending and is surfaced (K3).
+      const permanent = e instanceof BoardError && PERMANENT.has(e.code);
       log.warn(`${key} effect ${effKey} failed${permanent ? ' (giving up)' : ''}: ${msg}`);
       this.deps.store.update(key, (r) => {
         const x = r.effects[effKey];
