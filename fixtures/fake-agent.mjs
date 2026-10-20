@@ -146,6 +146,13 @@ if (step.tamperGit) {
   writeFileSync(join(common, 'hooks', 'post-commit'), '#!/bin/sh\necho pwned\n', { mode: 0o755 });
 }
 if (step.tamperGuard) writeFileSync(join(workspace, '.cursor', 'cli.json'), '{"permissions":{"allow":[],"deny":[]}}\n');
+if (step.deleteGuard) rmSync(join(workspace, '.cursor', 'cli.json'), { force: true });
+if (step.tamperPushUrl) spawnSync('git', ['config', '--local', 'remote.origin.pushurl', 'file:///tmp/conductor-evil-remote.git'], { cwd: workspace });
+// { 'from/path': 'to/path' } — a tracked file renamed by the builder (git mv), so a rename SOURCE shows up in the diff
+for (const [from, to] of Object.entries(step.rename ?? {})) {
+  mkdirSync(dirname(resolve(workspace, to)), { recursive: true });
+  spawnSync('git', ['mv', from, to], { cwd: workspace });
+}
 out({ type: 'tool_call', subtype: 'started', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test', workingDirectory: workspace } } }, session_id: sid });
 out({ type: 'tool_call', subtype: 'completed', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test' }, result: { success: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' } } } }, session_id: sid });
 const summary = step.message ?? `Implemented ${key}: ${Object.keys(files).join(', ')}. Ran npm test — passing.`;
