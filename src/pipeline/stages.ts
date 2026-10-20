@@ -1,0 +1,901 @@
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type {
+  AgentName, AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, LinearIssue, NextStep, Plan,
+  PlanReview, RepoConfig, Run, SessionRec, StageName, Verdict,
+} from '../types.ts';
+import type { EmitEvent } from '../agents/claude.ts';
+import type { Schema } from '../agents/json.ts';
+import { validateSchema } from '../agents/json.ts';
+import { toolEnv } from '../agents/env.ts';
+import { redact } from '../redact.ts';
+import { errMsg, fmtDuration, sha1, sha256, truncate } from '../util.ts';
+import { logger } from '../log.ts';
+import * as W from '../git/worktree.ts';
+import * as G from '../git/gates.ts';
+import { gitOk } from '../git/exec.ts';
+import { attributeDescription, attributeTrigger, findTriggerLabelOnIssue, viewerComments } from '../linear/attribution.ts';
+import { BUG_LABEL, type StageKey } from '../linear/names.ts';
+import type { PipelineCtx } from './context.ts';
+import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
+import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
+
+const log = logger('stages');
+const PROTECTED = '.claude/**, .cursor/**, .mcp.json, AGENTS.md, CLAUDE.md, GEMINI.md, .github/**, .husky/**, .git*, .techteam/**, .conductor/**';
+
+type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
+type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: AgentName } | { kind: 'stop' };
+
+export function normalizeTitle(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim();
+}
+export function bugFingerprint(b: Pick<Bug, 'title' | 'file'>): string {
+  return sha1(`${normalizeTitle(b.title)}|${(b.file ?? '').toLowerCase()}`).slice(0, 16);
+}
+
+function readConventions(root: string): { name: string; text: string }[] {
+  const out: { name: string; text: string }[] = [];
+  for (const name of ['CLAUDE.md', 'AGENTS.md']) {
+    const p = join(root, name);
+    try {
+      if (!existsSync(p)) continue;
+      const st = lstatSync(p);
+      if (!st.isFile() || st.size > 256 * 1024) continue; // never follow symlinks out of the worktree
+      out.push({ name, text: readFileSync(p, 'utf8').slice(0, 16_000) });
+    } catch {
+      /* unreadable: skip */
+    }
+  }
+  return out;
+}
+
+export class Stages {
+  private c: PipelineCtx;
+  constructor(ctx: PipelineCtx) {
+    this.c = ctx;
+  }
+
+  // ───────────────────────── helpers ─────────────────────────
+  private run(key: string): Run {
+    const r = this.c.store.get(key);
+    if (!r) throw new Error(`run ${key} vanished`);
+    return r;
+  }
+  private repo(run: Run): RepoConfig {
+    const r = this.c.cfg().repos.find((x) => x.name === run.repo);
+    if (!r) throw new Error(`repository "${run.repo}" is not registered any more`);
+    return r;
+  }
+  private patch(key: string, fn: (r: Run) => void): Run {
+    return this.c.store.update(key, fn);
+  }
+  private note(key: string, stage: StageName | 'engine', text: string): void {
+    this.c.emit(key, { agent: 'conductor', stage, kind: 'note', text });
+  }
+
+  /** Move the issue to the stage's Linear representation (labels mode or states mode). */
+  async applyStage(key: string, stage: StageKey): Promise<void> {
+    try {
+      const prov = await this.c.prov();
+      const cfg = this.c.cfg();
+      if (cfg.linear.mode === 'states' && prov.stageStateIds) {
+        await this.c.effects.state(key, 'state', { stateId: prov.stageStateIds[stage] }, stage);
+        return;
+      }
+      const stateId = stage === 'ready' && prov.inReviewStateId ? prov.inReviewStateId : prov.inProgressStateId;
+      const add = prov.stageLabelIds[stage];
+      const remove = Object.entries(prov.stageLabelIds).filter(([k]) => k !== stage).map(([, v]) => v);
+      await this.c.effects.state(key, 'state', { stateId, addLabelIds: [add], removeLabelIds: remove }, stage);
+    } catch (e) {
+      log.warn(`${key}: could not update Linear stage "${stage}": ${errMsg(e)}`);
+    }
+  }
+
+  async toNeedsHuman(key: string, reason: string, origin: NextStep, comment?: string): Promise<void> {
+    const now = this.c.clock.now();
+    const run = this.patch(key, (r) => {
+      r.status = 'needs_human';
+      r.needsHuman = { reason: truncate(reason, 600), origin, at: now };
+      r.next = 'none';
+      r.history.push({ ts: now, text: `Needs you: ${truncate(reason, 200)}` });
+    });
+    this.c.emit(key, { agent: 'conductor', stage: run.stage ?? 'engine', kind: 'error', text: `Needs human: ${reason}` });
+    await this.applyStage(key, 'needs_human');
+    await this.c.effects.comment(
+      key,
+      `needs:${now}`,
+      `🤖 **Conductor needs you**\n\n${comment ?? reason}\n\n_To retry: move this issue back to **Todo** (or use Retry in the dashboard). Anything you add as a comment is included in the next attempt._`,
+    );
+    this.c.notify(`${key} needs you`, truncate(reason, 160));
+  }
+
+  async pauseForLimit(key: string, limit: LimitInfo): Promise<void> {
+    const now = this.c.clock.now();
+    const until = limit.resetsAt && limit.resetsAt > now ? limit.resetsAt : now + (limit.provider === 'claude' ? 30 : 15) * 60_000;
+    this.c.providerPause(limit.provider, until, limit.message);
+    this.patch(key, (r) => {
+      r.status = 'paused';
+      r.pausedUntil = until;
+      r.pauseReason = truncate(limit.message, 300);
+      r.history.push({ ts: now, text: `Paused: ${limit.provider} usage limit — resuming automatically` });
+    });
+    this.c.emit(key, { agent: limit.provider, stage: this.run(key).stage ?? 'engine', kind: 'error', text: `Usage limit reached — paused until ${new Date(until).toLocaleString()}` });
+    await this.c.effects.comment(
+      key,
+      `pause:${until}`,
+      `🤖 **Paused — ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} usage limit reached.** Conductor will resume automatically after ${new Date(until).toLocaleString()}. Nothing is lost.`,
+    );
+    this.c.notify('Usage limit reached', `${limit.provider} — Conductor resumes automatically`);
+  }
+
+  private recordSession(key: string, rec: Omit<SessionRec, 'status'> & { status?: SessionRec['status'] }): void {
+    this.patch(key, (r) => {
+      if (!r.sessions.some((s) => s.id === rec.id)) r.sessions.push({ status: 'running', ...rec });
+    });
+  }
+  private finishSession(key: string, res: AgentResult): void {
+    if (!res.sessionId) return;
+    const status: SessionRec['status'] = res.ok ? 'ok' : res.errorKind === 'limit' ? 'limit' : res.errorKind === 'aborted' ? 'aborted' : res.errorKind?.startsWith('timeout') ? 'timeout' : 'error';
+    this.patch(key, (r) => {
+      const s = r.sessions.find((x) => x.id === res.sessionId);
+      if (s) {
+        s.status = status;
+        s.endedAt = this.c.clock.now();
+        s.costUsd = res.costUsd;
+        s.model = res.model ?? s.model;
+        s.cliVersion = res.cliVersion ?? s.cliVersion;
+      }
+      if (typeof res.costUsd === 'number') r.costUsd += res.costUsd;
+    });
+  }
+  private emitter(key: string, stage: StageName, loop: number, rev: number): (ev: EmitEvent) => void {
+    return (ev) => {
+      this.c.emit(key, ev);
+      if (ev.sessionId && ev.agent !== 'conductor') {
+        this.recordSession(key, { id: ev.sessionId, agent: ev.agent, stage, loop, rev, startedAt: this.c.clock.now() });
+      }
+    };
+  }
+
+  /** Every stage start re-checks that the issue is still the one the viewer asked for (description/attribution). */
+  private async integrity(run: Run): Promise<{ issue: LinearIssue | null; problem: string | null }> {
+    let issue: LinearIssue;
+    try {
+      issue = await this.c.linear().issue(run.issueId);
+    } catch (e) {
+      log.warn(`${run.key}: integrity check skipped (Linear unreachable): ${errMsg(e)}`);
+      return { issue: null, problem: null };
+    }
+    if (sha1(issue.description ?? '') !== run.descHash) {
+      return { issue, problem: 'The issue description changed after Conductor claimed it. Move the issue back to Todo to re-plan with the new text.' };
+    }
+    if (run.assignedPickup) return { issue, problem: null };
+    try {
+      const prov = await this.c.prov();
+      const triggerId = findTriggerLabelOnIssue(issue, this.c.cfg().linear.triggerLabel)?.id ?? prov.triggerLabelId;
+      const a = attributeTrigger(issue, triggerId, this.c.viewerId());
+      if (!a.ok) return { issue, problem: a.reason ?? 'trigger label attribution failed' };
+      const d = attributeDescription(issue, this.c.viewerId());
+      if (!d.ok) return { issue, problem: d.reason ?? 'description attribution failed' };
+    } catch {
+      /* provisioning lookup failed: not an integrity problem */
+    }
+    return { issue, problem: null };
+  }
+
+  /**
+   * One read-only agent call with validation, one corrective retry, hang/max-turn retry, limit pausing and
+   * the per-issue agent-run cap. Returns {kind:'stop'} after it has already moved the run to paused/needs_human/aborted.
+   */
+  private async callReadOnly(
+    key: string,
+    stage: ReadOnlyStage,
+    prompt: string,
+    schema: Schema,
+    cwd: string,
+    validate: (json: unknown) => string[],
+  ): Promise<Called> {
+    let corrective = '';
+    let retried = false;
+    let turnsFactor = 1;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const run = this.run(key);
+      if (this.c.signal(key).aborted) return { kind: 'stop' };
+      if (run.agentRuns >= this.c.cfg().pipeline.maxAgentRunsPerIssue) {
+        await this.toNeedsHuman(key, `This issue has used its limit of ${this.c.cfg().pipeline.maxAgentRunsPerIssue} agent runs. Review the work so far, then move it back to Todo to continue.`, run.next);
+        return { kind: 'stop' };
+      }
+      this.patch(key, (r) => {
+        r.agentRuns += 1;
+      });
+      const cfg = this.c.cfg();
+      const stageCfg = stage === 'plan' ? cfg.stages.plan : stage === 'plan_review' ? cfg.stages.review : cfg.stages.verify;
+      const forced: AgentName | undefined = stageCfg === 'claude' && this.c.pausedUntil('claude') && cfg.pipeline.onClaudeLimit === 'cursor' ? 'cursor' : undefined;
+      const res = await this.c.agents.readOnly({
+        stage,
+        cwd,
+        prompt: prompt + corrective,
+        schema,
+        name: `conductor ${key} ${stage}`,
+        onEvent: this.emitter(key, stage, run.loop, run.rev),
+        signal: this.c.signal(key),
+        secrets: this.c.secretsFor(run),
+        agent: forced,
+        maxTurnsFactor: turnsFactor,
+      });
+      this.finishSession(key, res);
+      if (res.quota) this.c.recordQuota(res.agent, res.quota);
+      this.writePromptAudit(key, `${stage}-${run.loop}-${attempt}`, prompt + corrective);
+      if (res.ok) {
+        const errs = validate(res.json);
+        if (!errs.length) return { kind: 'ok', json: res.json, result: res, agent: res.agent };
+        if (!retried) {
+          retried = true;
+          corrective = `\n\n## Your previous reply was rejected\nIt did not match the required format:\n${errs.slice(0, 8).map((e) => `- ${e}`).join('\n')}\nReturn a corrected JSON object.`;
+          this.note(key, stage, `Reply failed validation (${errs[0]}) — asking once more.`);
+          continue;
+        }
+        await this.toNeedsHuman(key, `The ${res.agent} reply kept failing validation: ${errs[0]}`, run.next);
+        return { kind: 'stop' };
+      }
+      switch (res.errorKind) {
+        case 'limit':
+          await this.pauseForLimit(key, res.limit ?? { provider: res.agent, resetsAt: null, message: res.error ?? 'limit' });
+          return { kind: 'stop' };
+        case 'aborted':
+          return { kind: 'stop' };
+        case 'isolation':
+        case 'spawn':
+          await this.toNeedsHuman(key, res.error ?? 'agent could not start', run.next);
+          return { kind: 'stop' };
+        case 'max_turns':
+          if (!retried) {
+            retried = true;
+            turnsFactor = 1.5;
+            this.note(key, stage, 'Hit the turn cap — retrying once with a higher cap.');
+            continue;
+          }
+          await this.toNeedsHuman(key, 'The agent ran out of turns twice. The task may be too large — consider splitting the issue.', run.next);
+          return { kind: 'stop' };
+        case 'parse':
+          if (!retried) {
+            retried = true;
+            corrective = '\n\n## Your previous reply was rejected\nNo JSON object could be found. Reply with ONLY the fenced ```json block.';
+            continue;
+          }
+          await this.toNeedsHuman(key, res.error ?? 'could not parse the agent reply', run.next);
+          return { kind: 'stop' };
+        default: // timeouts and generic agent errors: one more attempt, then a human
+          if (!retried) {
+            retried = true;
+            this.note(key, stage, `${res.agent} failed (${truncate(res.error ?? '', 160)}) — retrying once.`);
+            continue;
+          }
+          await this.toNeedsHuman(key, `${res.agent} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, run.next);
+          return { kind: 'stop' };
+      }
+    }
+    await this.toNeedsHuman(key, 'The agent could not produce a valid reply.', this.run(key).next);
+    return { kind: 'stop' };
+  }
+
+  private writePromptAudit(key: string, name: string, text: string): void {
+    try {
+      this.c.store.writeText(key, `prompt-${name}.md`, redact(text, this.c.secretsFor(this.run(key))));
+    } catch {
+      /* audit only */
+    }
+  }
+
+  // ───────────────────────── workspace ─────────────────────────
+  /** Create/reuse the worktree, install deps, record the baseline gate run (once). */
+  private async ensureWorkspace(key: string): Promise<boolean> {
+    let run = this.run(key);
+    const repo = this.repo(run);
+    const cfg = this.c.cfg();
+    if (!run.worktree || !existsSync(run.worktree)) {
+      this.note(key, 'plan', `Creating isolated worktree for ${repo.name}…`);
+      const wt = await W.createWorktree({ repo, key: run.key, worktreeRoot: cfg.worktreeRoot });
+      run = this.patch(key, (r) => {
+        r.worktree = wt.path;
+        r.branch = wt.branch;
+        r.baseSha = r.baseSha || wt.baseSha;
+      });
+      const anc = await W.scanAncestors(wt.path);
+      if (anc.length) this.note(key, 'plan', `Heads-up: instruction files exist above the worktree and may be read by Cursor: ${anc.slice(0, 3).join(', ')}`);
+    }
+    // dependencies
+    const lock = await W.lockfileHash(run.worktree);
+    if (run.lockfileHash !== lock) {
+      this.note(key, 'plan', 'Installing dependencies…');
+      const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
+      if (!inst.ok) {
+        if (this.c.signal(key).aborted) return false;
+        await this.toNeedsHuman(key, `Installing dependencies failed in the worktree. Fix the repo's setup command, then move the issue back to Todo.\n\n\`\`\`\n${truncate(inst.output.slice(-1500), 1500)}\n\`\`\``, 'plan');
+        return false;
+      }
+      this.patch(key, (r) => {
+        r.lockfileHash = lock;
+      });
+    }
+    // baseline gates (once per run)
+    if (!this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null) && repo.gates.length) {
+      this.note(key, 'plan', `Running baseline quality gates (${repo.gates.map((g) => g.name).join(', ')})…`);
+      const base = await this.runAllGates(key, repo, repo.gates);
+      if (this.c.signal(key).aborted) return false;
+      this.c.store.writeArtifact(key, 'baseline.json', base);
+    }
+    return true;
+  }
+
+  private async runAllGates(key: string, repo: RepoConfig, defs: GateDef[]): Promise<GateRun> {
+    const run = this.run(key);
+    const o = { cwd: run.worktree, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) };
+    const results: GateResult[] = [];
+    for (const def of defs) {
+      let r = await G.runGate(def, o);
+      if (r.exitCode !== 0 && !this.c.signal(key).aborted) r = await G.rerunFlaky(def, o, r); // flake guard
+      results.push(r);
+      this.c.emit(key, { agent: 'conductor', stage: 'verify', kind: 'note', ok: r.exitCode === 0, text: `gate ${def.name}: ${r.exitCode === 0 ? 'pass' : r.timedOut ? 'timeout' : `fail (${r.failureCount ?? '?'} failure${r.failureCount === 1 ? '' : 's'})`}` });
+    }
+    let sha = '';
+    try {
+      sha = await gitOk(run.worktree, ['rev-parse', 'HEAD']);
+    } catch {
+      /* ignore */
+    }
+    return { at: this.c.clock.now(), sha, results };
+  }
+
+  // ───────────────────────── PLAN ─────────────────────────
+  async plan(key: string): Promise<void> {
+    let run = this.run(key);
+    this.patch(key, (r) => {
+      r.stage = 'plan';
+      r.stageStartedAt = this.c.clock.now();
+    });
+    await this.applyStage(key, 'planning');
+    if (!(await this.ensureWorkspace(key))) return;
+    run = this.run(key);
+    const { issue, problem } = await this.integrity(run);
+    if (problem) return this.toNeedsHuman(key, problem, 'plan');
+    const repo = this.repo(run);
+    const comments = issue ? viewerComments(issue, this.c.viewerId()).slice(-20).map((c) => truncate(c.body, 2000)) : [];
+    const prompt = render(loadTemplate('plan'), {
+      preamble: preamble('plan'),
+      key: run.key,
+      task: taskBlock({ key: run.key, title: run.title, description: run.description, comments }),
+      feedback: run.feedback ? fence('plan-feedback', run.feedback, 8000) : '',
+      rev: String(run.rev),
+      baseSha: run.baseSha.slice(0, 12),
+      branch: run.branch,
+      gates: repo.gates.length ? repo.gates.map((g) => `\`${g.cmd}\``).join(', ') : '(none detected)',
+      conventions: conventionsBlock(readConventions(run.worktree)),
+    });
+    const called = await this.callReadOnly(key, 'plan', prompt, PLAN_SCHEMA, run.worktree, (j) => {
+      const errs = validateSchema(PLAN_SCHEMA, j);
+      const p = j as Plan;
+      if (!errs.length && p.blocked?.is && !(p.blocked.questions?.length > 0)) errs.push('$.blocked.questions: required when blocked.is is true');
+      return errs;
+    });
+    if (called.kind === 'stop') return;
+    const plan = called.json as Plan;
+    this.c.store.writeArtifact(key, `plan-${run.rev}.json`, plan);
+    const md = planToMarkdown(plan);
+    this.c.store.writeArtifact(key, `plan-${run.rev}.md`, md);
+    try {
+      mkdirSync(join(run.worktree, '.conductor'), { recursive: true });
+      writeFileSync(join(run.worktree, '.conductor', 'plan.md'), md);
+    } catch {
+      /* non-fatal */
+    }
+    this.patch(key, (r) => {
+      r.complexity = plan.complexity;
+      r.feedback = undefined;
+      r.planReviewDone = false;
+      r.history.push({ ts: this.c.clock.now(), text: `Plan rev ${r.rev} ready (${plan.complexity}, ${plan.acceptanceCriteria.length} AC)` });
+    });
+    if (plan.blocked.is) {
+      const qs = plan.blocked.questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      return this.toNeedsHuman(key, `The planner needs a decision before it can proceed:\n${qs}`, 'plan', `The planner needs your input before it can proceed:\n\n${qs}\n\nAnswer in a comment, then move this issue back to **Todo**.`);
+    }
+    await this.c.effects.comment(key, `plan:${run.rev}`, `🤖 **Conductor plan** (revision ${run.rev}, complexity ${plan.complexity})\n\n${truncate(md, 24_000)}`);
+    const cfg = this.c.cfg();
+    const wantsReview = cfg.pipeline.planReview === 'always' || (cfg.pipeline.planReview === 'auto' && plan.complexity !== 'S');
+    if (wantsReview) {
+      this.patch(key, (r) => {
+        r.next = 'plan_review';
+      });
+      return;
+    }
+    await this.approvalGate(key, plan);
+  }
+
+  // ───────────────────────── PLAN REVIEW ─────────────────────────
+  async planReview(key: string): Promise<void> {
+    const run = this.run(key);
+    this.patch(key, (r) => {
+      r.stage = 'plan_review';
+      r.stageStartedAt = this.c.clock.now();
+    });
+    const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
+    if (!plan) return this.toNeedsHuman(key, 'Plan artifact is missing; re-planning is needed.', 'plan');
+    const repo = this.repo(run);
+    const prompt = render(loadTemplate('plan-review'), {
+      preamble: preamble('plan_review'),
+      key: run.key,
+      task: taskBlock({ key: run.key, title: run.title, description: run.description }),
+      plan: fence('plan-under-review', planToMarkdown(plan), 30_000),
+      baseSha: run.baseSha.slice(0, 12),
+      gates: repo.gates.length ? repo.gates.map((g) => `\`${g.cmd}\``).join(', ') : '(none detected)',
+    });
+    const called = await this.callReadOnly(key, 'plan_review', prompt, PLAN_REVIEW_SCHEMA, run.worktree, (j) => validateSchema(PLAN_REVIEW_SCHEMA, j));
+    if (called.kind === 'stop') return;
+    const review = called.json as PlanReview;
+    this.c.store.writeArtifact(key, `review-${run.rev}.json`, review);
+    const blocking = review.issues.filter((i) => i.severity === 'blocking');
+    const maxRounds = 1;
+    if (review.decision === 'changes_requested' && blocking.length && run.planReviewRounds < maxRounds) {
+      const fb = blocking.map((i, n) => `${n + 1}. ${i.text}`).join('\n');
+      this.patch(key, (r) => {
+        r.planReviewRounds += 1;
+        r.rev += 1;
+        r.feedback = `An independent review requested changes to the previous plan:\n${fb}`;
+        r.next = 'plan';
+        r.history.push({ ts: this.c.clock.now(), text: `Plan review requested ${blocking.length} change(s); revising` });
+      });
+      this.note(key, 'plan_review', `Plan review requested changes (${blocking.length}) — re-planning once.`);
+      return;
+    }
+    this.patch(key, (r) => {
+      r.planReviewDone = true;
+      r.history.push({ ts: this.c.clock.now(), text: `Plan review: ${review.decision}${review.issues.length ? ` (${review.issues.length} note(s))` : ''}` });
+    });
+    await this.c.effects.comment(
+      key,
+      `review:${run.rev}`,
+      `🤖 **Plan review: ${review.decision === 'approved' ? 'approved ✅' : 'concerns noted ⚠️'}**\n\n${review.summary}${review.issues.length ? `\n\n${review.issues.map((i) => `- _${i.severity}_ — ${i.text}`).join('\n')}` : ''}`,
+    );
+    await this.approvalGate(key, this.c.store.readArtifact<Plan>(key, `plan-${run.rev}.json`, plan));
+  }
+
+  // ───────────────────────── APPROVAL ─────────────────────────
+  async approvalGate(key: string, plan: Plan): Promise<void> {
+    const run = this.run(key);
+    const cfg = this.c.cfg();
+    const approved = this.c.persistent.load().repos[run.repo]?.approvedPlans ?? 0;
+    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L';
+    if (!required) {
+      this.patch(key, (r) => {
+        r.planApproved = true;
+        r.approvedBy = 'auto';
+        r.next = 'build';
+      });
+      return;
+    }
+    this.patch(key, (r) => {
+      r.status = 'awaiting_approval';
+      r.next = 'approval';
+      r.history.push({ ts: this.c.clock.now(), text: 'Waiting for plan approval' });
+    });
+    await this.applyStage(key, 'plan_ready');
+    await this.c.effects.comment(
+      key,
+      `approval:${run.rev}`,
+      `🤖 **Plan ready — your approval is needed${plan.complexity === 'L' ? ' (large change)' : approved === 0 ? ' (first plan for this repo)' : ''}.**\n\nReply \`/approve\` on this issue, or press **Approve** in the dashboard. To change the plan, add a comment and move the issue back to **Todo**.`,
+    );
+    this.c.notify(`${key}: plan ready`, 'Your approval is needed.');
+  }
+
+  // ───────────────────────── BUILD ─────────────────────────
+  async build(key: string): Promise<void> {
+    let run = this.run(key);
+    const cfg = this.c.cfg();
+    const repo = this.repo(run);
+    this.patch(key, (r) => {
+      r.stage = 'build';
+      r.stageStartedAt = this.c.clock.now();
+    });
+    await this.applyStage(key, 'building');
+    const { issue, problem } = await this.integrity(run);
+    if (problem) return this.toNeedsHuman(key, problem, 'build');
+    void issue;
+    const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
+    if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
+    if (!(await this.ensureWorkspace(key))) return;
+    run = this.run(key);
+
+    // crash window: a commit exists beyond what we recorded ⇒ the builder had finished
+    const head = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
+    const known = run.commitSha ?? run.baseSha;
+    if (head && head !== known && head !== run.baseSha && !(await this.hasUncommitted(run.worktree))) {
+      this.note(key, 'build', 'Found a finished build from before a restart — moving on to verification.');
+      this.patch(key, (r) => {
+        r.commitSha = head;
+        r.next = 'verify';
+      });
+      return;
+    }
+    if (await this.hasUncommitted(run.worktree)) {
+      // leftover partial work from an interrupted build: keep a recoverable copy, then start clean
+      const refs = await W.backupRefs(run.worktree, run.key, run.rev).catch(() => null);
+      await W.resetToCommit(run.worktree, known);
+      this.note(key, 'build', `Discarded partial work from an interrupted build${refs?.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
+    }
+
+    const guard = await W.writeCursorGuard(run.worktree);
+    this.patch(key, (r) => {
+      r.cursorGuardSha = guard.sha256 ?? undefined;
+      r.noPushEnvOnly = guard.envOnly;
+    });
+    if (guard.envOnly) this.note(key, 'build', 'This repo has its own .cursor/cli.json — no-push protection is environment-only for this run.');
+
+    const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
+    const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
+    const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open');
+    const commonVars = {
+      preamble: preamble(isFix ? 'fix' : 'build'),
+      key: run.key,
+      task: taskBlock({ key: run.key, title: run.title, description: run.description }),
+      plan: fence('approved-plan', planToMarkdown(plan), 40_000),
+      branch: run.branch,
+      protected: PROTECTED,
+      gates: repo.gates.length ? repo.gates.map((g) => `\`${g.cmd}\``).join(', ') : '(none detected)',
+    };
+    let prompt: string;
+    if (!isFix) {
+      prompt = render(loadTemplate('build'), { ...commonVars, feedback: '', baselineFailing });
+    } else {
+      const prevLoop = run.loop - 1;
+      const cmp = this.c.store.readArtifact<{ comparison: GateComparison } | null>(key, `gates-${prevLoop}.json`, null)?.comparison;
+      const gateFailures = cmp?.regressions.length ? cmp.regressions.map((r) => `- gate \`${r.gate}\`: ${r.newFailures.length ? r.newFailures.slice(0, 15).join('; ') : r.note ?? 'now failing'}`).join('\n') : '';
+      prompt = render(loadTemplate('fix'), {
+        ...commonVars,
+        loop: String(run.loop),
+        maxLoops: String(run.loopBudget),
+        bugs: this.bugList(run),
+        gateFailures,
+        commitNote: run.commitNote ? fence('commit-hook-output', run.commitNote, 4000) : '',
+      });
+    }
+    this.writePromptAudit(key, `build-${run.loop}`, prompt);
+    const secrets = this.c.secretsFor(run);
+    const env = await W.agentGitEnv(repo.path);
+    this.patch(key, (r) => {
+      r.agentRuns += 1;
+    });
+    if (run.agentRuns + 1 > cfg.pipeline.maxAgentRunsPerIssue) {
+      return this.toNeedsHuman(key, `This issue has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
+    }
+    const res = await this.c.agents.build({
+      cwd: run.worktree,
+      prompt,
+      name: `conductor ${run.key} ${isFix ? 'fix' : 'build'} ${run.loop}`,
+      env,
+      onEvent: this.emitter(key, 'build', run.loop, run.rev),
+      signal: this.c.signal(key),
+      secrets,
+    });
+    this.finishSession(key, res);
+    if (!res.ok) return this.handleBuildFailure(key, res);
+
+    // layer-1 guard intact?
+    const chk = await W.checkCursorGuard(run.worktree, guard.sha256);
+    if (!chk.ok) return this.toNeedsHuman(key, `The builder tampered with the no-push guard (${chk.detail}). Review the worktree before continuing.`, 'build');
+
+    const committed = await W.commitAll({ worktree: run.worktree, message: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}\n\nBuilt by Conductor (Cursor). Plan rev ${run.rev}.` });
+    if (!committed.ok) {
+      if (committed.reason === 'nothing') {
+        if (run.loop === 1 && !isFix) {
+          return this.toNeedsHuman(key, 'The builder finished without changing any files. The task may need to be clarified.', 'build');
+        }
+        return this.toNeedsHuman(key, 'The builder made no changes in response to the reported problems.', 'build');
+      }
+      if (committed.reason === 'guard') {
+        return this.toNeedsHuman(key, `Conductor refused to commit: ${committed.detail}. Nothing was committed.`, 'build');
+      }
+      if (committed.reason === 'hook') {
+        // hook failure = feedback, never a hang
+        this.patch(key, (r) => {
+          r.commitNote = truncate(committed.detail, 4000);
+        });
+        return this.nextLoopOrHuman(key, 'The repository commit hook rejected the build');
+      }
+      return this.toNeedsHuman(key, `Could not commit the build: ${committed.detail}`, 'build');
+    }
+    const diff = await W.diffAgainst(run.worktree, run.baseSha);
+    const violations = W.diffScopeViolations(diff.files.map((f) => f.path), plan.filesToChange.map((f) => f.path));
+    if (violations.length) {
+      return this.toNeedsHuman(key, `The builder changed protected files that the plan did not list: ${violations.slice(0, 6).join(', ')}. Review them (they are committed on the branch) before continuing.`, 'build');
+    }
+    this.patch(key, (r) => {
+      r.commitSha = committed.sha;
+      r.commitNote = undefined;
+      r.next = 'verify';
+      r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${committed.files.length} file(s) committed (${committed.sha.slice(0, 7)})` });
+    });
+  }
+
+  private async hasUncommitted(wt: string): Promise<boolean> {
+    try {
+      return (await gitOk(wt, ['status', '--porcelain'])).trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async handleBuildFailure(key: string, res: AgentResult): Promise<void> {
+    const run = this.run(key);
+    switch (res.errorKind) {
+      case 'limit':
+        return this.pauseForLimit(key, res.limit ?? { provider: 'cursor', resetsAt: null, message: res.error ?? 'limit' });
+      case 'aborted':
+        return;
+      case 'spawn':
+        return this.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
+      default: {
+        const tries = run.history.filter((h) => h.text.startsWith('Build attempt failed')).length;
+        this.patch(key, (r) => {
+          r.history.push({ ts: this.c.clock.now(), text: `Build attempt failed: ${truncate(res.error ?? 'error', 120)}` });
+        });
+        if (tries < 1) {
+          this.note(key, 'build', `Cursor failed (${truncate(res.error ?? '', 160)}) — retrying once.`);
+          return; // run.next stays 'build'; the job loop calls build again
+        }
+        return this.toNeedsHuman(key, `Cursor failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, 'build');
+      }
+    }
+  }
+
+  private async nextLoopOrHuman(key: string, why: string): Promise<void> {
+    const run = this.run(key);
+    if (run.loop >= run.loopBudget) {
+      return this.toNeedsHuman(key, `${why}, and the loop limit (${run.loopBudget}) is reached.`, 'verify');
+    }
+    this.patch(key, (r) => {
+      r.loop += 1;
+      r.next = 'build';
+    });
+  }
+
+  private bugList(run: Run): string {
+    const failOn = new Set(this.c.cfg().pipeline.failOn);
+    const open = run.bugs.filter((b) => b.status === 'open' && failOn.has(b.severity));
+    if (!open.length) return '(none recorded — see the verifier summary)';
+    return fence(
+      'verifier-findings',
+      open.map((b, i) => `${i + 1}. [${b.severity}] ${b.title}\n${b.detail}`).join('\n\n'),
+      24_000,
+    );
+  }
+
+  // ───────────────────────── VERIFY ─────────────────────────
+  async verify(key: string): Promise<void> {
+    let run = this.run(key);
+    const cfg = this.c.cfg();
+    const repo = this.repo(run);
+    this.patch(key, (r) => {
+      r.stage = 'verify';
+      r.stageStartedAt = this.c.clock.now();
+    });
+    await this.applyStage(key, 'verifying');
+    const { problem } = await this.integrity(run);
+    if (problem) return this.toNeedsHuman(key, problem, 'verify');
+    const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
+    if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
+
+    // 1) deterministic gates (ground truth), compared against the baseline by failure set
+    const lock = await W.lockfileHash(run.worktree);
+    if (run.lockfileHash && run.lockfileHash !== lock) {
+      const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
+      if (inst.ok) this.patch(key, (r) => void (r.lockfileHash = lock));
+    }
+    const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
+    let current: GateRun = { at: this.c.clock.now(), sha: run.commitSha ?? '', results: [] };
+    let comparison: GateComparison = { regressions: [], preExisting: [], unverified: [], passed: [] };
+    let unverifiedWhy: string | undefined;
+    if (repo.gates.length) {
+      current = await this.runAllGates(key, repo, repo.gates);
+      if (this.c.signal(key).aborted) return;
+      comparison = G.compareGates(baseline, current);
+      if (comparison.unverified.length) unverifiedWhy = `Gate(s) already failing before the change with unparseable output — regressions cannot be excluded: ${comparison.unverified.join(', ')}`;
+    } else {
+      unverifiedWhy = 'No automated quality gates (tests/lint/typecheck) were detected for this repository — the result rests on the AI review alone.';
+      if (cfg.pipeline.noGates === 'block') {
+        return this.toNeedsHuman(key, `${unverifiedWhy} Add gate commands for this repo (config) or set noGates to "warn".`, 'verify');
+      }
+    }
+    this.c.store.writeArtifact(key, `gates-${run.loop}.json`, { run: current, comparison });
+    this.patch(key, (r) => {
+      r.unverified = !!unverifiedWhy;
+      r.unverifiedWhy = unverifiedWhy;
+    });
+
+    // 2) the diff the verifier reads
+    const diff = await W.diffAgainst(run.worktree, run.baseSha);
+    if (diff.files.length === 0) {
+      return this.toNeedsHuman(key, 'There is nothing to verify: the branch has no changes compared with its base. The build may not have run — move the issue back to Todo to try again.', 'build');
+    }
+    this.c.store.writeArtifact(key, 'diffstat.txt', diff.stat);
+    try {
+      writeFileSync(join(run.worktree, '.conductor', 'diff.patch'), diff.patch);
+    } catch {
+      /* non-fatal */
+    }
+    run = this.run(key);
+    const prompt = render(loadTemplate('verify'), {
+      preamble: preamble('verify'),
+      key: run.key,
+      task: taskBlock({ key: run.key, title: run.title, description: run.description }),
+      plan: fence('approved-plan', planToMarkdown(plan), 40_000),
+      gates: this.renderGates(baseline, current, comparison, repo.gates),
+      unverifiedNote: unverifiedWhy ?? '',
+      baseSha: run.baseSha.slice(0, 12),
+      diffStat: truncate(diff.stat, 4000),
+      diffPath: '.conductor/diff.patch',
+    });
+    const called = await this.callReadOnly(key, 'verify', prompt, VERDICT_SCHEMA, run.worktree, (j) => validateSchema(VERDICT_SCHEMA, j));
+    if (called.kind === 'stop') return;
+    const verdict = called.json as Verdict;
+    this.c.store.writeArtifact(key, `verdict-${run.loop}.json`, verdict);
+    await this.decide(key, plan, verdict, comparison, diff.stat);
+  }
+
+  private renderGates(baseline: GateRun | null, current: GateRun, cmp: GateComparison, defs: GateDef[]): string {
+    if (!defs.length) return '_No automated gates ran._';
+    const lines = ['| Gate | Command | Before the change | After | Verdict |', '| --- | --- | --- | --- | --- |'];
+    for (const r of current.results) {
+      const b = baseline?.results.find((x) => x.name === r.name);
+      const status = cmp.regressions.some((x) => x.gate === r.name) ? 'REGRESSION' : cmp.unverified.includes(r.name) ? 'unverified for regressions' : cmp.preExisting.includes(r.name) ? 'pre-existing failure' : 'pass';
+      lines.push(`| ${r.name} | \`${r.cmd}\` | ${b ? (b.exitCode === 0 ? 'pass' : `fail${b.failureCount != null ? ` (${b.failureCount})` : ''}`) : 'n/a'} | ${r.exitCode === 0 ? 'pass' : `fail${r.failureCount != null ? ` (${r.failureCount})` : ''}`} | ${status} |`);
+    }
+    const detail = current.results
+      .filter((r) => r.exitCode !== 0)
+      .map((r) => `#### ${r.name} output (tail)\n${fence(`gate:${r.name}`, r.outputTail.slice(-2500), 2600)}${cmp.regressions.find((x) => x.gate === r.name)?.newFailures.length ? `\nNew failures: ${cmp.regressions.find((x) => x.gate === r.name)!.newFailures.slice(0, 15).join('; ')}` : ''}`);
+    return [...lines, '', ...detail].join('\n');
+  }
+
+  private async decide(key: string, plan: Plan, verdict: Verdict, cmp: GateComparison, diffStat: string): Promise<void> {
+    const run = this.run(key);
+    const cfg = this.c.cfg();
+    const failOn = new Set(cfg.pipeline.failOn);
+    const bugs: Bug[] = [...verdict.bugs];
+    for (const r of cmp.regressions) {
+      bugs.push({
+        title: `Quality gate regression: ${r.gate}`,
+        severity: 'blocker',
+        evidence: r.newFailures.length ? `New failures: ${r.newFailures.slice(0, 15).join('; ')}` : r.note ?? 'The gate fails now but passed (or had fewer failures) before the change.',
+        suggestedFix: `Run \`${r.gate}\` locally and fix the new failures.`,
+      });
+    }
+    // An unmet criterion with no real finding behind it still needs actionable feedback for the fix loop.
+    if (!bugs.some((b) => failOn.has(b.severity))) {
+      for (const a of verdict.acceptance) {
+        if (a.status === 'not_met') bugs.push({ title: `Acceptance criterion not met: ${a.id}`, severity: 'major', evidence: a.evidence });
+      }
+    }
+    const failing = bugs.filter((b) => failOn.has(b.severity));
+    const pass = verdict.verdict === 'pass' && failing.length === 0;
+
+    // bug records: upsert by fingerprint, close those not re-observed
+    const seen = new Set<string>();
+    const prov = await this.c.prov().catch(() => null);
+    const done = await this.c.completedStateId().catch(() => null);
+    for (const b of bugs) {
+      const fp = bugFingerprint(b);
+      seen.add(fp);
+      const detail = `**Severity:** ${b.severity}${b.file ? `\n**File:** \`${b.file}${b.line ? `:${b.line}` : ''}\`` : ''}\n\n**Evidence:** ${b.evidence}${b.repro ? `\n\n**Repro:** ${b.repro}` : ''}${b.suggestedFix ? `\n\n**Suggested fix:** ${b.suggestedFix}` : ''}`;
+      let reopen: BugRec | undefined;
+      this.patch(key, (r) => {
+        const cur = r.bugs.find((x) => x.fp === fp);
+        if (cur) {
+          if (cur.status === 'closed') reopen = { ...cur };
+          cur.status = 'open';
+          cur.detail = detail;
+          cur.severity = b.severity;
+          if (!cur.loops.includes(run.loop)) cur.loops.push(run.loop);
+        } else {
+          r.bugs.push({ fp, title: b.title, severity: b.severity, file: b.file, detail, status: 'open', loops: [run.loop] });
+        }
+      });
+      if (failOn.has(b.severity) && !pass && prov) {
+        const cur = this.run(key).bugs.find((x) => x.fp === fp);
+        if (reopen?.linearId && prov.todoStateId) await this.c.effects.close(key, `bugreopen:${fp}:${run.loop}`, reopen.linearId, prov.todoStateId);
+        else if (!cur?.linearId) {
+          await this.c.effects.subIssue(key, `bug:${fp}`, {
+            fp,
+            title: `[Bug] ${b.title}`,
+            description: `Found by Conductor's independent verification of **${run.key}** (loop ${run.loop}).\n\n${detail}`,
+            labelIds: [prov.bugLabelId],
+            stateId: prov.todoStateId ?? undefined,
+            teamId: run.teamId,
+          });
+        }
+      }
+    }
+    const toClose: BugRec[] = [];
+    this.patch(key, (r) => {
+      for (const b of r.bugs) {
+        if (b.status === 'open' && (pass || !seen.has(b.fp))) {
+          b.status = 'closed';
+          toClose.push({ ...b });
+        }
+      }
+      r.verdict = pass ? 'pass' : 'fail';
+    });
+    if (done) for (const b of toClose) if (b.linearId) await this.c.effects.close(key, `bugclose:${b.fp}:${run.loop}`, b.linearId, done);
+
+    if (pass) return this.markReady(key, plan, verdict, cmp, diffStat);
+
+    const summary = `🤖 **Verification failed (loop ${run.loop}/${run.loopBudget})**\n\n${verdict.summary}\n\n${failing.map((b) => `- **${b.severity}** ${b.title}${b.file ? ` — \`${b.file}\`` : ''}`).join('\n')}`;
+    await this.c.effects.comment(key, `verify:${run.loop}`, summary);
+    this.patch(key, (r) => {
+      r.history.push({ ts: this.c.clock.now(), text: `Verification ${run.loop}: ${failing.length} problem(s)` });
+    });
+    await this.nextLoopOrHuman(key, `Verification still finds ${failing.length} problem(s)`);
+  }
+
+  private async markReady(key: string, plan: Plan, verdict: Verdict, cmp: GateComparison, diffStat: string): Promise<void> {
+    const run = this.run(key);
+    const repo = this.repo(run);
+    const acTable = verdict.acceptance.length ? ['| AC | Status | Evidence |', '| --- | --- | --- |', ...verdict.acceptance.map((a) => `| ${a.id} | ${a.status} | ${a.evidence.replace(/\|/g, '\\|').replace(/\n+/g, ' ')} |`)].join('\n') : '';
+    const gates = cmp.passed.length || cmp.preExisting.length || cmp.unverified.length ? `Gates passed: ${cmp.passed.join(', ') || '—'}${cmp.preExisting.length ? `\nPre-existing failures (not caused by this change): ${cmp.preExisting.join(', ')}` : ''}` : '';
+    this.patch(key, (r) => {
+      r.status = 'ready';
+      r.next = 'none';
+      r.needsHuman = undefined;
+      r.history.push({ ts: this.c.clock.now(), text: `Verified — ready for your review${r.unverified ? ' (unverified by tests)' : ''}` });
+    });
+    await this.applyStage(key, 'ready');
+    const body = [
+      `🤖 **Ready for review ✅**${run.unverified ? ' — ⚠️ **not verified by automated tests**' : ''}`,
+      '',
+      verdict.summary,
+      '',
+      acTable,
+      '',
+      gates,
+      run.unverifiedWhy ? `\n> ⚠️ ${run.unverifiedWhy}` : '',
+      '',
+      `**Branch:** \`${run.branch}\` (base \`${run.baseSha.slice(0, 7)}\`)`,
+      `**Worktree:** \`${run.worktree}\``,
+      '',
+      '```',
+      truncate(diffStat, 1500),
+      '```',
+      '',
+      'Review: `' + `git -C ${repo.path} diff ${run.baseSha.slice(0, 7)}...${run.branch}` + '`',
+      'Merge when you are happy: `' + `git -C ${repo.path} merge --no-ff ${run.branch}` + '` (Conductor never merges or pushes).',
+    ]
+      .filter((l) => l !== undefined)
+      .join('\n');
+    await this.c.effects.comment(key, `ready:${run.rev}:${run.loop}`, body);
+    const st = this.c.persistent.load();
+    void plan;
+    void st;
+    this.c.notify(`${key} is ready`, `${truncate(run.title, 80)} — verified${run.unverified ? ' (no tests)' : ''}.`);
+  }
+
+  // used by the engine when a human approves
+  markApproved(key: string, by: 'human' | 'auto'): void {
+    const run = this.run(key);
+    const st = this.c.persistent.load();
+    st.repos[run.repo] = { approvedPlans: (st.repos[run.repo]?.approvedPlans ?? 0) + 1 };
+    this.c.persistent.save(st);
+    this.patch(key, (r) => {
+      r.planApproved = true;
+      r.approvedBy = by;
+      r.status = 'queued';
+      r.next = 'build';
+      r.history.push({ ts: this.c.clock.now(), text: `Plan approved (${by})` });
+    });
+  }
+
+  /** Short hash used to detect description edits. */
+  static descHash(description: string): string {
+    return sha1(description ?? '');
+  }
+  static sha256 = sha256;
+  static fmt = fmtDuration;
+}
+void BUG_LABEL;

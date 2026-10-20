@@ -203,9 +203,16 @@ export interface Run {
   unverifiedWhy?: string;
   noPushEnvOnly: boolean; // tracked .cursor/cli.json prevented writing the deny rule
   cursorGuardSha?: string; // sha256 of .cursor/cli.json written for the build
+  /** Picked up via the explicit `allowAssignedToMe` opt-in (creator attribution is skipped). */
+  assignedPickup?: boolean;
   planApproved: boolean;
   approvedBy?: 'auto' | 'human';
   planReviewDone: boolean;
+  planReviewRounds: number; // revisions requested by plan review so far
+  feedback?: string; // reviewer/human feedback to include in the next plan prompt
+  commitNote?: string; // repo-hook output from a failed commit, fed to the fix prompt
+  lockfileHash?: string; // last installed lockfile hash (re-install when it changes)
+  lastError?: string;
   complexity?: Complexity;
   /** What Conductor last wrote to Linear (used to tell human edits from its own). */
   expected: { stateId?: string; stage?: string };
@@ -451,6 +458,8 @@ export interface ApiQuota {
   claude?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean };
 }
 export interface ApiEngine {
+  /** Issues carrying the trigger label that Conductor deliberately ignores, with the reason. */
+  ignored?: { key: string; reason: string }[];
   paused: boolean;
   pauseReason?: string;
   providerPause: Partial<Record<AgentName, { until: number; reason: string }>>;

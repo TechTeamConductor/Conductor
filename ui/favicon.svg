@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Conductor">
+  <rect width="32" height="32" rx="8" fill="#3347d4"/>
+  <path d="M9 22.5 22.5 9" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" fill="none"/>
+  <circle cx="23.2" cy="8.8" r="3.1" fill="#ffffff"/>
+  <path d="M9.5 12.5c3.2 0 3.2 5 6.4 5" stroke="#ffffff" stroke-opacity=".62" stroke-width="2" stroke-linecap="round" fill="none"/>
+</svg>
