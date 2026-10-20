@@ -119,19 +119,20 @@ export class Stages {
    * The project-context blocks of a prompt, fenced as data: deterministic facts recomputed from git at the run's base commit (and, for
    * read-only stages only, previously completed tasks). A builder never receives history, summaries or anything an agent wrote.
    */
-  async projectBlocks(key: string, consumer: Consumer, files: string[] = []): Promise<{ projectFacts: string; projectHistory: string }> {
+  async projectBlocks(key: string, consumer: Consumer, files: string[] = []): Promise<{ projectFacts: string; projectHistory: string; projectNotes: string }> {
     const run = this.run(key);
-    let b: { facts: string; history: string };
+    let b: { facts: string; history: string; notes: string };
     try {
       b = await this.c.context.blocks(run, this.repo(run), consumer, files);
     } catch (e) {
       // the context engine is an aid: whatever goes wrong inside it, the stage simply runs without the block
       log.warn(`${key}: project context unavailable: ${errMsg(e)}`);
-      b = { facts: '', history: '' };
+      b = { facts: '', history: '', notes: '' };
     }
     return {
       projectFacts: b.facts ? fence('project-facts', b.facts, 40_000) : '',
       projectHistory: consumer === 'readonly' && b.history ? fence('project-history', b.history, 8_000) : '',
+      projectNotes: consumer === 'readonly' && b.notes ? fence('project-notes', b.notes, 4_000) : '',
     };
   }
 

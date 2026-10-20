@@ -22,6 +22,11 @@ You are the planning engineer. Produce an implementation plan precise enough tha
 ## Previously completed tasks in this project
 {{projectHistory}}
 {{/projectHistory}}
+{{#projectNotes}}
+
+## Notes on the project's directories (model-written summaries — may be wrong or stale)
+{{projectNotes}}
+{{/projectNotes}}
 
 ## Repository
 - Your working directory is a dedicated git worktree at base commit `{{baseSha}}` (branch `{{branch}}`).

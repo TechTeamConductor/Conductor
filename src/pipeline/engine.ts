@@ -1,4 +1,7 @@
 import { join } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { SUMMARY_SCHEMA } from '../context/summaries.ts';
 import type { ProviderId, Config, NextStep, RepoConfig, Run } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { newRun } from '../store.ts';
@@ -110,7 +113,7 @@ export class Engine {
     this.persistentDeps = deps.persistent ?? { load: loadState, save: saveState };
     this.effects = new Effects({ store: deps.store, board: deps.board, secrets: (r) => this.secretsFor(r), now: () => this.clock.now() });
     this.probe = new OfflineProbe({ fetcher: deps.offlineFetcher ?? null, now: () => this.clock.now() });
-    this.context = deps.context ?? new ContextService({ board: deps.board, getConfig: deps.getConfig, now: () => this.clock.now() });
+    this.context = deps.context ?? new ContextService({ board: deps.board, getConfig: deps.getConfig, now: () => this.clock.now(), summarise: (prompt) => this.summariseCall(prompt) });
     this.stages = new Stages(this.makeCtx());
   }
 
@@ -358,6 +361,20 @@ export class Engine {
     for (const k of this.d.store.tombstoned()) ignored.push({ key: k, reason: 'This run\'s record was unreadable and has been set aside; the card will not be started again by itself. Check the data folder.' });
     this.ignored = ignored;
     this.changed();
+  }
+
+  /** One read-only model call for an opt-in module summary, in an EMPTY scratch directory (the facts are in the prompt). Null on any failure. */
+  private async summariseCall(prompt: string): Promise<unknown | null> {
+    const dir = mkdtempSync(join(tmpdir(), 'conductor-ctx-'));
+    try {
+      await this.freshHealth();
+      const res = await this.d.agents.readOnly({ role: 'context', complexity: undefined, states: this.routeStates(), onLimit: () => undefined, stage: 'plan', cwd: dir, prompt, schema: SUMMARY_SCHEMA as any, name: 'conductor context summary', onEvent: () => undefined, secrets: this.d.secrets?.() ?? [] } as any);
+      return res.ok ? res.json ?? null : null;
+    } catch {
+      return null;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 
   /** A run at rest gets one outcome line in its project's history (level-triggered, idempotent, never an error for the run). */

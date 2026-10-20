@@ -20,6 +20,11 @@ You are an independent reviewer of an implementation plan. You did not write it.
 ## Previously completed tasks in this project
 {{projectHistory}}
 {{/projectHistory}}
+{{#projectNotes}}
+
+## Notes on the project's directories (model-written summaries — may be wrong or stale)
+{{projectNotes}}
+{{/projectNotes}}
 
 ## Repository
 Working directory = git worktree at base commit `{{baseSha}}`. Quality gates: {{gates}}

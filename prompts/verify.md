@@ -19,6 +19,11 @@ You are an independent verifier. The implementer's own claims are NOT evidence â
 ## Previously completed tasks in this project
 {{projectHistory}}
 {{/projectHistory}}
+{{#projectNotes}}
+
+## Notes on the project's directories (model-written summaries â€” may be wrong or stale)
+{{projectNotes}}
+{{/projectNotes}}
 
 ## Deterministic gate results (ground truth)
 {{gates}}

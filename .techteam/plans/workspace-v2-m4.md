@@ -119,7 +119,7 @@ When a run reaches `finished`/`ready`/`needs_human`/`aborted`, one line is appen
 - [x] **Commit 1 — store + scanner + incremental + status** (pure modules, fixtures, no engine change).
 - [x] **Commit 2 — packs + history + prompt blocks + engine insertion** (facts-only for builders; read-only fencing; refresh-before-plan; failure never blocks).
 - [x] **Commit 3 — offline classification + pause/resume + probe + labels + API/UI.**
-- [ ] **Commit 4 — `src/limits/budget.ts` (first consumer: the context-run budget; final semantics per §2b-8) + opt-in LLM summaries + docs.**
+- [x] **Commit 4 — `src/limits/budget.ts` (first consumer: the context-run budget; final semantics per §2b-8) + opt-in LLM summaries + docs.**
 - [ ] Reviewer code review + Security review; checkpoint commit.
 
 ## 5. Testing Strategy

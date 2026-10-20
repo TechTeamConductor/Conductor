@@ -12,6 +12,8 @@ import { liveFacts } from './live.ts';
 import { appendHistory, readHistory, type DigestStatus } from './history.ts';
 import { SCAN_ENV, isObjectId } from './gitread.ts';
 import { isIdent } from './facts.ts';
+import { refreshSummaries, summariesBlock } from './summaries.ts';
+import { loadContext } from './store.ts';
 
 const log = logger('context');
 const PACK_TIMEOUT_MS = 20_000;
@@ -21,6 +23,8 @@ export interface ContextBlocks {
   facts: string;
   /** Read-only stages only: previously completed tasks. Empty for a builder. */
   history: string;
+  /** Read-only stages only, and only when the project opted in: still-valid module summaries. */
+  notes: string;
 }
 
 /** What the stages need; the engine passes the real service, tests may pass a stub. */
@@ -58,7 +62,9 @@ export class ContextService implements ContextLike {
   private board: Board;
   private getConfig: () => Config;
   private now: () => number;
-  constructor(deps: { board: Board; getConfig: () => Config; now?: () => number }) {
+  private summarise?: (prompt: string) => Promise<unknown | null>;
+  constructor(deps: { board: Board; getConfig: () => Config; now?: () => number; summarise?: (prompt: string) => Promise<unknown | null> }) {
+    this.summarise = deps.summarise;
     this.board = deps.board;
     this.getConfig = deps.getConfig;
     this.now = deps.now ?? Date.now;
@@ -70,7 +76,7 @@ export class ContextService implements ContextLike {
   }
 
   async blocks(run: Run, repo: RepoConfig, consumer: Consumer, files: string[] = []): Promise<ContextBlocks> {
-    const empty: ContextBlocks = { facts: '', history: '' };
+    const empty: ContextBlocks = { facts: '', history: '', notes: '' };
     try {
       const projectKey = projectKeyOf(run.key);
       if (!projectKey || !isObjectId(run.baseSha)) return empty;
@@ -95,7 +101,12 @@ export class ContextService implements ContextLike {
           log.warn(`${run.key}: history unreadable: ${errMsg(e)}`);
         }
       }
-      return { facts: pack.text, history };
+      let notes = '';
+      if (consumer === 'readonly' && this.settings(projectKey).summaries) {
+        const ctx = loadContext(projectKey);
+        if (ctx.state === 'ok') notes = summariesBlock(projectKey, Object.fromEntries(ctx.manifest.tops.map((t) => [t.path, t.treeSha])));
+      }
+      return { facts: pack.text, history, notes };
     } catch (e) {
       log.warn(`${run.key}: context pack unavailable: ${errMsg(e)}`);
       return empty;
@@ -105,7 +116,11 @@ export class ContextService implements ContextLike {
   async refresh(run: Run, repo: RepoConfig): Promise<RefreshResult | null> {
     const projectKey = projectKeyOf(run.key);
     if (!projectKey) return null;
-    return refreshContext(projectKey, { name: repo.name, path: repo.path, baseBranch: repo.baseBranch, gates: repo.gates }, { staleDays: this.settings(projectKey).staleDays, now: this.now });
+    const r = await refreshContext(projectKey, { name: repo.name, path: repo.path, baseBranch: repo.baseBranch, gates: repo.gates }, { staleDays: this.settings(projectKey).staleDays, now: this.now });
+    if (this.summarise && this.settings(projectKey).summaries && r.status.state === 'fresh') {
+      void refreshSummaries(projectKey, { call: this.summarise, perDay: this.getConfig().pipeline.contextRunsPerDay, now: this.now() }).catch((e) => log.warn(`${projectKey}: summaries failed: ${errMsg(e)}`));
+    }
+    return r;
   }
 
   /** Append the run's outcome line when it rests (idempotent per `status:rev:loop`). Returns the mark, or null when nothing was due/possible. */

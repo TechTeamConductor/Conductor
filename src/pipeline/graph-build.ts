@@ -64,7 +64,7 @@ export interface GraphHost {
   callAnalysis(key: string, prompt: string, role: Role, label: string): Promise<{ kind: 'ok'; json: unknown } | { kind: 'stop'; hold?: Hold }>;
   applyHold(key: string, hold: Hold | undefined): Promise<void>;
   /** Fenced project-context blocks for a prompt (builder: facts only; read-only: facts + history). */
-  projectBlocks(key: string, consumer: 'builder' | 'readonly', files?: string[]): Promise<{ projectFacts: string; projectHistory: string }>;
+  projectBlocks(key: string, consumer: 'builder' | 'readonly', files?: string[]): Promise<{ projectFacts: string; projectHistory: string; projectNotes: string }>;
   /** One slot of the engine's single cap on concurrent analysis calls (null = the run was stopped while waiting). */
   analysisSlot(key: string): Promise<(() => void) | null>;
   protectedPaths: string;
