@@ -818,10 +818,11 @@ export class Engine {
   }
 
   /** `rev` (when given) must be the current plan revision: an approval for a replaced plan is refused. */
-  approve(key: string, by: 'human' | 'auto' = 'human', rev?: number): void {
+  approve(key: string, by: 'human' | 'auto' = 'human', rev?: number, confirmRisks = false): void {
     const run = this.d.store.get(key);
     if (!run || run.status !== 'awaiting_approval') throw new EngineError('bad_state', 'This run is not waiting for approval.');
     if (rev !== undefined && rev !== run.rev) throw new EngineError('stale', 'This plan was replaced by a newer revision — review it and approve again.');
+    if (by === 'human' && run.risks?.length && !confirmRisks) throw new EngineError('confirm_required', `This plan includes risky steps (${run.risks.map((x) => x.rule).join(', ')}). Confirm that you understand them to approve.`);
     this.stages.markApproved(key, by);
     this.tickSoon();
   }

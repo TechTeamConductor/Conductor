@@ -19,6 +19,8 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
+import { decideApproval, effectivePolicy } from '../policy/policy.ts';
+import { projectKeyOf } from '../context/service.ts';
 import { buildGraph, graphBudgets, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
 import { GraphBuilder } from './graph-build.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
@@ -702,22 +704,32 @@ export class Stages {
     // a big decomposition is a big change of plan: more than 8 items always waits for a person (the union of the items' files is the plan's
     // file list, so the protected-path rule above already covers every item)
     const bigGraph = itemsOf(plan).length > GRAPH_BIG_ITEMS;
-    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected || run.untrusted === true || bigGraph;
-    if (!required) {
+    const policy = effectivePolicy(cfg, projectKeyOf(run.key));
+    const decision = decideApproval({
+      plan,
+      policy,
+      forced: { protectedPaths: touchesProtected, untrusted: run.untrusted === true, bigGraph },
+      firstPlanHold: cfg.pipeline.planApproval === 'first' && approved === 0,
+    });
+    if (decision.auto) {
       this.patch(key, (r) => {
         r.planApproved = true;
         r.approvedBy = 'auto';
         r.next = 'build';
+        r.holdReasons = undefined;
+        r.risks = undefined;
         this.attachGraph(r, plan);
       });
       await this.c.effects.flush(key);
       return;
     }
-    const why = bigGraph ? ` (${itemsOf(plan).length} tasks — more than ${GRAPH_BIG_ITEMS})` : touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : run.untrusted ? ' (the task text came from an unverified source)' : approved === 0 ? ' (first plan for this repo)' : '';
+    const why = ` (${decision.reasons.join('; ')})`;
     const secrets = this.c.secretsFor(run);
     this.patch(key, (r) => {
       r.status = 'awaiting_approval';
       r.next = 'approval';
+      r.holdReasons = decision.reasons;
+      r.risks = decision.risks;
       r.history.push({ ts: this.c.clock.now(), text: 'Waiting for plan approval' });
       // K1: the status change and its board effects are ONE write
       Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'plan_ready' } }, secrets);

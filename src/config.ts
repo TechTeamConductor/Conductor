@@ -73,6 +73,7 @@ export function defaultConfig(): Config {
       readOnlyParallel: 2,
       contextRunsPerDay: 12,
       asksPerHour: 20,
+      policy: 'full-auto',
       verifyEachItem: false,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
@@ -143,6 +144,7 @@ export function normalizeConfig(input: unknown): Config {
       readOnlyParallel: clamp(pl.readOnlyParallel, 1, 4, d.pipeline.readOnlyParallel),
       contextRunsPerDay: clamp(pl.contextRunsPerDay, 1, 48, d.pipeline.contextRunsPerDay),
       asksPerHour: clamp(pl.asksPerHour, 1, 60, d.pipeline.asksPerHour),
+      policy: oneOf(pl.policy, ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'] as const, d.pipeline.policy),
       verifyEachItem: pl.verifyEachItem === true,
       timeoutsMin: {
         plan: clamp(to.plan, 1, 240, d.pipeline.timeoutsMin.plan),
@@ -182,7 +184,9 @@ export function normalizeProjects(raw: unknown): Record<string, ProjectSettings>
     const ctx = Object.hasOwn(entry, 'context') ? (entry as Record<string, unknown>).context : undefined;
     const c = (ctx && typeof ctx === 'object' && !Array.isArray(ctx) ? ctx : {}) as Record<string, unknown>;
     const own = (k: string): unknown => (Object.hasOwn(c, k) ? c[k] : undefined);
+    const pol = Object.hasOwn(entry, 'policy') ? (entry as Record<string, unknown>).policy : undefined;
     out[key] = {
+      ...(typeof pol === 'string' && ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'].includes(pol) ? { policy: pol as ProjectSettings['policy'] } : {}),
       context: { summaries: own('summaries') === true, staleDays: clamp(own('staleDays'), 1, 365, 14), packBytes: clamp(own('packBytes'), 1024, 32 * 1024, 8 * 1024) },
     };
   }

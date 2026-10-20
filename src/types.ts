@@ -289,6 +289,9 @@ export interface Run {
   graph?: TaskGraphRun;
   /** `status:rev:loop` of the last outcome digest written to the project's history (M4) — makes the digest idempotent. */
   digestMark?: string;
+  /** Why the plan is waiting for approval, and the risk-rule hits that need an explicit confirmation (M6). */
+  holdReasons?: string[];
+  risks?: { rule: string; detail: string }[];
   /** Started from a Quick Ask with "make this change if it is small" ticked (M5): plan review is skipped, approval is NOT (see Stages.approvalGate). Assigned by server code only. */
   fastPath?: boolean;
   /** Offline bookkeeping (M4): pause episodes and the cumulative time spent offline. */
@@ -343,6 +346,8 @@ export interface Config {
     contextRunsPerDay: number;
     /** Quick Ask / Research limits (ceilings are code constants in src/limits/budget.ts). */
     asksPerHour: number;
+    /** Global approval policy default (M6). `full-auto` = v1 behaviour. */
+    policy: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
     /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
     verifyEachItem: boolean;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
@@ -361,6 +366,8 @@ export interface ProjectContextSettings {
   packBytes: number;
 }
 export interface ProjectSettings {
+  /** Approval policy (M6); absent ⇒ the global `pipeline.policy`. */
+  policy?: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
   context?: ProjectContextSettings;
 }
 /** Subset of Config editable from the dashboard. */

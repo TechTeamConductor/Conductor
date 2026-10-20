@@ -411,6 +411,17 @@ export class Api {
       const r = await refreshContext(key, repo, { full: body.full === true, staleDays: this.d.getConfig().projects?.[key]?.context?.staleDays ?? DEFAULT_STALE_DAYS });
       return { json: { action: r.action, rescanned: r.rescanned, reused: r.reused, status: r.status, error: r.error ?? null } };
     }
+    if ((m = /^\/api\/projects\/([^/]+)\/settings$/.exec(path)) && method === 'PUT') {
+      const { key } = this.contextTarget(safeDecode(m[1]!));
+      for (const k of Object.keys(body)) if (!['policy', 'confirmFullAuto'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      if (!['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'].includes(body.policy)) throw new ApiFail(400, 'bad_request', '"policy" must be full-auto, approve-plan, approve-risky or manual-stages.');
+      if (body.policy === 'full-auto' && body.confirmFullAuto !== true) throw new ApiFail(400, 'confirm_required', 'Full automation needs "confirmFullAuto": true — plans will run without asking (large changes, protected files and unverified sources still wait for you).');
+      const cfg = this.d.getConfig();
+      const prev = cfg.projects?.[key] ?? {};
+      cfg.projects = { ...(cfg.projects ?? {}), [key]: { ...prev, policy: body.policy } };
+      this.d.saveConfig(cfg);
+      return { json: { ok: true, policy: body.policy } };
+    }
     if ((m = /^\/api\/projects\/([^/]+)\/context\/settings$/.exec(path)) && method === 'PUT') {
       const { key } = this.contextTarget(safeDecode(m[1]!));
       for (const k of Object.keys(body)) if (!['summaries', 'staleDays', 'packBytes'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
@@ -463,7 +474,7 @@ export class Api {
       switch (m[2]) {
         case 'approve':
           if (typeof body.rev !== 'number' || !Number.isInteger(body.rev)) throw new ApiFail(400, 'bad_request', '"rev" (the plan revision you are approving) is required.');
-          this.d.engine.approve(key, 'human', body.rev);
+          this.d.engine.approve(key, 'human', body.rev, body.confirmRisks === true);
           break;
         case 'retry':
           await this.d.engine.retry(key);
