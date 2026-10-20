@@ -2,7 +2,7 @@
   "name": "techteam-conductor",
   "version": "0.1.0",
   "private": true,
-  "description": "Local master UI that runs Linear issues through Claude (plan) -> Cursor (build) -> Claude (verify) with bug loops.",
+  "description": "Local master UI and board that runs cards through Claude (plan) -> Cursor (build) -> Claude (verify) with bug loops.",
   "type": "module",
   "license": "UNLICENSED",
   "engines": {

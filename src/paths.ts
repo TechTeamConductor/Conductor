@@ -4,10 +4,14 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 
 /** Root of all Conductor state. Override with CONDUCTOR_HOME (tests, demo). */
 export function conductorHome(): string {
-  return process.env.CONDUCTOR_HOME && process.env.CONDUCTOR_HOME.length > 0
-    ? process.env.CONDUCTOR_HOME
-    : join(homedir(), '.conductor-v2'); // v2's own home: running this code can never touch the v1 data in ~/.conductor
+  if (process.env.CONDUCTOR_HOME && process.env.CONDUCTOR_HOME.length > 0) return process.env.CONDUCTOR_HOME;
+  // belt and braces (security review C-10): a test process that forgot to point CONDUCTOR_HOME at a temp folder (e.g. `node --test x.test.ts`
+  // without the preload) must never fall back to the user's real v2 home.
+  if (process.env.NODE_TEST_CONTEXT) throw new Error('CONDUCTOR_HOME is not set inside a test run — refusing to use the real ~/.conductor-v2. Run tests with `npm test` (it loads test/preload.ts).');
+  return join(homedir(), '.conductor-v2'); // v2's own home: running this code can never touch the v1 data in ~/.conductor
 }
+/** The empty folders a v2 start creates; a home holding only these (and home.json) holds no data. Shared by the home check and the importer. */
+export const HOME_SKELETON: ReadonlySet<string> = new Set(['logs', 'run', 'runs', 'board', 'providers', 'projects']);
 export const paths = {
   home: () => conductorHome(),
   config: () => join(conductorHome(), 'config.json'),
@@ -29,10 +33,9 @@ export function assertHomeIsUsable(home: string = paths.home()): void {
   if (!existsSync(home)) return;
   if (existsSync(join(home, 'home.json'))) return;
   // an empty skeleton of v2's own folders (what earlier builds created before the marker existed) is not v1 data
-  const SKELETON = new Set(['logs', 'run', 'runs', 'board', 'providers', 'projects']);
   const entries = readdirSync(home).filter((n) => {
     if (n.startsWith('.')) return false;
-    if (!SKELETON.has(n)) return true;
+    if (!HOME_SKELETON.has(n)) return true;
     try {
       return readdirSync(join(home, n)).length > 0;
     } catch {

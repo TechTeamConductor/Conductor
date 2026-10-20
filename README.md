@@ -29,14 +29,14 @@ No `npm install` is needed to run it (zero runtime dependencies; Node 22.18+). D
 
 ### Coming from Conductor v1 (Linear)?
 
-v1 and v2 run **side by side**: v2 never touches the v1 folder (`~/.conductor`).
+v1 and v2 run **side by side**: v2 never writes to the v1 folder (`~/.conductor`); `migrate` refuses a `--to` that is inside it (or the reverse).
 
 ```
 node bin/conductor.mjs migrate            # dry run: shows exactly what would be imported, writes nothing
-node bin/conductor.mjs migrate --apply    # creates ~/.conductor-v2 (one atomic step) and a backup copy in ~/.conductor-backups
+node bin/conductor.mjs migrate --apply    # creates ~/.conductor-v2 (built aside, then one rename) and a backup copy in ~/.conductor-backups (kept until YOU delete it; it holds your v1 run records and plan/verdict files)
 ```
 
-Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still active in v1 shows up as **Needs you** — v2 never starts the same work twice; press Retry to run it in v2. Imported text is treated as unverified, so its plan waits for your approval. Nothing is ever written to Linear, and your old Linear key stays in the macOS Keychain until you delete it yourself.
+Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still active in v1 shows up as **Needs you** — v2 never starts the same work twice; press Retry to run it in v2. **Every imported card is treated as unverified text**: v1's approval is dropped, and when you press Retry (or move it to To do) it starts again at the **plan**, which waits for your approval before anything is built. The dry run also lists exactly what the imported settings will *run* on your machine (gate and setup commands, agent binaries, environment variables, copied files) — only migrate a folder you created. Files over 50 MB, symlinks and non-regular files in the v1 folder are skipped with a warning, never read. Nothing is ever written to Linear, and your old Linear key stays in the macOS Keychain until you delete it yourself.
 
 ## Everyday use
 

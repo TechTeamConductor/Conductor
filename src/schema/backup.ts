@@ -46,9 +46,22 @@ function walk(p: string, rel: string, out: { abs: string; rel: string }[], skipp
  * followed; two sources with the same basename never overwrite each other; every copy is verified against its source hash and a
  * mismatch throws (a backup that cannot be trusted is an error, not a warning).
  */
-export function backupPaths(sources: string[], opts: { root?: string; label?: string; now?: () => number; exclude?: ReadonlySet<string> } = {}): BackupResult {
+export function backupPaths(
+  sources: string[],
+  opts: {
+    root?: string;
+    label?: string;
+    now?: () => number;
+    exclude?: ReadonlySet<string>;
+    /** Files larger than this are skipped (reported, never silently dropped). Default 50 MB. */
+    maxFileBytes?: number;
+    /** An allow-list: files for which this returns false are skipped (reported). */
+    keep?: (absPath: string) => boolean;
+  } = {},
+): BackupResult {
   const root = opts.root ?? backupRoot();
   const exclude = opts.exclude ?? DEFAULT_EXCLUDE;
+  const maxBytes = opts.maxFileBytes ?? 50 * 1024 * 1024;
   const ts = new Date((opts.now ?? Date.now)()).toISOString().replace(/[:.]/g, '-');
   const label = opts.label ? `-${safeLabel(opts.label)}` : '';
   let dir = join(root, `${ts}${label}`);
@@ -67,6 +80,14 @@ export function backupPaths(sources: string[], opts: { root?: string; label?: st
     const isDir = (() => { try { return lstatSync(src).isDirectory(); } catch { return false; } })();
     walk(src, '', list, skipped, exclude);
     for (const f of list) {
+      if (opts.keep && !opts.keep(f.abs)) {
+        skipped.push({ path: f.abs, why: 'not an importable file (allow-list)' });
+        continue;
+      }
+      if (lstatSync(f.abs).size > maxBytes) {
+        skipped.push({ path: f.abs, why: `larger than ${Math.round(maxBytes / 1024 / 1024)} MB` });
+        continue;
+      }
       const rel = isDir ? join(top, f.rel) : top;
       const target = join(dir, rel);
       mkdirSync(join(target, '..'), { recursive: true, mode: 0o700 });

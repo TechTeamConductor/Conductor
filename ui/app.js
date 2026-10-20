@@ -580,6 +580,11 @@ function computeBanners(wizard) {
       : `Stages that need ${AGENT_LABEL[a]} wait. Nothing is lost, runs resume by themselves.`);
     out.push({ id: 'pp-' + a, cls: 'b-limit', icon: 'clock', title: `${AGENT_LABEL[a]} usage limit`, text: ' — resuming automatically at ' + fmtWhen(p.until), until: p.until, lines });
   }
+  const cardKeys = new Set((st.cards || []).map((c) => c.key));
+  const hidden = (eng.ignored || []).filter((i) => !cardKeys.has(i.key));
+  if (hidden.length) {
+    out.push({ id: 'ignored', cls: 'b-error', icon: 'warn', title: hidden.length === 1 ? 'One card is being ignored' : `${hidden.length} cards are being ignored`, text: '', lines: hidden.slice(0, 8).map((i) => `${i.key}: ${i.reason}`), list: true });
+  }
   if (eng.storageProblem || eng.lastPollError) {
     out.push({ id: 'storage', cls: 'b-error', icon: 'warn', title: 'The board cannot be saved right now', text: ' ' + (eng.storageProblem || eng.lastPollError), lines: ['Check free disk space and permissions on the data folder. Conductor keeps retrying; running stages are not affected.'] });
   }
@@ -635,7 +640,7 @@ function tick() { for (const el of document.querySelectorAll('[data-t0],[data-t1
 
 /* ───────────────────────── run actions (cards + drawer) ───────────────────────── */
 const runUrl = (key, what) => `/api/runs/${enc(key)}/${what}`;
-const runRev = (key) => { const r = S.state && S.state.runs.find((x) => x.key === key); return r ? r.rev : 0; };
+const runRev = (key) => { if (S.detail && S.detail.key === key && Number.isFinite(S.detail.rev)) return S.detail.rev; const r = S.state && S.state.runs.find((x) => x.key === key); return r ? r.rev : 0; };
 const actApprove = (key) => runAction(key, 'approve', () => api('POST', runUrl(key, 'approve'), { rev: runRev(key) }), `Plan for ${key} approved. Cursor starts building.`);
 const actMove = (key, lane, msg) => runAction(key, 'move:' + lane, () => api('POST', `/api/items/${enc(key)}/move`, { lane }), msg);
 const actRetry = (key) => runAction(key, 'retry', () => api('POST', runUrl(key, 'retry')), `${key}: retry started.`);
@@ -663,10 +668,10 @@ function setBusy(el, busy) {
 }
 
 /* ───────────────────────── board view ───────────────────────── */
-const B = { summary: null, items: null, polled: null, board: null, cols: new Map(), cards: new Map(), history: null, histList: null, histCount: null, histSig: '', empty: null, pollEl: null, order: '', itemsSig: '' };
+const B = { idle: new Map(), summary: null, items: null, polled: null, board: null, cols: new Map(), cards: new Map(), history: null, histList: null, histCount: null, histSig: '', empty: null, pollEl: null, order: '', itemsSig: '' };
 
 function buildBoardView() {
-  B.cols = new Map(); B.cards = new Map(); B.histSig = ''; B.order = ''; B.itemsSig = '';
+  B.cols = new Map(); B.cards = new Map(); B.idle = new Map(); B.histSig = ''; B.order = ''; B.itemsSig = '';
   B.items = h('div', { class: 'summary-items' });
   B.polled = h('span', { class: 'sum-quiet' });
   B.summary = h('div', { class: 'summary' }, h('h1', null, 'Board'), B.items, h('span', { class: 'summary-spacer' }), B.polled);
@@ -718,7 +723,12 @@ function updateBoard() {
   const open = st.runs.filter((r) => r.column !== 'closed');
   const closed = st.runs.filter((r) => r.column === 'closed');
   const cardsBy = { backlog: st.cards.filter((c) => c.lane === 'backlog'), todo: st.cards.filter((c) => c.lane === 'todo') };
-  const idle = cardsBy.backlog.length + cardsBy.todo.length;
+  // run-less cards that sit in a Conductor-owned lane (orphans: nobody is working on them) must not be invisible — show them in their lane's column with the reason
+  const ORPHAN_COL = { needs_you: 'needs_human', review: 'ready', active: 'planning' };
+  const extra = new Map(COLUMNS.map((c) => [c.id, []]));
+  for (const c of st.cards) if (ORPHAN_COL[c.lane]) extra.get(ORPHAN_COL[c.lane]).push(c);
+  const orphanCount = [...extra.values()].reduce((n, l) => n + l.length, 0);
+  const idle = cardsBy.backlog.length + cardsBy.todo.length + orphanCount;
   const byCol = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
@@ -735,7 +745,7 @@ function updateBoard() {
     const col = B.cols.get(c.id);
     if (c.cards) { // run-less cards (Backlog / To do): plain cards with their own actions
       const cl = cardsBy[c.id];
-      reconcile(col.list, cl.map(idleCard));
+      reconcile(col.list, cl.map(idleEl));
       setText(col.count, cl.length);
       col.el.classList.toggle('is-empty', !cl.length);
       toggleHidden(col.empty, cl.length > 0);
@@ -749,30 +759,52 @@ function updateBoard() {
       updateCard(el, r);
       return el;
     });
-    reconcile(col.list, els);
-    setText(col.count, list.length);
-    col.count.setAttribute('aria-label', plural(list.length, 'run'));
-    col.el.classList.toggle('is-empty', !list.length);
-    col.el.classList.toggle('is-attn', !!c.attn && list.length > 0);
-    col.el.classList.toggle('is-ask', !!c.ask && list.length > 0);
-    toggleHidden(col.empty, list.length > 0);
+    const ex = extra.get(c.id) || [];
+    reconcile(col.list, els.concat(ex.map(idleEl)));
+    const total = list.length + ex.length;
+    setText(col.count, total);
+    col.count.setAttribute('aria-label', plural(total, 'card'));
+    col.el.classList.toggle('is-empty', !total);
+    col.el.classList.toggle('is-attn', !!c.attn && total > 0);
+    col.el.classList.toggle('is-ask', !!c.ask && total > 0);
+    toggleHidden(col.empty, total > 0);
   }
   for (const [k, el] of B.cards) if (!seen.has(k)) { el.remove(); B.cards.delete(k); }
-  updateSummary(byCol);
+  const liveIdle = new Set(st.cards.map((c) => c.key + '|' + c.lane));
+  for (const [id, rec] of B.idle) if (!liveIdle.has(id)) { rec.el.remove(); B.idle.delete(id); }
+  updateSummary(byCol, extra);
   updateHistory(closed);
 }
 
+/** Idle (run-less) cards are created ONCE per key+lane and updated in place — rebuilding them on every state event dropped keyboard focus and clicks. */
+function idleEl(c) {
+  const id = c.key + '|' + c.lane;
+  let rec = B.idle.get(id);
+  if (!rec) { rec = { el: idleCard(c), title: null, note: null }; B.idle.set(id, rec); }
+  const t = rec.el.querySelector('.card-title');
+  if (t && rec.title !== c.title) { t.textContent = c.title; rec.title = c.title; }
+  const n = c.note || '';
+  if (rec.note !== n) {
+    rec.note = n;
+    let np = rec.el.querySelector('.card-note');
+    if (n && !np) { np = h('p', { class: 'muted card-note' }, n); rec.el.querySelector('.card-actions').before(np); }
+    else if (np && n) np.textContent = n;
+    else if (np) np.remove();
+  }
+  return rec.el;
+}
 function idleCard(c) {
   const move = (lane, msg) => () => runAction(c.key, 'move:' + lane, () => api('POST', `/api/items/${enc(c.key)}/move`, { lane }), msg);
-  const btns = c.lane === 'backlog'
-    ? [h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: move('todo', `${c.key} will start now.`) }, 'Start')]
-    : [h('button', { type: 'button', class: 'btn btn-sm', onclick: move('backlog', `${c.key} moved to Backlog.`) }, 'Park')];
+  const btns = c.lane === 'todo'
+    ? [h('button', { type: 'button', class: 'btn btn-sm', onclick: move('backlog', `${c.key} moved to Backlog.`) }, 'Park')]
+    : [h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: move('todo', `${c.key} will start now.`) }, c.lane === 'backlog' ? 'Start' : 'Run it'),
+      ...(c.lane === 'backlog' ? [] : [h('button', { type: 'button', class: 'btn btn-sm', onclick: move('backlog', `${c.key} moved to Backlog.`) }, 'Park')])];
   btns.push(h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: move('canceled', `${c.key} canceled.`) }, 'Cancel'));
-  return h('li', { class: 'card idle-card' }, h('div', { class: 'card-top' }, h('span', { class: 'card-key' }, c.key)), h('p', { class: 'card-title' }, c.title), c.note ? h('p', { class: 'muted' }, c.note) : null, h('div', { class: 'card-actions' }, btns));
+  return h('li', { class: 'card idle-card' }, h('div', { class: 'card-top' }, h('span', { class: 'card-key' }, c.key)), h('p', { class: 'card-title' }, c.title), h('div', { class: 'card-actions' }, btns));
 }
 
-function updateSummary(byCol) {
-  const n = (id) => byCol.get(id).length;
+function updateSummary(byCol, extra) {
+  const n = (id) => byCol.get(id).length + ((extra && extra.get(id)) || []).length;
   const working = n('planning') + n('building') + n('verifying');
   const items = [];
   if (n('needs_human')) items.push({ col: 'needs_human', cls: 'st-needs_human', ic: 'alert', n: n('needs_human'), text: n('needs_human') === 1 ? 'needs you' : 'need you' });

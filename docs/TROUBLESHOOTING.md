@@ -10,6 +10,8 @@
 
 **"…contains data from Conductor v1 … run conductor migrate".** v2 never uses a v1 folder in place. Use `node bin/conductor.mjs migrate` (dry run first, then `--apply`) to import it into a new folder, or point `CONDUCTOR_HOME` at an empty folder.
 
+**Backups pile up.** Every data upgrade and every `migrate --apply` copies what it read into `~/.conductor-backups/<timestamp>-<label>/` (mode 0700; prompt-audit and gate-output files are not copied by the importer). Nothing prunes them: delete old folders yourself when you no longer need them — they hold your run records and plan/verdict text.
+
 **"…was written by a newer Conductor".** A file in the data folder has a data version this build does not understand. Nothing was changed. Upgrade Conductor, or restore a backup from `~/.conductor-backups`.
 
 **"Session expired" in the dashboard.** Run `npm run open` (one-time sign-in link).

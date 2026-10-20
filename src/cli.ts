@@ -107,13 +107,25 @@ async function migrateCmd(): Promise<void> {
     for (const p of r.projects) console.log(`  project ${p.key}${p.repo ? ` → repository "${p.repo}"` : ' (no repository set yet)'}: ${p.cards} card(s)`);
     for (const x of r.runs) console.log(`  ${x.oldKey}${x.oldKey === x.newKey ? '' : ` → ${x.newKey}`}  ${x.status} → lane ${x.lane}${x.note ? `\n      ${x.note}` : ''}`);
     for (const w of r.warnings) console.log(` ! ${w}`);
+    if (r.willRun) {
+      // C-5: the imported config is not just data — these commands run as you at the next setup/gate/stage
+      console.log('\nThe imported settings will RUN these on your machine (check them — only migrate a folder you created):');
+      console.log(`  agent binaries: claude="${r.willRun.agentBins.claude}"  cursor="${r.willRun.agentBins.cursor}"`);
+      for (const x of r.willRun.repos) {
+        console.log(`  repository "${x.name}" at ${x.path}`);
+        console.log(`    setup:  ${x.setup ?? '(auto-detected)'}`);
+        console.log(`    gates:  ${x.gates.length ? x.gates.join('  |  ') : '(none)'}`);
+        if (x.envPassthrough.length) console.log(`    passes these environment variables to gates: ${x.envPassthrough.join(', ')}`);
+        if (x.copyFiles.length) console.log(`    copies these ignored files into worktrees: ${x.copyFiles.join(', ')}`);
+      }
+    }
     if (r.backupDir) console.log(`\nBackup copy of what was read: ${r.backupDir}`);
     if (r.dryRun) console.log('\nLooks right? Run the same command with --apply to create the v2 folder.');
     else if (r.published) console.log(`\nDone. Start v2 with:  CONDUCTOR_HOME=${to} npm start   (or just  npm start  when ${to} is the default).\nYour v1 folder is untouched and keeps working. Nothing was written to Linear; the old Linear API key is still in your macOS Keychain (service "techteam-conductor", account "linear-api-key") — v2 never reads it; delete it yourself when you are sure you no longer need v1.`);
   } catch (e) {
     if (e instanceof MigrateError) {
       console.error(`migrate: ${e.message}`);
-      process.exit(e.code === 'target_exists' || e.code === 'changed_during_import' ? 3 : 2);
+      process.exit(e.code === 'target_exists' || e.code === 'changed_during_import' || e.code === 'target_changed' ? 3 : 2);
     }
     throw e;
   }

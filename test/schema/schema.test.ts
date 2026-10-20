@@ -81,10 +81,18 @@ test('backupPaths copies files and folders with a manifest, skips missing source
 });
 
 test('default home is ~/.conductor-v2 (never the v1 data) and the board lives under it', () => {
-  delete process.env.CONDUCTOR_HOME;
-  assert.equal(conductorHome(), join(homedir(), '.conductor-v2'));
-  assert.equal(paths.board(), join(homedir(), '.conductor-v2', 'board'));
-  process.env.CONDUCTOR_HOME = home;
+  const ctx = process.env.NODE_TEST_CONTEXT;
+  try {
+    delete process.env.CONDUCTOR_HOME;
+    // C-10: inside a test run, falling back to the real home is refused outright
+    assert.throws(() => conductorHome(), /CONDUCTOR_HOME is not set inside a test run/);
+    delete process.env.NODE_TEST_CONTEXT;
+    assert.equal(conductorHome(), join(homedir(), '.conductor-v2'));
+    assert.equal(paths.board(), join(homedir(), '.conductor-v2', 'board'));
+  } finally {
+    process.env.CONDUCTOR_HOME = home;
+    if (ctx !== undefined) process.env.NODE_TEST_CONTEXT = ctx;
+  }
 });
 
 // ───────────── config (inert in M1a: version stays 2) ─────────────

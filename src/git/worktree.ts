@@ -860,7 +860,10 @@ export async function assertOwnedWorktree(repo: { name: string; path: string }, 
   const have = await realpathLoose(worktreePath);
   if (have !== want) throw new Error(`the recorded worktree is not the one Conductor v2 created for this card (${worktreePath}); refusing to touch it`);
   if (existsSync(worktreePath)) {
+    // a symlink planted at the expected path would make `have === want` while pointing at someone else's checkout (security review B-2 residual)
+    if ((await lstat(worktreePath)).isSymbolicLink()) throw new Error(`${worktreePath} is a symbolic link, not a checkout Conductor v2 created; refusing to touch it`);
     const head = await git(worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (head.code !== 0) throw new Error(`the checkout at ${worktreePath} is on a detached HEAD, not ${branchFor(key)}; refusing to touch it`);
     if (head.code === 0 && head.stdout.trim() !== branchFor(key)) throw new Error(`the checkout at ${worktreePath} is on branch ${head.stdout.trim()}, not ${branchFor(key)}; refusing to touch it`);
   }
 }

@@ -390,7 +390,9 @@ export class Engine {
     if (run0.worktree) {
       const repo0 = cfg.repos.find((r) => r.name === run0.repo);
       try {
-        if (repo0) await W.assertOwnedWorktree(repo0, run0.key, run0.worktree, cfg.worktreeRoot); // never back up / reset a foreign checkout (B-2)
+        // never back up / reset a foreign checkout (B-2); an unregistered repository means ownership cannot be proven ⇒ touch nothing
+        if (!repo0) throw new Error(`repository "${run0.repo}" is not registered, so ownership of ${run0.worktree} cannot be verified`);
+        await W.assertOwnedWorktree(repo0, run0.key, run0.worktree, cfg.worktreeRoot);
         await W.backupRefs(run0.worktree, run0.key, run0.rev); // recoverable copy first, always
         if (!keepCommits) await W.resetToBase(run0.worktree, run0.baseSha);
       } catch (e) {
