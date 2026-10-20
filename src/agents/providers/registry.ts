@@ -1,6 +1,7 @@
 import { PROVIDER_LABEL, type Capabilities, type Provider, type ProviderDeps, type ProviderId } from './types.ts';
 import { cursorProvider } from './cursor.ts';
 import { claudeProvider } from './claude.ts';
+import { codexProvider } from './codex.ts';
 import { isBuildIsolationVerified } from './verification.ts';
 import { isProviderId } from './static.ts';
 
@@ -17,7 +18,7 @@ function seal(p: Provider): Provider {
 }
 
 export function createProviders(d: ProviderDeps): Record<ProviderId, Provider> {
-  return Object.freeze({ claude: seal(claudeProvider(d)), cursor: seal(cursorProvider(d)) });
+  return Object.freeze({ claude: seal(claudeProvider(d)), cursor: seal(cursorProvider(d)), codex: seal(codexProvider(d)) });
 }
 
 /**

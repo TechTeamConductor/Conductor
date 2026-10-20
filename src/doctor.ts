@@ -9,6 +9,7 @@ import { buildClaudeArgs, checkClaudeInit } from './agents/claude.ts';
 import { runClaude } from './agents/claude.ts';
 import { runCursor } from './agents/cursor.ts';
 import { runProcess } from './agents/spawn.ts';
+import { CODEX_MIN_VERSION, codexAuth, detectCodex } from './agents/providers/codex.ts';
 import { scanAncestors } from './git/worktree.ts';
 import { KeychainStore } from './secrets.ts';
 import { errMsg, truncate } from './util.ts';
@@ -28,7 +29,8 @@ async function cliOut(bin: string, args: string[], env: Record<string, string>):
 }
 
 /** Zero-quota health of the two agent CLIs (found / version / logged in). Cached 60 s. */
-export async function agentHealth(cfg: Config, which: 'claude' | 'cursor', force = false): Promise<AgentHealth> {
+export async function agentHealth(cfg: Config, which: 'claude' | 'cursor' | 'codex', force = false): Promise<AgentHealth> {
+  if (which === 'codex') return codexHealth(cfg, force);
   const binName = which === 'claude' ? cfg.agents.claude.bin : cfg.agents.cursor.bin;
   const hit = cache.get(`${which}:${binName}`);
   if (!force && hit && Date.now() - hit.at < 60_000) return hit.value;
@@ -63,6 +65,27 @@ export async function agentHealth(cfg: Config, which: 'claude' | 'cursor', force
   return value;
 }
 
+/**
+ * Codex: `--version` + `login status` against Conductor's PRIVATE home, nothing else (zero quota, never a model call). A launcher whose native
+ * binary is missing is reported as `broken-install` (found: false) with the stderr tail and a fixed hint — Conductor never repairs it.
+ */
+async function codexHealth(cfg: Config, force: boolean): Promise<AgentHealth> {
+  const binName = cfg.agents.codex.bin;
+  const hit = cache.get(`codex:${binName}`);
+  if (!force && hit && Date.now() - hit.at < 60_000) return hit.value;
+  const d = await detectCodex(binName);
+  let value: AgentHealth;
+  if (d.state === 'missing') value = { found: false, ok: false, state: 'missing', detail: d.detail };
+  else if (d.state === 'broken-install') value = { found: false, ok: false, state: 'broken-install', detail: `Codex is installed but does not start: ${d.detail}` };
+  else {
+    const auth = await codexAuth(binName);
+    const detail = d.belowMinimum ? `Codex ${d.version} is older than ${CODEX_MIN_VERSION}, which this version of Conductor was written against; it is treated as unverified.` : auth === 'ok' ? 'Signed in (Conductor\'s private Codex home)' : auth === 'not-logged-in' ? 'Not signed in to Conductor\'s private Codex home.' : 'Sign-in state unknown.';
+    value = { found: true, version: d.version, state: 'ok', loggedIn: auth === 'ok' ? true : auth === 'not-logged-in' ? false : undefined, ok: auth === 'ok' && !d.belowMinimum, detail };
+  }
+  cache.set(`codex:${binName}`, { at: Date.now(), value });
+  return value;
+}
+
 /** Everything the doctor command and dashboard warnings need. Never spends agent quota. */
 export async function runChecks(cfg: Config): Promise<Check[]> {
   const out: Check[] = [];
@@ -79,6 +102,10 @@ export async function runChecks(cfg: Config): Promise<Check[]> {
   add('claude', 'Claude Code', c.ok ? 'ok' : 'fail', `${c.version ?? ''} ${c.detail ?? ''}`.trim());
   const k = await agentHealth(cfg, 'cursor');
   add('cursor', 'Cursor CLI', k.ok ? 'ok' : 'fail', `${k.version ?? ''} ${k.detail ?? ''}`.trim());
+  // Codex is optional (in no default chain): reported, never a failure unless a role actually uses it
+  const x = await agentHealth(cfg, 'codex');
+  const codexUsed = Object.values(cfg.roles).some((r) => r.providers.includes('codex'));
+  add('codex', 'Codex CLI (optional)', x.ok ? 'ok' : codexUsed ? 'fail' : 'warn', `${x.version ?? ''} ${x.detail ?? ''}`.trim());
   add('keychain', 'Secret storage', KeychainStore.available() && process.env.CONDUCTOR_NO_KEYCHAIN !== '1' ? 'ok' : 'warn', KeychainStore.available() ? 'macOS Keychain' : '0600 file in the data folder (Keychain unavailable)');
 
   if (!cfg.repos.length) add('repos', 'Repositories', 'warn', 'No repository registered yet.');
@@ -90,7 +117,7 @@ export async function runChecks(cfg: Config): Promise<Check[]> {
     add(`repo:${r.name}`, `Repo ${r.name}`, r.gates.length ? 'ok' : 'warn', r.gates.length ? `Gates: ${r.gates.map((g) => g.name).join(', ')}` : 'No test/lint/typecheck commands detected — results will be flagged "unverified".');
     const wtRoot = cfg.worktreeRoot ?? join(r.path, '..', '.conductor-v2-worktrees');
     const anc = await scanAncestors(join(wtRoot, r.name, 'x')).catch(() => []);
-    if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `Cursor may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in the data folder's config.json to a clean folder if this causes trouble.`);
+    if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `An agent may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in the data folder's config.json to a clean folder if this causes trouble.`);
     if (r.path.startsWith('/Volumes/')) add(`volume:${r.name}`, 'External drive', 'warn', `${r.name} lives on an external volume — if you install the background service, launchd may start before the drive mounts (it retries automatically).`);
   }
   try {

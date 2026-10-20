@@ -705,9 +705,9 @@ export async function diffAgainst(worktree: string, baseSha: string): Promise<{ 
   return { stat: redact(statR.stdout), patch: redact(patch), files };
 }
 
-const PROTECTED_DIR_SEGMENTS = new Set(['.claude', '.cursor', '.husky', '.techteam', '.conductor', '.devcontainer', '.vscode']);
+const PROTECTED_DIR_SEGMENTS = new Set(['.claude', '.cursor', '.codex', '.agents', '.husky', '.techteam', '.conductor', '.devcontainer', '.vscode']);
 // instruction/config files that tools auto-load or execute (security review M6)
-const PROTECTED_FILE_NAMES = new Set(['.mcp.json', 'agents.md', 'claude.md', 'claude.local.md', 'gemini.md', '.envrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs', '.cursorrules', '.windsurfrules', 'lefthook.yml', '.pre-commit-config.yaml']);
+const PROTECTED_FILE_NAMES = new Set(['.mcp.json', 'agents.md', 'agents.override.md', 'claude.md', 'claude.local.md', 'gemini.md', '.envrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs', '.cursorrules', '.windsurfrules', 'lefthook.yml', '.pre-commit-config.yaml']);
 
 function isProtectedPath(p: string): boolean {
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
@@ -906,8 +906,8 @@ export async function removeWorktree(
 
 // ───────────────────────────── instruction-file ancestors ─────────────────────────────
 
-const ANCESTOR_FILES = ['AGENTS.md', 'CLAUDE.md', 'CLAUDE.local.md', 'GEMINI.md'];
-const ANCESTOR_DIRS = [join('.claude', 'rules'), join('.cursor', 'rules')];
+const ANCESTOR_FILES = ['AGENTS.md', 'agents.override.md', 'CLAUDE.md', 'CLAUDE.local.md', 'GEMINI.md'];
+const ANCESTOR_DIRS = [join('.claude', 'rules'), join('.cursor', 'rules'), '.codex', '.agents'];
 
 /** Instruction files/dirs in EVERY ancestor directory above `path` (not `path` itself). Absolute paths. */
 export async function scanAncestors(path: string): Promise<string[]> {

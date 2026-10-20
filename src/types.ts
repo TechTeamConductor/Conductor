@@ -266,6 +266,8 @@ export interface Config {
       maxTurns: { plan: number; review: number; verify: number };
     };
     cursor: { bin: string; model?: string };
+    /** Codex CLI (read-only roles only in M2). `model` is validated against a strict pattern and passed as `--model=<v>`. */
+    codex: { bin: string; model?: string };
   };
   /** Roles → ordered provider chains (config v4). Replaces v3's `stages` + `pipeline.onClaudeLimit`, which are derived for the dashboard (see Settings). */
   roles: Roles;
@@ -466,6 +468,7 @@ export interface ApiState {
   health: {
     claude: AgentHealth;
     cursor: AgentHealth;
+    codex: AgentHealth;
     warnings: string[];
   };
   providers: ApiProvider[];

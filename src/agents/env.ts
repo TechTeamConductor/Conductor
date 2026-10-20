@@ -46,6 +46,16 @@ export function cursorEnv(extra: Record<string, string> = {}, src: NodeJS.Proces
   return baseEnv({ ...pick(CURSOR_KEYS, src), ...extra }, src);
 }
 
+/**
+ * Env for `codex` children (Security conditions 2-3): the base allow-list, plus ONLY the two variables Conductor itself sets.
+ * `CODEX_HOME` is Conductor's private home and `HOME` a private EMPTY directory, so nothing in the user's real ~/.codex (config, hooks,
+ * rules, MCP servers, credentials) or home directory is in play. Never `OPENAI_*`, never the user's `CODEX_*`.
+ */
+export function codexEnv(opts: { codexHome: string; home: string }, extra: Record<string, string> = {}, src: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const base = baseEnv(extra, src);
+  return { ...base, HOME: opts.home, CODEX_HOME: opts.codexHome };
+}
+
 /** Env for gates / dependency installs: base + explicitly passed-through names only. */
 export function toolEnv(passthrough: readonly string[] = [], src: NodeJS.ProcessEnv = process.env): Record<string, string> {
   return baseEnv({ ...pick(passthrough, src), CI: '1' }, src);

@@ -3,7 +3,7 @@
 import type { ProviderId } from './types.ts';
 import { isBuildIsolationVerified } from './verification.ts';
 
-export const PROVIDER_IDS = ['claude', 'cursor'] as const satisfies readonly ProviderId[];
+export const PROVIDER_IDS = ['claude', 'cursor', 'codex'] as const satisfies readonly ProviderId[];
 /** Providers that have a build capability in code. */
 export const BUILD_CAPABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(['cursor']);
 

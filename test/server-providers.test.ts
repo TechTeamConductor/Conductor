@@ -55,7 +55,7 @@ test('GET /api/providers: every registry provider with derived capabilities, a t
   const r = await get('/api/providers');
   assert.equal(r.status, 200);
   const ids = r.json.providers.map((p: any) => p.id).sort();
-  assert.deepEqual(ids, ['claude', 'cursor']);
+  assert.deepEqual(ids, ['claude', 'codex', 'cursor']);
   const cursor = r.json.providers.find((p: any) => p.id === 'cursor');
   assert.equal(cursor.label, 'Cursor');
   assert.deepEqual(cursor.capabilities, { readOnly: true, build: true, buildIsolationVerified: true });
@@ -65,6 +65,13 @@ test('GET /api/providers: every registry provider with derived capabilities, a t
   assert.equal(claude.tier, 'verified');
   assert.match(claude.hint, /claude\.com\/claude-code/);
   assert.ok(claude.inUse && cursor.inUse);
+  const codex = r.json.providers.find((p: any) => p.id === 'codex');
+  assert.equal(codex.label, 'Codex');
+  assert.deepEqual(codex.capabilities, { readOnly: true, build: false, buildIsolationVerified: false });
+  assert.equal(codex.tier, 'unverified');
+  assert.equal(codex.inUse, false, 'in no default chain');
+  assert.equal(codex.state, 'missing');
+  assert.match(codex.hint, /npm i -g @openai\/codex/);
   const st = await get('/api/state');
   assert.deepEqual(st.json.providers.map((p: any) => p.id).sort(), ids);
 });
@@ -78,6 +85,9 @@ test('GET /api/roles: the config, the role requirements and, per role and provid
   assert.equal(r.choices.implementation.claude.ok, false);
   assert.match(r.choices.implementation.claude.reason, /cannot write code/);
   assert.equal(r.choices.planning.claude.ok, true);
+  assert.deepEqual(r.choices.planning.codex, { ok: true, needsAck: true });
+  assert.equal(r.choices.implementation.codex.ok, false);
+  assert.match(r.choices.implementation.codex.reason, /Codex cannot write code/);
 });
 
 test('PUT /api/roles negatives: non-object bodies, prototype/unknown roles, bad providers, unsupported pairings, bad complexity keys — all 400/409, nothing saved', async () => {
@@ -133,8 +143,30 @@ test('PUT /api/roles: a valid assignment is saved, validated again at load, refl
   assert.equal(back.status, 200);
 });
 
+test('PUT /api/roles: an unverified provider (Codex) needs an explicit acknowledgement; a build role refuses it; the notice says where the text goes', async () => {
+  const noAck = await send('PUT', '/api/roles', { roles: { review: { providers: ['codex', 'claude'] } } });
+  assert.equal(noAck.status, 409);
+  assert.equal(noAck.json.error.code, 'needs_acknowledgement');
+  assert.match(noAck.json.error.message, /isolation has not been verified/);
+  const impl = await send('PUT', '/api/roles', { roles: { implementation: { providers: ['codex'] } }, acknowledge: ['codex'] });
+  assert.equal(impl.status, 400, 'an acknowledgement never unlocks a build role');
+  assert.equal(impl.json.error.code, 'unsupported_pairing');
+  const ok = await send('PUT', '/api/roles', { roles: { review: { providers: ['claude', 'codex'] } }, acknowledge: ['codex'] });
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.ok(ok.json.notices.some((n: string) => /Codex → review: .*OpenAI/.test(n)));
+  assert.deepEqual((await get('/api/roles')).json.roles.review.providers, ['claude', 'codex']);
+  assert.equal((await get('/api/providers')).json.providers.find((p: any) => p.id === 'codex').inUse, true);
+  // an already-assigned provider does not need to be acknowledged again
+  assert.equal((await send('PUT', '/api/roles', { roles: { review: { providers: ['claude', 'codex'] } } })).status, 200);
+  const back = await send('PUT', '/api/roles', { roles: { review: { providers: ['claude', 'cursor'] } } });
+  assert.equal(back.status, 200);
+  // the Codex canary is not available in this build: confirmed or not it never runs a model call
+  const c = await send('POST', '/api/providers/codex/test', { level: 'canary', confirm: true });
+  assert.equal(c.status, 501);
+});
+
 test('POST /api/providers/:id/test: the id is checked against the registry before anything else; bodies are strict; a canary needs confirm:true EVERY time, runs one at a time, with a cool-down', async () => {
-  for (const id of ['..%2F..%2Fetc', '__proto__', 'constructor', 'codex', 'CLAUDE', 'claude%00', '']) {
+  for (const id of ['..%2F..%2Fetc', '__proto__', 'constructor', 'gpt', 'CLAUDE', 'claude%00', '']) {
     const r = await send('POST', `/api/providers/${id}/test`, {});
     assert.ok(r.status === 404 || r.status === 400, `${id}: ${r.status}`);
   }

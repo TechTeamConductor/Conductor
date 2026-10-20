@@ -112,7 +112,9 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
 
 export function resumeCommand(run: Run, s: SessionRec): string {
   if (!isUuid(s.id) || !run.worktree) return '';
-  const bin = s.agent === 'claude' ? 'claude' : 'agent';
+  // Codex stages run `--ephemeral` in a private home: there is no session to resume
+  const bin = s.agent === 'claude' ? 'claude' : s.agent === 'cursor' ? 'agent' : null;
+  if (!bin) return '';
   return `cd ${shellQuote(run.worktree)} && ${bin} --resume ${s.id}`;
 }
 

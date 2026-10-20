@@ -6,10 +6,10 @@ import type { Schema } from '../json.ts';
 import type { StageName } from '../../types.ts';
 
 /** Registry-driven: add a provider by adding a registry entry; nothing else names providers in a ternary. */
-export type ProviderId = 'claude' | 'cursor';
+export type ProviderId = 'claude' | 'cursor' | 'codex';
 
 /** The ONLY place a provider's display name is written down. */
-export const PROVIDER_LABEL: Readonly<Record<ProviderId, string>> = Object.freeze({ claude: 'Claude', cursor: 'Cursor' });
+export const PROVIDER_LABEL: Readonly<Record<ProviderId, string>> = Object.freeze({ claude: 'Claude', cursor: 'Cursor', codex: 'Codex' });
 
 export interface ProviderDeps {
   getConfig: () => Config;

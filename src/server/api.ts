@@ -87,11 +87,13 @@ function str(v: unknown, name: string, max: number, required = true): string {
 const PROVIDER_HINT: Record<ProviderId, string> = {
   claude: 'Install Claude Code from https://claude.com/claude-code, then run `claude` once to sign in.',
   cursor: 'Install the Cursor agent: curl https://cursor.com/install -fsS | bash — then run `agent login`.',
+  codex: 'Install Codex (npm i -g @openai/codex), then sign in with Conductor\'s private home: CODEX_HOME=~/.conductor-v2/providers/codex-home codex login — Conductor never runs either command for you.',
 };
 /** Said once when a provider is first given a role: where the task text goes. */
 const EGRESS: Record<ProviderId, string> = {
   claude: 'Task text and repository content for this role are sent to Anthropic through your Claude Code login.',
   cursor: 'Task text and repository content for this role are sent to Cursor through your Cursor agent login.',
+  codex: 'Task text and repository content for this role are sent to OpenAI through the Codex login in Conductor\'s private home.',
 };
 const CANARY_COOLDOWN_MS = 60_000;
 
@@ -428,6 +430,7 @@ export class Api {
       }
       // canary: spends quota — explicit confirmation on EVERY call, one at a time per provider, with a cool-down
       if (body.confirm !== true) throw new ApiFail(400, 'confirm_required', 'This check calls the model and uses your plan\'s quota. Send "confirm": true to run it.');
+      if (id === 'codex') throw new ApiFail(501, 'not_available', 'The Codex isolation check is not available in this build yet; Codex stays labelled "unverified" until it has run on a working install.');
       if (this.canaryBusy.has(id)) throw new ApiFail(409, 'busy', 'A check for this provider is already running.');
       const last = this.canaryLast.get(id) ?? 0;
       if (Date.now() - last < CANARY_COOLDOWN_MS) throw new ApiFail(429, 'cooldown', 'That check just ran. Wait a minute before running it again.');

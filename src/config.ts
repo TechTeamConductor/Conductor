@@ -36,6 +36,8 @@ export function migrateConfigV3ToV4(raw: any): any {
   const legacy = stages !== undefined || onClaudeLimit !== undefined ? { ...(rest.legacy ?? {}), v3: { stages, onClaudeLimit } } : rest.legacy;
   return { ...rest, ...(pipeline !== undefined ? { pipeline: pl } : {}), roles, ...(legacy !== undefined ? { legacy } : {}) };
 }
+/** A Codex model name: letters/digits first, then letters, digits and . _ : / - (max 64). Anything else is dropped. */
+export const CODEX_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
 export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 4, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4 } };
 const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'pipeline', 'worktreeRoot', 'extra', 'legacy']);
 
@@ -47,6 +49,7 @@ export function defaultConfig(): Config {
     agents: {
       claude: { bin: 'claude', isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } },
       cursor: { bin: 'agent' },
+      codex: { bin: 'codex' },
     },
     roles: defaultRoles(),
     pipeline: {
@@ -105,6 +108,11 @@ export function normalizeConfig(input: unknown): Config {
       cursor: {
         bin: typeof ag.cursor?.bin === 'string' && ag.cursor.bin ? ag.cursor.bin : d.agents.cursor.bin,
         model: typeof ag.cursor?.model === 'string' && ag.cursor.model ? ag.cursor.model : undefined,
+      },
+      codex: {
+        bin: typeof ag.codex?.bin === 'string' && ag.codex.bin ? ag.codex.bin : d.agents.codex.bin,
+        // the only config-derived value that ever reaches the Codex command line, so it is validated here AND where the argv is built
+        model: typeof ag.codex?.model === 'string' && CODEX_MODEL_RE.test(ag.codex.model) ? ag.codex.model : undefined,
       },
     },
     roles: normalizeRoles((withRoles as any).roles, (m) => log.warn(`config roles: ${m}`)),

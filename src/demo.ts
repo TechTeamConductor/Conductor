@@ -93,6 +93,7 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
     health: async () => ({
       claude: { found: true, version: '2.1.296 (demo)', ok: true, loggedIn: true, detail: 'Demo mode — scripted agent' },
       cursor: { found: true, version: '2026.10.19 (demo)', ok: true, loggedIn: true, detail: 'Demo mode — scripted agent' },
+      codex: { found: false, ok: false, state: 'missing', detail: 'Codex is not part of the demo.' },
     }),
     probe: async (t: 'claude' | 'cursor') => ({ ok: true, detail: `${t} (demo) answered`, durationMs: 120 }),
     openExec: async () => undefined,

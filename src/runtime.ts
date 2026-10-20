@@ -28,7 +28,7 @@ export interface RuntimeOptions {
   secretStore?: SecretStore;
   persistent?: { load(): PersistentState; save(s: PersistentState): void };
   /** Replace real CLI health checks (demo/tests). */
-  health?: () => Promise<{ claude: any; cursor: any }>;
+  health?: () => Promise<{ claude: any; cursor: any; codex?: any }>;
   probe?: (t: 'claude' | 'cursor') => Promise<{ ok: boolean; detail: string; durationMs: number }>;
   openExec?: ExecFn;
   notify?: (title: string, message: string) => void;
@@ -70,16 +70,17 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [] });
   // The last CLI health the dashboard computed (the router reads it: a provider that is not installed / not signed in is skipped, visibly).
   // Older than 5 minutes it counts as unknown — a stale "not logged in" must never keep a provider out after the user signed in.
-  let lastHealth: { at: number; value: { claude: any; cursor: any } } | null = null;
+  let lastHealth: { at: number; value: { claude: any; cursor: any; codex: any } } | null = null;
   engine.setHealthSource(() => (lastHealth && Date.now() - lastHealth.at < 5 * 60_000 ? lastHealth.value : null));
   const health = async () => {
-    const base = opts.health ? await opts.health() : { claude: await agentHealth(getConfig(), 'claude'), cursor: await agentHealth(getConfig(), 'cursor') };
-    lastHealth = { at: Date.now(), value: { claude: base.claude, cursor: base.cursor } };
+    const base = opts.health ? await opts.health() : { claude: await agentHealth(getConfig(), 'claude'), cursor: await agentHealth(getConfig(), 'cursor'), codex: await agentHealth(getConfig(), 'codex') };
+    const codex = base.codex ?? { found: false, ok: false, state: 'missing', detail: 'Not checked.' };
+    lastHealth = { at: Date.now(), value: { claude: base.claude, cursor: base.cursor, codex } };
     const warnings: string[] = [];
     if (!opts.health) {
-      for (const c of await runChecks(getConfig())) if (c.level === 'warn' && c.id !== 'repos' && c.id !== 'keychain') warnings.push(`${c.label}: ${c.detail}`);
+      for (const c of await runChecks(getConfig())) if (c.level === 'warn' && c.id !== 'repos' && c.id !== 'keychain' && c.id !== 'codex') warnings.push(`${c.label}: ${c.detail}`);
     }
-    return { claude: base.claude, cursor: base.cursor, warnings };
+    return { claude: base.claude, cursor: base.cursor, codex, warnings };
   };
   const apiRef = new Api({
     engine,

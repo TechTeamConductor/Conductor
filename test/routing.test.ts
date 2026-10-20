@@ -16,6 +16,7 @@ const st = (over: Partial<ProviderState> & { build?: boolean; verified?: boolean
 const states = (o: Partial<Record<ProviderId, ProviderState>> = {}): States => ({
   claude: o.claude ?? st(),
   cursor: o.cursor ?? st({ build: true, verified: true, tier: 'partial' }),
+  codex: o.codex ?? st({ tier: 'unverified' }),
 });
 const names = (r: ReturnType<typeof route>) => (r.ok ? r.candidates.map((c) => c.id) : []);
 
