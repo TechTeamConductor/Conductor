@@ -13,14 +13,14 @@ export type Complexity = 'S' | 'M' | 'L';
 export type RunStatus =
   | 'queued' // claimed, waiting for a worker slot
   | 'running' // a stage job is executing
-  | 'awaiting_approval' // plan ready, waiting for human `/approve` or dashboard approve
+  | 'awaiting_approval' // plan ready, waiting for the human's Approve
   | 'needs_human' // blocked; human must act (see needsHuman)
   | 'paused' // provider usage limit; auto-resumes at pausedUntil
-  | 'parked' // human moved the issue to Backlog/Triage; hold, do nothing
+  | 'parked' // human moved the card to Backlog; hold, do nothing
   | 'ready' // verified; waiting for human to review/merge
   | 'aborted' // human cancelled/removed the trigger
   | 'failed' // infrastructure failure (retried by the poller)
-  | 'finished'; // human completed the Linear issue
+  | 'finished'; // human marked the card done
 
 /** The next step the engine will execute for a run. */
 export type NextStep = 'plan' | 'plan_review' | 'approval' | 'build' | 'verify' | 'none';
@@ -159,16 +159,16 @@ export interface BugRec {
   file?: string;
   detail: string; // markdown body used for the sub-issue
   status: 'open' | 'closed';
-  linearId?: string;
-  linearKey?: string;
+  itemId?: string; // the board item (kind 'bug') filed for this finding
+  itemKey?: string;
   loops: number[]; // loops in which it was observed
 }
 export interface EffectRec {
   status: 'pending' | 'done';
-  linearId?: string;
-  kind: 'comment' | 'subissue' | 'state' | 'labels' | 'close';
-  payload?: unknown; // everything needed to (re)apply the effect idempotently
-  attempts: number;
+  refId?: string; // id of the board entity the effect produced (comment / bug item)
+  kind: 'comment' | 'subissue' | 'state' | 'close';
+  payload?: unknown; // everything needed to (re)apply the effect idempotently (already redacted)
+  attempts: number; // failures so far (reporting + back-off only; a local write cannot half-fail)
   lastError?: string;
 }
 export interface HistoryLine {
@@ -176,15 +176,15 @@ export interface HistoryLine {
   text: string;
 }
 export interface Run {
-  /** On-disk data version of this record (see src/schema). Stamped on every write; absent in legacy files = 1. */
+  /** On-disk data version of this record (see src/schema). Stamped on every write; absent in legacy files = 1 (migrated in memory to 2). */
   schemaVersion?: number;
-  key: string; // Linear identifier, e.g. "ENG-123"
-  issueId: string;
-  teamId: string;
+  /** Fields carried over from a v1 (Linear) run, kept verbatim and never interpreted. */
+  legacy?: Record<string, unknown>;
+  key: string; // board key, e.g. "APP-12"
+  itemId: string; // board item id
   title: string;
-  description: string; // snapshot at claim (trusted: attribution-checked)
+  description: string; // snapshot at claim; a later edit halts the run at the next stage boundary
   descHash: string;
-  url: string;
   repo: string; // RepoConfig.name
   branch: string; // conductor/<key-lower>
   worktree: string;
@@ -208,23 +208,23 @@ export interface Run {
   unverifiedWhy?: string;
   noPushEnvOnly: boolean; // tracked .cursor/cli.json prevented writing the deny rule
   cursorGuardSha?: string; // sha256 of .cursor/cli.json written for the build
-  /** Picked up via the explicit `allowAssignedToMe` opt-in (creator attribution is skipped). */
-  assignedPickup?: boolean;
+  /** Source text was never verified (e.g. imported from another system): the plan always waits for human approval. */
+  untrusted?: boolean;
   planApproved: boolean;
   approvedBy?: 'auto' | 'human';
   planReviewDone: boolean;
   planReviewRounds: number; // revisions requested by plan review so far
   answered?: boolean; // deliverable was an answer (no code); finished without build/verify
   limitStreak?: number; // consecutive usage-limit rejections (back-off); reset on any successful agent call
-  limitEpisode?: number; // increments when a new limit streak starts (one Linear comment/notification per episode)
+  limitEpisode?: number; // increments when a new limit streak starts (one board comment/notification per episode)
   buildFails?: number; // consecutive failed Cursor build attempts in the current stage
   feedback?: string; // reviewer/human feedback to include in the next plan prompt
   commitNote?: string; // repo-hook output from a failed commit, fed to the fix prompt
   lockfileHash?: string; // last installed lockfile hash (re-install when it changes)
   lastError?: string;
   complexity?: Complexity;
-  /** What Conductor last wrote to Linear (used to tell human edits from its own). */
-  expected: { stateId?: string; stage?: string };
+  /** What Conductor last projected onto the board. */
+  expected: { written?: boolean; stage?: string };
   sessions: SessionRec[];
   bugs: BugRec[];
   effects: Record<string, EffectRec>;
@@ -232,7 +232,7 @@ export interface Run {
   verdict: 'pass' | 'fail' | null;
   history: HistoryLine[];
   lastEventSeq: number;
-  /** Markers: conversation comments already consumed into prompts (Linear comment ids). */
+  /** Conversation comments already consumed into prompts (board comment ids). */
   commentsSeen: string[];
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
   restartTimes?: number[];
@@ -295,9 +295,7 @@ export interface Settings {
   maxParallel: number;
   onClaudeLimit: Config['pipeline']['onClaudeLimit'];
   noGates: Config['pipeline']['noGates'];
-  pickupFromBacklog: boolean;
   stages: Config['stages'];
-  linearMode: Config['linear']['mode'];
 }
 
 // ───────────────────────────── agents ─────────────────────────────
@@ -323,89 +321,8 @@ export interface AgentResult {
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
 }
 
-// ───────────────────────────── Linear port ─────────────────────────────
-export interface LinearState {
-  id: string;
-  name: string;
-  type: 'triage' | 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
-}
-export interface LinearLabel {
-  id: string;
-  name: string;
-  teamId: string | null; // null = workspace-level label
-}
-export interface LinearComment {
-  id: string;
-  body: string;
-  userId: string | null;
-  createdAt: string; // ISO
-}
-export interface LinearHistoryEntry {
-  id: string;
-  createdAt: string; // ISO
-  actorId: string | null;
-  addedLabelIds: string[];
-  removedLabelIds: string[];
-  /** Users who edited the description in this entry (empty/undefined if not edited). */
-  descriptionUpdatedBy: string[];
-  /** Who changed the issue TITLE / PROJECT in this entry (security review H2: both reach agent prompts). */
-  titleUpdatedBy?: string[];
-  projectUpdatedBy?: string[];
-  fromStateId?: string | null;
-  toStateId?: string | null;
-}
-export interface LinearIssue {
-  id: string;
-  identifier: string; // "ENG-123"
-  title: string;
-  description: string;
-  url: string;
-  priority: number;
-  state: LinearState;
-  labels: LinearLabel[];
-  creatorId: string | null;
-  assigneeId: string | null;
-  parentId: string | null;
-  projectName: string | null;
-  teamId: string;
-  createdAt: string;
-  updatedAt: string;
-  comments?: LinearComment[]; // present on `issue()` only
-  history?: LinearHistoryEntry[]; // present on `issue()` only; ALL pages
-}
-export interface TeamSetupInfo {
-  states: LinearState[];
-  labels: LinearLabel[]; // team + workspace labels
-  /** Team's default state for new issues (C4), if Linear exposes it. */
-  defaultIssueStateId: string | null;
-}
-export interface LinearPort {
-  viewer(): Promise<{ id: string; name: string; email: string }>;
-  teams(): Promise<{ id: string; key: string; name: string }[]>;
-  teamSetup(teamId: string): Promise<TeamSetupInfo>;
-  createLabel(teamId: string, input: { name: string; color: string }): Promise<LinearLabel>;
-  createState(teamId: string, input: { name: string; type: LinearState['type']; color: string }): Promise<LinearState>;
-  /** Open issues (state type not completed/canceled) in the team carrying `triggerLabel`; creator/assignee/parent/state/labels populated. */
-  candidates(teamId: string, triggerLabel: string, opts?: { includeAssigned?: boolean }): Promise<LinearIssue[]>;
-  /** One issue with comments and ALL history pages. */
-  issue(id: string): Promise<LinearIssue>;
-  update(
-    id: string,
-    patch: { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[]; description?: string },
-  ): Promise<void>;
-  comment(issueId: string, body: string): Promise<{ id: string }>;
-  createIssue(input: {
-    teamId: string;
-    title: string;
-    description?: string;
-    parentId?: string;
-    labelIds?: string[];
-    stateId?: string;
-    projectId?: string;
-  }): Promise<LinearIssue>;
-  /** Sub-issues of an issue (for marker-based dedupe). */
-  children(issueId: string): Promise<LinearIssue[]>;
-}
+// Linear types live in src/linear/types.ts (legacy, removed in M1d); re-exported so the Linear modules and their tests keep compiling until then.
+export type * from './linear/types.ts';
 
 // ───────────────────────────── HTTP API shapes (see docs/API.md) ─────────────────────────────
 export interface AgentHealth {
@@ -474,19 +391,22 @@ export interface ApiQuota {
   claude?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean };
 }
 export interface ApiEngine {
-  /** Issues carrying the trigger label that Conductor deliberately ignores, with the reason. */
+  /** Cards Conductor deliberately does not run (e.g. in a Conductor-owned lane without a run), with the reason. */
   ignored?: { key: string; reason: string }[];
+  /** Set when the board cannot be written (disk full, journal refused): effects stop retrying every tick until it recovers. */
+  storageProblem?: string | null;
   paused: boolean;
   pauseReason?: string;
   providerPause: Partial<Record<AgentName, { until: number; reason: string }>>;
   running: number;
   maxParallel: number;
+  /** Last time the engine looked at the board. */
   lastPollAt: number | null;
   lastPollError: string | null;
   pollSeconds: number;
 }
 export interface ApiSetupStep {
-  id: 'agents' | 'linear' | 'team' | 'repo';
+  id: 'agents' | 'repo';
   label: string;
   ok: boolean;
   detail?: string;
@@ -508,7 +428,6 @@ export interface ApiState {
   health: {
     claude: AgentHealth;
     cursor: AgentHealth;
-    linear: { ok: boolean; viewer?: string; detail?: string };
     warnings: string[];
   };
   quota: ApiQuota;

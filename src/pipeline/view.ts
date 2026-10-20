@@ -80,7 +80,7 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
   return {
     key: run.key,
     title: run.title,
-    url: run.url,
+    url: '', // cards have no external page (kept for API compatibility; removed from the UI in M1c)
     repo: run.repo,
     status: st,
     column: columnOf(run),

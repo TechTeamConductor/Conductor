@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, makeHarness } from './helpers/harness.ts';
 
-test('happy path: Todo → plan → build → verify → ready, in an isolated worktree', async () => {
+test('happy path: To do → plan → build → verify → ready, in an isolated worktree', async () => {
   const h = await makeHarness();
   try {
     const mainBefore = git(h.repoDir, 'rev-parse', 'HEAD');
@@ -25,12 +25,12 @@ test('happy path: Todo → plan → build → verify → ready, in an isolated w
     assert.ok(existsSync(join(run.worktree, '.conductor', 'plan.md')));
     assert.equal(git(run.worktree, 'status', '--porcelain'), '');
     assert.ok(!git(run.worktree, 'ls-files').includes('.conductor'));
-    // Linear: comments posted, stage reflected, no PR/push
-    const issue = h.linear.issueByKey(key);
-    const comments = (await h.linear.issue(issue.id)).comments ?? [];
-    assert.ok(comments.some((c) => c.body.includes('Conductor plan')), 'plan comment');
+    // Board: comments posted, lane + stage reflected, no PR/push
+    const comments = h.board.comments(key);
+    assert.ok(comments.some((c) => c.author === 'conductor' && c.body.includes('Conductor plan')), 'plan comment');
     assert.ok(comments.some((c) => c.body.includes('Ready for review')), 'ready comment');
-    assert.ok(issue.labels.some((l) => l.name === 'conductor:ready'));
+    assert.equal(h.board.item(key)!.lane, 'review');
+    assert.equal(h.board.item(key)!.stage, 'ready');
     assert.ok(h.notes.some((n) => /ready/i.test(n.title)));
     // sessions recorded for both agents with resumable ids
     assert.ok(run.sessions.some((s) => s.agent === 'claude' && s.stage === 'plan'));

@@ -1,4 +1,4 @@
-// AC2: the whole first-run wizard (agents → Linear key → team → labels → repo) driven through the HTTP API.
+// AC2 (v2): the first-run wizard — agents → repository — driven through the HTTP API. No Linear, no key, no team, no labels.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -6,7 +6,6 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRuntime, type Runtime } from '../src/runtime.ts';
-import { FakeLinear } from '../src/linear/fake.ts';
 import { MemoryStore } from '../src/secrets.ts';
 import { defaultConfig, normalizeConfig } from '../src/config.ts';
 import { makeRepo } from './helpers/harness.ts';
@@ -17,8 +16,6 @@ let cookie = '';
 let csrf = '';
 let home = '';
 const secrets = new MemoryStore();
-const fake = new FakeLinear({ key: 'WIZ' });
-const KEY = 'lin_api_' + 'AbCdEfGhIjKlMnOpQrStUvWx0123456789';
 
 function call(path: string, method = 'GET', body?: unknown): Promise<{ status: number; json: any; text: string }> {
   return new Promise((resolve, reject) => {
@@ -48,10 +45,7 @@ before(async () => {
   rt = await createRuntime({
     ephemeral: true,
     config: normalizeConfig(defaultConfig()),
-    linear: null,
     secretStore: secrets,
-    connect: async () => ({ viewer: { id: fake.viewerId, name: 'Wiz User', email: 'w@example.com' }, teams: [{ id: fake.teamId, key: 'WIZ', name: 'Wizard Team' }] }),
-    makeLinear: () => fake,
     health: async () => ({ claude: { found: true, ok: true, loggedIn: true, detail: 'ok' }, cursor: { found: true, ok: true, loggedIn: true, detail: 'ok' } }),
     persistent: { load: () => ({ repos: {} }), save: () => undefined },
     notify: () => undefined,
@@ -68,50 +62,34 @@ after(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test('fresh install: setup is incomplete with the right steps, and the board is not shown', async () => {
+test('fresh install: setup is incomplete with exactly two steps (agents, repository) and no Linear anywhere', async () => {
   const s = (await call('/api/state')).json;
   assert.equal(s.setup.complete, false);
-  assert.deepEqual(s.setup.steps.map((x: any) => [x.id, x.ok]), [['agents', true], ['linear', false], ['team', false], ['repo', false]]);
+  assert.deepEqual(s.setup.steps.map((x: any) => [x.id, x.ok]), [['agents', true], ['repo', false]]);
+  assert.equal(s.health.linear, undefined);
+  assert.equal(JSON.stringify(s).toLowerCase().includes('linear'), false, 'no Linear wording in the state the UI receives');
+  assert.equal((await call('/api/setup/linear-key', 'POST', { key: 'lin_api_' + 'x'.repeat(30) })).status, 404, 'the old Linear endpoints are gone');
 });
 
-test('wizard end to end: key → (dry-run preview) → create labels → repo → complete; the key is stored once and never echoed', async () => {
-  const bad = await call('/api/setup/linear-key', 'POST', { key: 'not-a-linear-key' });
-  assert.equal(bad.status, 400);
-  const k = await call('/api/setup/linear-key', 'POST', { key: KEY });
-  assert.equal(k.status, 200);
-  assert.deepEqual(k.json.teams.map((t: any) => t.key), ['WIZ']);
-  assert.ok(!k.text.includes(KEY), 'the key is not echoed back');
-  assert.equal(await secrets.get('linear-api-key'), KEY, 'stored in the secret store');
-  assert.equal((await call('/api/state')).json.setup.steps[1].ok, true);
-
-  const dry = await call('/api/setup/team', 'POST', { teamId: fake.teamId, mode: 'labels', dryRun: true });
-  assert.equal(dry.status, 200);
-  assert.equal(dry.json.dryRun, true);
-  assert.ok(dry.json.willCreate.includes('conductor') && dry.json.willCreate.includes('conductor-bug') && dry.json.willCreate.length === 8, dry.text);
-  assert.equal(fake.allLabels().some((l) => l.name === 'conductor'), false, 'the preview creates nothing in Linear');
-  assert.ok(Array.isArray(dry.json.warnings));
-
-  const real = await call('/api/setup/team', 'POST', { teamId: fake.teamId, mode: 'labels', dryRun: false });
-  assert.equal(real.status, 200);
-  assert.equal(real.json.created.length, 8);
-  assert.ok(fake.labelByName('conductor') && fake.labelByName('conductor:building'));
-  const again = await call('/api/setup/team', 'POST', { teamId: fake.teamId, mode: 'labels', dryRun: false });
-  assert.equal(again.json.created.length, 0, 'idempotent');
-
+test('wizard end to end: register a repository → setup complete; tasks need a repository first', async () => {
+  const early = await call('/api/tasks', 'POST', { title: 'too early' });
+  assert.ok(early.status >= 400 && early.status < 500, 'no repository yet ⇒ a clear 4xx, not a crash');
   const repo = await call('/api/setup/repo', 'POST', { path: join(home, 'app') });
   assert.equal(repo.status, 200);
   assert.ok(repo.json.repo.gates.some((g: any) => g.name === 'test'));
-
   const done = (await call('/api/state')).json;
   assert.equal(done.setup.complete, true);
   assert.ok(done.setup.steps.every((s: any) => s.ok));
 });
 
-test('after setup the pipeline works from the dashboard: New task → picked up → finished', async () => {
+test('after setup the pipeline works from the dashboard: New task → card on the board → picked up', async () => {
   rt.engine.start({ pollMs: 100 });
   const t = await call('/api/tasks', 'POST', { title: 'Wizard smoke task', description: 'hello' });
   assert.equal(t.status, 201);
-  assert.match(t.json.key, /^WIZ-\d+$/);
+  assert.match(t.json.key, /^APP-\d+$/, 'the project key is derived from the repository name');
+  const board = (await call('/api/board')).json;
+  assert.ok(board.projects.some((p: any) => p.repo === 'app'));
+  assert.ok(board.items.some((i: any) => i.key === t.json.key && i.createdBy === 'user'));
   const t0 = Date.now();
   for (;;) {
     const r = (await call('/api/state')).json.runs.find((x: any) => x.key === t.json.key);

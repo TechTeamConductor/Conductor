@@ -11,7 +11,6 @@ import { createRuntime, VERSION } from './runtime.ts';
 import { isolationProbe, probe, runChecks } from './doctor.ts';
 import { installService, serviceStatus, uninstallService, plistPath } from './service.ts';
 import { startDemo } from './demo.ts';
-import { SECRET_LINEAR, defaultSecretStore, dropSecret } from './secrets.ts';
 import { errMsg } from './util.ts';
 
 const log = logger('cli');
@@ -23,18 +22,18 @@ const opt = (n: string) => {
   return i >= 0 ? argv[i + 1] : undefined;
 };
 
-const HELP = `Conductor ${VERSION} — Linear → Claude plans → Cursor builds → Claude verifies
+const HELP = `Conductor ${VERSION} — a board → Claude plans → Cursor builds → Claude verifies
 
 Usage: conductor <command>
 
   start              run Conductor and open the dashboard (default)
   open               open a fresh signed-in dashboard tab (when it is already running)
   demo               try everything with scripted agents — no keys, no quota
-  doctor             check your setup   [--isolation] [--probe] [--linear]
+  doctor             check your setup   [--isolation] [--probe]
   service install    keep Conductor running in the background (launchd)   [--dry-run]
   service uninstall  remove the background service
   service status
-  uninstall          remove the service and the stored Linear key   [--purge removes ~/.conductor]
+  uninstall          remove the background service   [--purge removes the data folder]
   version
 
 Flags for start: --no-open (do not open a browser tab), --port <n>
@@ -123,7 +122,6 @@ async function start(): Promise<void> {
   }
   lock.update({ port });
   await rt.server.listenControl(paths.control());
-  await rt.refreshLinear();
   rt.engine.start();
   const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
   const url = `http://127.0.0.1:${port}`;
@@ -160,7 +158,7 @@ async function openCmd(): Promise<void> {
 
 async function demo(): Promise<void> {
   const d = await startDemo({ port: Number(opt('--port')) || undefined });
-  console.log(`\nConductor DEMO is running (scripted agents, in-memory Linear — nothing real is touched).\n\n  ${d.url}\n\nThree sample tasks are queued: one waits for your plan approval, one shows the bug-fix loop, one asks you a question.\nCreate your own with “New task”. Stop with Ctrl+C.\n`);
+  console.log(`\nConductor DEMO is running (scripted agents, a throw-away board — nothing real is touched).\n\n  ${d.url}\n\nThree sample tasks are queued: one waits for your plan approval, one shows the bug-fix loop, one asks you a question.\nCreate your own with “New task”. Stop with Ctrl+C.\n`);
   if (!flag('--no-open')) openBrowser(d.url);
   const stop = async () => {
     await d.close();
@@ -175,15 +173,7 @@ async function doctor(): Promise<void> {
   ensureHome();
   const cfg = loadConfig();
   configureLog({ level: 'error' });
-  let linear = null;
-  try {
-    const rt = await createRuntime({ ephemeral: true, config: cfg });
-    linear = rt.linearRef.port;
-    await rt.close();
-  } catch {
-    /* no linear */
-  }
-  const checks = await runChecks(cfg, { linear });
+  const checks = await runChecks(cfg); // never opens the board (it must work while the app is running)
   console.log(`Conductor ${VERSION} — setup check\n`);
   for (const c of checks) console.log(` ${mark(c.level)} ${c.label.padEnd(28)} ${c.detail}`);
   let failed = checks.some((c) => c.level === 'fail');
@@ -201,12 +191,6 @@ async function doctor(): Promise<void> {
       console.log(` ${r.ok ? '✓' : '✗'} ${t.padEnd(8)} ${r.detail} (${r.durationMs} ms)`);
       if (!r.ok) failed = true;
     }
-  }
-  if (flag('--linear')) {
-    console.log('\nLinear (read-only)…');
-    const r = await probe(cfg, 'linear', linear);
-    console.log(` ${r.ok ? '✓' : '✗'} ${r.detail}`);
-    if (!r.ok) failed = true;
   }
   const h: AgentHealth | undefined = undefined;
   void h;
@@ -238,12 +222,11 @@ async function service(): Promise<void> {
 
 async function uninstall(): Promise<void> {
   await uninstallService();
-  await dropSecret(defaultSecretStore(), SECRET_LINEAR);
-  console.log('Removed the background service and the stored Linear key.');
+  console.log('Removed the background service.');
   if (flag('--purge')) {
     rmSync(paths.home(), { recursive: true, force: true });
     console.log(`Deleted ${paths.home()}.`);
-  } else console.log(`Your settings and run history are still in ${paths.home()} (use --purge to delete them).\nLinear labels/statuses created by Conductor are left in place — remove them in Linear if you like.`);
+  } else console.log(`Your settings and run history are still in ${paths.home()} (use --purge to delete them).`);
 }
 
 main().catch((e) => {

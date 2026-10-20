@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import type { AgentHealth, Config, LinearPort } from './types.ts';
+import type { AgentHealth, Config } from './types.ts';
 import { resolveBin } from './config.ts';
 import { claudeEnv, cursorEnv } from './agents/env.ts';
 import { buildClaudeArgs, checkClaudeInit } from './agents/claude.ts';
@@ -64,7 +64,7 @@ export async function agentHealth(cfg: Config, which: 'claude' | 'cursor', force
 }
 
 /** Everything the doctor command and dashboard warnings need. Never spends agent quota. */
-export async function runChecks(cfg: Config, opts: { linear?: LinearPort | null } = {}): Promise<Check[]> {
+export async function runChecks(cfg: Config): Promise<Check[]> {
   const out: Check[] = [];
   const add = (id: string, label: string, level: Check['level'], detail: string) => out.push({ id, label, level, detail });
 
@@ -79,16 +79,7 @@ export async function runChecks(cfg: Config, opts: { linear?: LinearPort | null 
   add('claude', 'Claude Code', c.ok ? 'ok' : 'fail', `${c.version ?? ''} ${c.detail ?? ''}`.trim());
   const k = await agentHealth(cfg, 'cursor');
   add('cursor', 'Cursor CLI', k.ok ? 'ok' : 'fail', `${k.version ?? ''} ${k.detail ?? ''}`.trim());
-  add('keychain', 'Secret storage', KeychainStore.available() && process.env.CONDUCTOR_NO_KEYCHAIN !== '1' ? 'ok' : 'warn', KeychainStore.available() ? 'macOS Keychain' : '0600 file in ~/.conductor (Keychain unavailable)');
-
-  if (opts.linear) {
-    try {
-      const v = await opts.linear.viewer();
-      add('linear', 'Linear', 'ok', `Connected as ${v.name || v.email}`);
-    } catch (e) {
-      add('linear', 'Linear', 'fail', truncate(errMsg(e), 200));
-    }
-  } else add('linear', 'Linear', 'warn', 'Not connected yet — finish the setup wizard (paste a Linear API key).');
+  add('keychain', 'Secret storage', KeychainStore.available() && process.env.CONDUCTOR_NO_KEYCHAIN !== '1' ? 'ok' : 'warn', KeychainStore.available() ? 'macOS Keychain' : '0600 file in the data folder (Keychain unavailable)');
 
   if (!cfg.repos.length) add('repos', 'Repositories', 'warn', 'No repository registered yet.');
   for (const r of cfg.repos) {
@@ -99,7 +90,7 @@ export async function runChecks(cfg: Config, opts: { linear?: LinearPort | null 
     add(`repo:${r.name}`, `Repo ${r.name}`, r.gates.length ? 'ok' : 'warn', r.gates.length ? `Gates: ${r.gates.map((g) => g.name).join(', ')}` : 'No test/lint/typecheck commands detected — results will be flagged "unverified".');
     const wtRoot = cfg.worktreeRoot ?? join(r.path, '..', '.conductor-worktrees');
     const anc = await scanAncestors(join(wtRoot, r.name, 'x')).catch(() => []);
-    if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `Cursor may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in ~/.conductor/config.json to a clean folder if this causes trouble.`);
+    if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `Cursor may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in the data folder's config.json to a clean folder if this causes trouble.`);
     if (r.path.startsWith('/Volumes/')) add(`volume:${r.name}`, 'External drive', 'warn', `${r.name} lives on an external volume — if you install the background service, launchd may start before the drive mounts (it retries automatically).`);
   }
   try {
@@ -204,16 +195,10 @@ export async function isolationProbe(cfg: Config): Promise<IsolationReport> {
 }
 
 // ───────────────────────── explicit probes (may spend a tiny amount of quota) ─────────────────────────
-export async function probe(cfg: Config, target: 'claude' | 'cursor' | 'linear', linear?: LinearPort | null): Promise<{ ok: boolean; detail: string; durationMs: number }> {
+export async function probe(cfg: Config, target: 'claude' | 'cursor'): Promise<{ ok: boolean; detail: string; durationMs: number }> {
   const t0 = Date.now();
   const done = (ok: boolean, detail: string) => ({ ok, detail, durationMs: Date.now() - t0 });
   try {
-    if (target === 'linear') {
-      if (!linear) return done(false, 'Linear is not connected yet.');
-      const v = await linear.viewer();
-      const teams = await linear.teams();
-      return done(true, `Connected as ${v.name || v.email} · ${teams.length} team(s)`);
-    }
     const tmp = mkdtempSync(join(tmpdir(), 'cond-probe-'));
     try {
       if (target === 'claude') {

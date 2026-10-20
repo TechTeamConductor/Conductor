@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 import { chmodSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, makeHarness, TestClock, type Harness } from './helpers/harness.ts';
-import { comments, labelNames } from './helpers/util.ts';
-import { markerLine } from '../src/linear/attribution.ts';
+import { comments, laneOf, stageOf } from './helpers/util.ts';
+import { Effects } from '../src/pipeline/effects.ts';
 import { looksSecret, redact } from '../src/redact.ts';
 import { defaultConfig, normalizeConfig } from '../src/config.ts';
 
@@ -21,7 +21,7 @@ async function until(h: Harness, fn: () => boolean, ms = 20_000): Promise<void> 
 const bug = (title: string, extra: Record<string, unknown> = {}) => ({ title, severity: 'major', file: 'feature.mjs', line: 1, evidence: `${title} (evidence)`, repro: 'r', suggestedFix: 'f', ...extra });
 
 // ───────────── the user's BAR-363 failure: a QUESTION must be answered, not built ─────────────
-test('question task: the planner answers, Conductor posts the answer in Linear and finishes — no build, no verify', async () => {
+test('question task: the planner answers, Conductor posts the answer on the card and finishes — no build, no verify', async () => {
   const h = await makeHarness();
   try {
     h.scenario({ claude: { '*': { plan: [{ json: { deliverable: 'answer', answer: '## Best feature\nMulti-tenant isolation (`services/api/src/isolation.test.ts`).', filesToChange: [], acceptanceCriteria: [], steps: [] } }] } } });
@@ -32,8 +32,9 @@ test('question task: the planner answers, Conductor posts the answer in Linear a
     assert.equal(run.answered, true);
     assert.equal(h.calls().filter((c) => c.who === 'cursor').length, 0, 'the builder never ran');
     assert.equal(h.calls().filter((c) => c.who === 'claude' && c.stage === 'verify').length, 0, 'the verifier never ran');
-    assert.ok((await comments(h, key)).some((c) => c.includes('Multi-tenant isolation') && c.includes('Answer')), 'the answer is in Linear');
-    assert.ok(labelNames(h, key).includes('conductor:ready'));
+    assert.ok((await comments(h, key)).some((c) => c.includes('Multi-tenant isolation') && c.includes('Answer')), 'the answer is on the card');
+    assert.equal(laneOf(h, key), 'review');
+    assert.equal(stageOf(h, key), 'ready');
     assert.ok(h.notes.some((n) => /answered/i.test(n.title)));
   } finally {
     await h.cleanup();
@@ -52,8 +53,8 @@ test('question task without an answer text is rejected by validation and re-aske
   }
 });
 
-// ───────────── B1: the per-issue agent-run cap must not be a dead end ─────────────
-test('B1: hitting the agent-run cap → needs_human; moving to Todo gives a FRESH budget and the run completes', async () => {
+// ───────────── B1: the per-card agent-run cap must not be a dead end ─────────────
+test('B1: hitting the agent-run cap → needs_human; moving to To do gives a FRESH budget and the run completes', async () => {
   const h = await makeHarness({ config: (c) => void (c.pipeline.maxAgentRunsPerIssue = 3) });
   try {
     h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'x', bugs: [bug('Needs a fix')] } }, { json: { verdict: 'pass' } }] } } });
@@ -61,7 +62,7 @@ test('B1: hitting the agent-run cap → needs_human; moving to Todo gives a FRES
     await h.settle(); // plan(1) build(2) verify(3) → fail → build would be #4 → cap
     assert.equal(h.run(key).status, 'needs_human');
     assert.match(h.run(key).needsHuman!.reason, /agent runs/);
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'Todo');
+    await h.engine.applyHumanMove(key, 'todo');
     await h.settle();
     assert.equal(h.run(key).status, 'ready', 'the same retry used to hit the cap again forever');
     assert.ok(h.run(key).agentRuns <= 3);
@@ -70,7 +71,7 @@ test('B1: hitting the agent-run cap → needs_human; moving to Todo gives a FRES
   }
 });
 
-// ───────────── B2: repeated Cursor limits must not spam Linear or eat the budget ─────────────
+// ───────────── B2: repeated Cursor limits must not spam the board or eat the budget ─────────────
 test('B2: 12 consecutive Cursor limit rejections → still paused, ONE comment, ONE notification, budget untouched, growing back-off', async () => {
   const clock = new TestClock();
   const h = await makeHarness({ clock });
@@ -157,7 +158,7 @@ test('M3: verifier "fail" with only an unverifiable criterion → needs_human af
 });
 
 // ───────────── M4 / M5: sub-issue hygiene ─────────────
-test('M4: a full re-plan closes the now-obsolete bug sub-issue in Linear (not just locally)', async () => {
+test('M4: a full re-plan closes the now-obsolete bug child card on the board (not just locally)', async () => {
   const h = await makeHarness();
   try {
     h.scenario({
@@ -167,33 +168,31 @@ test('M4: a full re-plan closes the now-obsolete bug sub-issue in Linear (not ju
     const key = h.issue('Re-plan while a bug is open');
     await until(h, () => h.store.get(key)?.loop === 2 && h.store.get(key)?.status === 'running');
     await sleep(500);
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'Todo');
-    await h.engine.tick();
+    await h.engine.applyHumanMove(key, 'todo'); // restart while the builder is mid-flight
     await h.engine.idle();
     await h.settle(60);
     const run = h.run(key);
     assert.equal(run.status, 'ready');
     assert.ok(run.rev >= 2);
-    const kids = await h.linear.children(h.linear.issueByKey(key).id);
+    const kids = h.board.children(h.board.item(key)!.id);
     assert.equal(kids.length, 1);
-    assert.equal(kids[0]!.state.type, 'completed', 'the stale [Bug] sub-issue is closed in Linear');
+    assert.equal(kids[0]!.lane, 'done', 'the stale [Bug] card is closed on the board');
   } finally {
     await h.cleanup();
   }
 });
-test('M5: 12 findings → at most 5 sub-issues per loop / 8 per run (rest summarised); a re-observed bug is commented on, not duplicated', async () => {
+test('M5: 12 findings → at most 5 bug cards per loop / 8 per run (rest summarised); a re-observed bug is commented on, not duplicated', async () => {
   const h = await makeHarness({ config: (c) => void (c.pipeline.maxLoops = 2) });
   try {
     const twelve = Array.from({ length: 12 }, (_, i) => bug(`Distinct problem number ${i + 1}`, { file: `f${i}.mjs` }));
     h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'many', bugs: twelve } }] } } });
     const key = h.issue('Lots of bugs');
     await h.settle();
-    const kids = await h.linear.children(h.linear.issueByKey(key).id);
-    assert.ok(kids.length <= 8, `at most 8 sub-issues per run (5 per loop), got ${kids.length}`);
+    const kids = h.board.children(h.board.item(key)!.id);
+    assert.ok(kids.length <= 8, `at most 8 bug cards per run (5 per loop), got ${kids.length}`);
     assert.ok(kids.length >= 5, 'the most severe findings are still filed');
     assert.ok((await comments(h, key)).some((c) => /more finding\(s\) were not filed/.test(c)), 'overflow is summarised in the parent comment');
-    const first = await h.linear.issue(kids[0]!.id);
-    assert.ok((first.comments ?? []).some((c) => /Still failing after loop 2/.test(c.body)), 'the existing sub-issue is updated when the bug is re-observed');
+    assert.ok(h.board.comments(kids[0]!.id).some((c) => /Still failing after loop 2/.test(c.body)), 'the existing bug card is updated when the bug is re-observed');
   } finally {
     await h.cleanup();
   }
@@ -213,47 +212,43 @@ test('m12: a plan that touches CI/agent config always waits for a human, even wi
   }
 });
 
-// ───────────── m1: a REAL crash window (attempt recorded, Linear write happened, "done" never saved) ─────────────
-test('m1: pending effect from a crashed process whose comment already exists in Linear is ADOPTED, not duplicated', async () => {
+// ───────────── m1: a REAL crash window (the board write happened, "done" was never saved) ─────────────
+test('m1: a pending effect whose comment already reached the board is ADOPTED by its idempotency key, not duplicated', async () => {
   const h = await makeHarness({ config: (c) => void (c.pipeline.planApproval = 'manual') });
   try {
     const key = h.issue('Crash window');
     await h.settle();
-    const issueId = h.linear.issueByKey(key).id;
-    const mk = `${key}:crash-test`;
-    await h.linear.comment(issueId, `🤖 body\n\n${markerLine(mk)}`); // the write that happened right before the "crash"
-    h.store.update(key, (r) => {
-      r.effects['crash-test'] = { kind: 'comment', status: 'pending', attempts: 0, payload: { body: '🤖 body' } }; // attempt not yet persisted by the OLD code
-    });
+    const itemId = h.board.item(key)!.id;
+    for (const name of ['crash-test', 'crash-test2']) {
+      h.board.addComment(itemId, `🤖 ${name}`, 'conductor', { idemKey: `${key}:${name}` }); // the write that happened right before the "crash"
+      h.store.update(key, (r) => Effects.enqueue(r, name, { kind: 'comment', payload: { body: `🤖 ${name}` } })); // …but the run never recorded it as done
+    }
     await h.engine.effects.flush(key);
-    const twins = (await comments(h, key)).filter((c) => c.includes('crash-test'));
-    // with the fix, the attempt is persisted before the write; an effect left at attempts>=1 is looked up first
-    h.store.update(key, (r) => {
-      r.effects['crash-test2'] = { kind: 'comment', status: 'pending', attempts: 1, payload: { body: '🤖 body2' } };
-    });
-    await h.linear.comment(issueId, `🤖 body2\n\n${markerLine(`${key}:crash-test2`)}`);
-    await h.engine.effects.flush(key);
-    const twins2 = (await comments(h, key)).filter((c) => c.includes('crash-test2'));
-    assert.equal(twins2.length, 1, 'no duplicate when the attempt had been recorded');
-    assert.equal(h.run(key).effects['crash-test2']!.status, 'done');
-    void twins;
+    for (const name of ['crash-test', 'crash-test2']) {
+      assert.equal((await comments(h, key)).filter((c) => c === `🤖 ${name}`).length, 1, `no duplicate for ${name}`);
+      assert.equal(h.run(key).effects[name]!.status, 'done');
+    }
   } finally {
     await h.cleanup();
   }
 });
 
 // ───────────── m2 / m3 / m4 / m6 ─────────────
-test('m2: un-parking a READY run (issue moved from Backlog to a started status) restores ready — it does not become a zombie', async () => {
+test('m2: a parked READY run moved back to To do is re-planned keeping its commits — it does not become a zombie', async () => {
   const h = await makeHarness();
   try {
-    const key = h.issue('Park then un-park');
+    const key = h.issue('Park then restart');
     await h.settle();
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'Backlog');
+    const commit = h.run(key).commitSha;
+    await h.engine.applyHumanMove(key, 'backlog');
     await h.settle();
     assert.equal(h.run(key).status, 'parked');
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'In Progress');
+    assert.equal(laneOf(h, key), 'backlog');
+    await h.engine.applyHumanMove(key, 'todo');
     await h.settle();
     assert.equal(h.run(key).status, 'ready');
+    assert.equal(h.run(key).rev, 2);
+    assert.ok(commit && h.run(key).commitSha, 'work was kept');
   } finally {
     await h.cleanup();
   }
@@ -263,7 +258,7 @@ test('m2: Resume/Retry on a parked run explains how to continue instead of being
   try {
     const key = h.issue('Parked');
     await h.settle();
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'Backlog');
+    await h.engine.applyHumanMove(key, 'backlog');
     await h.settle();
     assert.throws(() => h.engine.resume(key), /Backlog/);
     await assert.rejects(() => h.engine.retry(key), /Backlog/);

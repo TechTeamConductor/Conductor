@@ -1,213 +1,210 @@
-import type { EffectRec, LinearPort, Run } from '../types.ts';
+import type { EffectRec, Run } from '../types.ts';
 import type { RunStore } from '../store.ts';
+import type { Board } from '../board/index.ts';
+import { BoardError } from '../board/types.ts';
+import { laneForRun } from '../board/lanes.ts';
 import { errMsg, truncate } from '../util.ts';
 import { redact } from '../redact.ts';
-import { hasMarker, markerLine } from '../linear/attribution.ts';
 import { logger } from '../log.ts';
 
 const log = logger('effects');
-const MAX_ATTEMPTS = 12;
 const COMMENT_LIMIT = 30_000;
+/** An effect still failing this long after its first failure is reported as a storage problem (a brief hiccup is not). */
+const STUCK_MS = 15_000;
 
-/** Agent-written text is untrusted: no remote images (tracking/exfil) and no @mentions that would ping teammates (L12). */
+/** Agent-written text is untrusted: no remote images (tracking/exfil) in rendered markdown. */
 function neutralise(s: string): string {
-  return s.replace(/!\[/g, '!\\[').replace(/@(?=[A-Za-z0-9_])/g, '@\u200b');
+  return s.replace(/!\[/g, '!\\[');
 }
 
-type StatePayload = { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[] };
-type SubIssuePayload = { fp: string; title: string; description: string; labelIds: string[]; stateId?: string; teamId: string };
+type SubIssuePayload = { fp: string; title: string; description: string };
+export type EffectInput =
+  | { kind: 'comment'; payload: { body: string; itemId?: string } }
+  | { kind: 'state'; payload: { stage?: string } }
+  | { kind: 'subissue'; payload: SubIssuePayload }
+  | { kind: 'close'; payload: { itemId: string; lane: 'done' | 'todo' } };
 
 export interface EffectsDeps {
-  /** Only comments/issues authored by the API-key owner can be adopted as Conductor's own (marker spoofing, M3). */
-  viewerId?: () => string | undefined;
   store: RunStore;
-  linear: () => LinearPort | null;
+  board: Board;
   secrets: (run: Run) => string[];
+  now?: () => number;
 }
 
 /**
- * Idempotent Linear side effects (RC6). Every effect is written to the run record as `pending` BEFORE it is
- * attempted; on retry (or after a crash) a marker lookup adopts a half-completed write instead of duplicating it.
+ * Conductor's writes to the board (crash protocol, workspace-v2-m1.md):
+ *   1. the effect is recorded as `pending` in run.json — for the transitions that matter in the SAME `RunStore.update` as the
+ *      status change (`Effects.enqueue`, used inside the caller's patch; condition K1);
+ *   2. it is applied to the board with an idempotency key `<RUN>:<effKey>` (a replay is a no-op);
+ *   3. it is marked `done`. `flush()` re-applies anything still pending (every tick and once at startup).
+ * A local write cannot half-fail across a network, so there are no marker lookups and no give-up counter; a persistent
+ * storage failure is surfaced (`storageProblem`) and retried with back-off instead of every tick (condition K3).
  */
 export class Effects {
   private deps: EffectsDeps;
-  private chains = new Map<string, Promise<unknown>>();
+  private nextTry = new Map<string, number>(); // `${key}|${effKey}` → epoch ms (back-off for failing writes)
+  private lastFailure: string | null = null;
+  private failedSince = new Map<string, number>(); // `${key}|${effKey}` → first transient failure (ms)
 
   constructor(deps: EffectsDeps) {
     this.deps = deps;
   }
-
-  private serial<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const prev = this.chains.get(key) ?? Promise.resolve();
-    const next = prev.then(fn, fn);
-    this.chains.set(key, next.catch(() => undefined));
-    return next;
+  private now(): number {
+    return (this.deps.now ?? Date.now)();
   }
 
-  private marker(run: Run, effKey: string): string {
-    return `${run.key}:${effKey}`;
-  }
-
-  private setRec(key: string, effKey: string, patch: Partial<EffectRec> & { kind: EffectRec['kind'] }): void {
-    this.deps.store.update(key, (r) => {
-      const cur = r.effects[effKey];
-      r.effects[effKey] = { ...cur, ...patch, status: patch.status ?? cur?.status ?? 'pending', attempts: cur?.attempts ?? 0 };
-    });
-  }
-
-  /** Post a comment once per (run, effKey). */
-  comment(key: string, effKey: string, body: string): Promise<void> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run || run.effects[effKey]?.status === 'done') return;
-      const safe = neutralise(truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT));
-      this.setRec(key, effKey, { kind: 'comment', payload: { body: safe } });
-      await this.apply(key, effKey);
-    });
-  }
-
-  /** Post a comment on a *different* issue (e.g. a bug sub-issue) once per (run, effKey). */
-  commentOn(key: string, effKey: string, issueId: string, body: string): Promise<void> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run || run.effects[effKey]?.status === 'done') return;
-      const safe = neutralise(truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT));
-      this.setRec(key, effKey, { kind: 'comment', payload: { body: safe, issueId } });
-      await this.apply(key, effKey);
-    });
-  }
-
-  /** Update state/labels; also records `run.expected`. */
-  state(key: string, effKey: string, payload: StatePayload, stageName?: string): Promise<void> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run) return;
-      // state effects are naturally idempotent: always re-apply the latest intent under the same key
-      this.setRec(key, effKey, { kind: 'state', status: 'pending', payload: { ...payload, stageName } });
-      await this.apply(key, effKey);
-    });
-  }
-
-  /** Create a bug sub-issue once; returns its id/identifier when known. */
-  subIssue(key: string, effKey: string, payload: SubIssuePayload): Promise<{ id: string; identifier?: string } | null> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run) return null;
-      const cur = run.effects[effKey];
-      if (cur?.status === 'done' && cur.linearId) return { id: cur.linearId };
-      this.setRec(key, effKey, { kind: 'subissue', payload });
-      await this.apply(key, effKey);
-      const after = this.deps.store.get(key)?.effects[effKey];
-      return after?.linearId ? { id: after.linearId } : null;
-    });
-  }
-
-  /** Move a Linear issue (e.g. a bug sub-issue) to a completed state. */
-  close(key: string, effKey: string, issueId: string, doneStateId: string): Promise<void> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run || run.effects[effKey]?.status === 'done') return;
-      this.setRec(key, effKey, { kind: 'close', payload: { issueId, doneStateId } });
-      await this.apply(key, effKey);
-    });
-  }
-
-  /** Re-attempt every pending effect of a run (called each poll). */
-  flush(key: string): Promise<void> {
-    return this.serial(key, async () => {
-      const run = this.deps.store.get(key);
-      if (!run) return;
-      for (const [effKey, rec] of Object.entries(run.effects)) {
-        if (rec.status === 'pending') await this.apply(key, effKey);
+  /**
+   * Non-null while some effect has been failing to reach the board for ≥ 15 s and is still pending; clears by itself once every
+   * such effect has gone through. (A success of a *different* effect does not hide a stuck one.)
+   */
+  storageProblem(): string | null {
+    if (!this.lastFailure) return null;
+    const now = this.now();
+    for (const [k, since] of [...this.failedSince]) {
+      const [key, effKey] = k.split('|') as [string, string];
+      if (this.deps.store.get(key)?.effects[effKey]?.status !== 'pending') {
+        this.failedSince.delete(k);
+        continue;
       }
-    });
+      if (now - since >= STUCK_MS) return `The board could not be written: ${this.lastFailure}`;
+    }
+    if (!this.failedSince.size) this.lastFailure = null;
+    return null;
   }
 
+  /** Mutate `run` (inside the caller's `store.update`) so the effect is recorded atomically with the caller's own changes. */
+  static enqueue(run: Run, effKey: string, input: EffectInput, secrets: readonly string[] = []): void {
+    const cur = run.effects[effKey];
+    const alwaysRepend = input.kind === 'state'; // state intents are re-applied under the same key: the latest one wins
+    if (cur?.status === 'done' && !alwaysRepend) return;
+    let payload: unknown = input.payload;
+    if (input.kind === 'comment') {
+      const p = input.payload;
+      payload = { ...p, body: neutralise(truncate(redact(p.body, secrets), COMMENT_LIMIT)) };
+    } else if (input.kind === 'subissue') {
+      const p = input.payload;
+      payload = { fp: p.fp, title: truncate(redact(p.title, secrets), 200), description: truncate(redact(p.description, secrets), 20_000) };
+    }
+    run.effects[effKey] = { ...cur, kind: input.kind, status: 'pending', payload, attempts: alwaysRepend ? 0 : cur?.attempts ?? 0 } as EffectRec;
+  }
+
+  private enqueueAndApply(key: string, effKey: string, input: EffectInput): void {
+    const run = this.deps.store.get(key);
+    if (!run) return;
+    if (input.kind !== 'state' && run.effects[effKey]?.status === 'done') return;
+    this.deps.store.update(key, (r) => Effects.enqueue(r, effKey, input, this.deps.secrets(r)));
+    this.apply(key, effKey);
+  }
+
+  async comment(key: string, effKey: string, body: string): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'comment', payload: { body } });
+  }
+  /** A comment on a *different* item (e.g. a bug child). */
+  async commentOn(key: string, effKey: string, itemId: string, body: string): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'comment', payload: { body, itemId } });
+  }
+  /** Project the run's stage label (and lane — derived from the run's CURRENT status at apply time) onto the board. */
+  async state(key: string, effKey: string, payload: { stage?: string }): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'state', payload });
+  }
+  /** File a bug child item once; returns its id when known. */
+  async subIssue(key: string, effKey: string, payload: SubIssuePayload): Promise<{ id: string; key?: string } | null> {
+    const run = this.deps.store.get(key);
+    if (!run) return null;
+    const cur = run.effects[effKey];
+    if (cur?.status === 'done' && cur.refId) return { id: cur.refId };
+    this.enqueueAndApply(key, effKey, { kind: 'subissue', payload });
+    const after = this.deps.store.get(key)?.effects[effKey];
+    return after?.refId ? { id: after.refId, key: this.deps.board.item(after.refId)?.key } : null;
+  }
+  /** Move a bug child (close = done, reopen = todo). */
+  async close(key: string, effKey: string, itemId: string, lane: 'done' | 'todo' = 'done'): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'close', payload: { itemId, lane } });
+  }
+
+  /** Re-attempt every pending effect of a run. */
+  async flush(key: string): Promise<void> {
+    const run = this.deps.store.get(key);
+    if (!run) return;
+    for (const [effKey, rec] of Object.entries(run.effects)) {
+      if (rec.status !== 'pending') continue;
+      if ((this.nextTry.get(`${key}|${effKey}`) ?? 0) > this.now()) continue;
+      this.apply(key, effKey);
+    }
+  }
+
+  /** True when the run has any pending effect (the startup flush covers exactly these runs). */
+  hasPending(run: Run): boolean {
+    return Object.values(run.effects).some((e) => e.status === 'pending');
+  }
   pendingCount(key: string): number {
     const run = this.deps.store.get(key);
     return run ? Object.values(run.effects).filter((e) => e.status === 'pending').length : 0;
   }
 
-  private async apply(key: string, effKey: string): Promise<void> {
-    const linear = this.deps.linear();
+  private apply(key: string, effKey: string): void {
     const run = this.deps.store.get(key);
     const rec = run?.effects[effKey];
-    if (!linear || !run || !rec || rec.status === 'done') return;
-    const prior = rec.attempts ?? 0;
-    const lookup = prior > 0; // any earlier attempt (even one that crashed mid-flight) may have half-succeeded
-    // persist the attempt BEFORE touching Linear: after a crash the retry must look the marker up instead of re-creating
-    this.deps.store.update(key, (r) => {
-      const x = r.effects[effKey];
-      if (x) x.attempts = prior + 1;
-    });
-    const mk = this.marker(run, effKey);
+    if (!run || !rec || rec.status === 'done') return;
+    const board = this.deps.board;
+    const mk = `${run.key}:${effKey}`;
     try {
-      let linearId: string | undefined = rec.linearId;
+      let refId: string | undefined = rec.refId;
       if (rec.kind === 'comment') {
-        const p = rec.payload as { body: string; issueId?: string };
-        const body = String(p.body);
-        const target = p.issueId ?? run.issueId;
-        let found: string | undefined;
-        if (lookup) {
-          const issue = await linear.issue(target);
-          const me = this.deps.viewerId?.();
-          found = issue.comments?.find((c) => hasMarker(c.body, mk) && (!me || c.userId === me))?.id;
-        }
-        linearId = found ?? (await linear.comment(target, `${body}\n\n${markerLine(mk)}`)).id;
+        const p = rec.payload as { body: string; itemId?: string };
+        refId = board.addComment(p.itemId ?? run.itemId, String(p.body), 'conductor', { idemKey: mk }).id;
       } else if (rec.kind === 'state') {
-        const p = rec.payload as StatePayload & { stageName?: string };
-        await linear.update(run.issueId, { stateId: p.stateId, addLabelIds: p.addLabelIds, removeLabelIds: p.removeLabelIds });
+        const p = rec.payload as { stage?: string };
+        const lane = laneForRun(run);
+        board.setLane(run.itemId, lane, 'conductor', { stage: p.stage });
         this.deps.store.update(key, (r) => {
-          r.expected = { stateId: p.stateId ?? r.expected.stateId, stage: p.stageName ?? r.expected.stage };
+          r.expected = { written: true, stage: p.stage ?? r.expected.stage };
         });
       } else if (rec.kind === 'subissue') {
         const p = rec.payload as SubIssuePayload;
-        let found: string | undefined;
-        if (lookup) {
-          const me = this.deps.viewerId?.();
-          found = (await linear.children(run.issueId)).find((c) => hasMarker(c.description ?? '', mk) && (!me || c.creatorId === me))?.id;
-        }
-        if (found) linearId = found;
-        else {
-          const created = await linear.createIssue({
-            teamId: p.teamId,
-            title: truncate(redact(p.title, this.deps.secrets(run)), 200), // titles leak too (H3)
-            description: `${truncate(redact(p.description, this.deps.secrets(run)), 20_000)}\n\n${markerLine(mk)}`,
-            parentId: run.issueId,
-            labelIds: p.labelIds,
-            stateId: p.stateId,
-          });
-          linearId = created.id;
-          this.deps.store.update(key, (r) => {
-            const b = r.bugs.find((x) => x.fp === p.fp);
-            if (b) {
-              b.linearId = created.id;
-              b.linearKey = created.identifier;
-            }
-          });
-        }
+        const parent = board.item(run.itemId);
+        if (!parent) throw new BoardError('not_found', 'The parent card no longer exists.');
+        const created = board.createItem({ projectId: parent.projectId, title: p.title, description: p.description, kind: 'bug', parentId: parent.id, lane: 'todo', autoStart: false, idemKey: mk }, 'conductor');
+        refId = created.id;
+        this.deps.store.update(key, (r) => {
+          const b = r.bugs.find((x) => x.fp === p.fp);
+          if (b) {
+            b.itemId = created.id;
+            b.itemKey = created.key;
+          }
+        });
       } else if (rec.kind === 'close') {
-        const p = rec.payload as { issueId: string; doneStateId: string };
-        await linear.update(p.issueId, { stateId: p.doneStateId });
+        const p = rec.payload as { itemId: string; lane: 'done' | 'todo' };
+        board.setLane(p.itemId, p.lane, 'conductor');
       }
+      this.nextTry.delete(`${key}|${effKey}`);
+      this.failedSince.delete(`${key}|${effKey}`);
       this.deps.store.update(key, (r) => {
         const e = r.effects[effKey];
         if (e) {
           e.status = 'done';
-          e.linearId = linearId ?? e.linearId;
+          e.refId = refId ?? e.refId;
           e.lastError = undefined;
-          e.attempts = 0; // a success clears the retry history (state effects are re-used across stages)
+          e.attempts = 0;
         }
       });
     } catch (e) {
       const msg = redact(errMsg(e), this.deps.secrets(run));
-      log.warn(`${key} effect ${effKey} failed: ${msg}`);
+      const permanent = e instanceof BoardError && e.code !== 'read_only'; // e.g. the target item vanished: retrying cannot succeed
+      log.warn(`${key} effect ${effKey} failed${permanent ? ' (giving up)' : ''}: ${msg}`);
       this.deps.store.update(key, (r) => {
         const x = r.effects[effKey];
         if (!x) return;
         x.lastError = truncate(msg, 300);
-        if ((x.attempts ?? 0) >= MAX_ATTEMPTS) x.status = 'done'; // give up; never loop forever (attempts already counted)
+        x.attempts = (x.attempts ?? 0) + 1;
+        if (permanent) x.status = 'done';
       });
+      if (!permanent) {
+        const n = this.deps.store.get(key)?.effects[effKey]?.attempts ?? 1;
+        this.nextTry.set(`${key}|${effKey}`, this.now() + Math.min(5 * 60_000, 2_000 * 2 ** Math.min(n, 8)));
+        this.lastFailure = truncate(msg, 160);
+        if (!this.failedSince.has(`${key}|${effKey}`)) this.failedSince.set(`${key}|${effKey}`, this.now());
+      }
     }
   }
 }

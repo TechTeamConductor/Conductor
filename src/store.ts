@@ -14,10 +14,11 @@ import { paths } from './paths.ts';
 import { atomicWriteFile, deepClone } from './util.ts';
 import { NewerVersionError } from './schema/errors.ts';
 import { quarantine } from './schema/version.ts';
+import { migrateRunV1ToV2 } from './schema/run-migrations.ts';
 import { logger } from './log.ts';
 
 /** Version of the run.json shape this build reads and writes. (Shape-changing migrations are registered with the code that consumes them — M1b.) */
-export const RUN_SCHEMA_VERSION = 1;
+export const RUN_SCHEMA_VERSION = 2;
 const log = logger('store');
 
 export type StoreEvent = { type: 'run'; key: string } | { type: 'log'; key: string; event: LogEvent };
@@ -38,13 +39,16 @@ export class RunStoreError extends Error {
 /** Crash-safe, single-process run store (JSON files + ndjson event logs). */
 export class RunStore {
   private root: string;
+  /** Read-only consumers (doctor, the importer reading a v1 home) must never rename or rewrite anything (review N2). */
+  private readOnly: boolean;
   private seq = new Map<string, number>();
   private listeners = new Set<StoreListener>();
   private cache = new Map<string, Run>();
 
-  constructor(root: string = paths.runs()) {
+  constructor(root: string = paths.runs(), opts: { readOnly?: boolean } = {}) {
     this.root = root;
-    mkdirSync(root, { recursive: true, mode: 0o700 });
+    this.readOnly = opts.readOnly === true;
+    if (!this.readOnly) mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
   static validKey(key: string): boolean {
@@ -100,13 +104,13 @@ export class RunStore {
       raw = JSON.parse(readFileSync(f, 'utf8'));
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('not an object');
     } catch (e) {
-      const kept = quarantine(f);
-      log.warn(`${key}: run.json is unreadable (${(e as Error).message}) — kept as ${kept ?? 'run.json'} and ignored`);
+      const kept = this.readOnly ? null : quarantine(f);
+      log.warn(`${key}: run.json is unreadable (${(e as Error).message})${kept ? ` — kept as ${kept}` : ' — left in place'} and ignored`);
       return null;
     }
     const v = typeof raw.schemaVersion === 'number' ? raw.schemaVersion : 1;
     if (v > RUN_SCHEMA_VERSION) throw new NewerVersionError('run record', f, v, RUN_SCHEMA_VERSION);
-    return raw as Run;
+    return (v < 2 ? migrateRunV1ToV2(raw) : raw) as Run;
   }
 
   has(key: string): boolean {
@@ -249,7 +253,7 @@ export class RunStore {
 }
 
 /** Factory for a blank run record. */
-export function newRun(seed: Pick<Run, 'key' | 'issueId' | 'teamId' | 'title' | 'description' | 'descHash' | 'url' | 'repo' | 'branch' | 'worktree' | 'baseSha'> & { loopBudget: number }): Run {
+export function newRun(seed: Pick<Run, 'key' | 'itemId' | 'title' | 'description' | 'descHash' | 'repo' | 'branch' | 'worktree' | 'baseSha'> & { loopBudget: number }): Run {
   const now = Date.now();
   return {
     ...seed,

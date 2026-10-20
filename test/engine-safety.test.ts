@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { git, makeHarness, makeRepo } from './helpers/harness.ts';
+import { git, makeHarness, makeRepo, TestClock } from './helpers/harness.ts';
+import { Effects } from '../src/pipeline/effects.ts';
 import { comments } from './helpers/util.ts';
 
 test('Claude isolation is fail-closed: an unexpected tool/MCP in init stops the stage', async () => {
@@ -117,36 +118,57 @@ test('secrets from copied env files are redacted from Linear comments and logs',
   }
 });
 
-test('crash between "comment created" and "recorded": retry adopts the existing comment (no duplicate)', async () => {
+test('crash between "board write" and "effect marked done": the replay adopts the existing comment (no duplicate)', async () => {
   const h = await makeHarness();
   try {
     const key = h.issue('Idempotent');
-    // the first plan comment is created in Linear but the call "fails" after success
-    h.linear.failNext('comment', new Error('network dropped after write'), 1, { after: true });
     await h.settle();
-    for (let i = 0; i < 3; i++) await h.engine.tick(); // flush pending effects
-    const cs = (await comments(h, key)).filter((c) => c.includes('conductor-ref:') && c.includes(':claimed'));
-    assert.equal(cs.length, 1, 'claimed comment exists exactly once');
-    const planCs = (await comments(h, key)).filter((c) => c.includes('Conductor plan'));
-    assert.equal(planCs.length, 1);
+    const run = h.run(key);
+    // crash window (b): the comment reached the board, but the run record never saw it complete
+    h.store.update(key, (r) => Effects.enqueue(r, 'crashy', { kind: 'comment', payload: { body: 'late narration' } }));
+    h.board.addComment(run.itemId, 'late narration', 'conductor', { idemKey: `${key}:crashy` });
+    assert.equal(h.engine.effects.pendingCount(key), 1);
+    await h.engine.effects.flush(key);
+    assert.equal(h.engine.effects.pendingCount(key), 0);
+    assert.equal((await comments(h, key)).filter((c) => c === 'late narration').length, 1, 'exactly one copy');
+    // and the ordinary effects of a normal run are not duplicated either
+    assert.equal((await comments(h, key)).filter((c) => c.includes('Conductor plan')).length, 1);
+    assert.equal((await comments(h, key)).filter((c) => c.includes('picked this up')).length, 1);
   } finally {
     await h.cleanup();
   }
 });
 
-test('Linear outage during a run does not lose work; effects flush when Linear recovers', async () => {
-  const h = await makeHarness();
+test('a board that cannot be written does not lose work: effects stay pending, the problem is surfaced, and they flush when it recovers (K3)', async () => {
+  const clock = new TestClock();
+  const h = await makeHarness({ clock });
   try {
     const key = h.issue('Outage');
     await h.engine.tick(); // claim OK
-    h.linear.failNext('comment', new Error('Linear is down'), 50);
-    h.linear.failNext('update', new Error('Linear is down'), 50);
-    await h.settle(); // pipeline still completes locally
+    const real = h.board.addComment.bind(h.board);
+    let failing = true;
+    (h.board as any).addComment = (...a: Parameters<typeof real>) => {
+      if (failing) throw new Error('ENOSPC: no space left on device');
+      return real(...a);
+    };
+    await h.settle(); // the pipeline still completes locally
     assert.equal(h.run(key).status, 'ready');
     assert.ok(h.engine.effects.pendingCount(key) > 0, 'some effects are still pending');
-    h.linear.clearFailures();
+    assert.equal(h.engine.status().storageProblem, null, 'a brief hiccup is not yet reported');
+    clock.advance(30_000);
+    await h.engine.tick(); // one back-off retry — still failing
+    assert.match(h.engine.status().storageProblem ?? '', /could not be written/, 'a persistent failure is surfaced to the dashboard');
+    // retries are spaced out (back-off), not spun every tick
+    const before = h.run(key).effects;
+    const attemptsBefore = Object.values(before).reduce((n, e) => n + (e.attempts ?? 0), 0);
+    for (let i = 0; i < 5; i++) await h.engine.tick();
+    const attemptsAfter = Object.values(h.run(key).effects).reduce((n, e) => n + (e.attempts ?? 0), 0);
+    assert.equal(attemptsAfter, attemptsBefore, 'no retry storm: back-off holds until the clock moves');
+    failing = false;
+    clock.advance(10 * 60_000);
     for (let i = 0; i < 4; i++) await h.engine.tick();
     assert.equal(h.engine.effects.pendingCount(key), 0);
+    assert.equal(h.engine.status().storageProblem, null, 'the banner clears on recovery');
     assert.ok((await comments(h, key)).some((c) => c.includes('Ready for review')));
   } finally {
     await h.cleanup();

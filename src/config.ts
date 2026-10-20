@@ -199,9 +199,7 @@ export function toSettings(cfg: Config): Settings {
     maxParallel: cfg.pipeline.maxParallel,
     onClaudeLimit: cfg.pipeline.onClaudeLimit,
     noGates: cfg.pipeline.noGates,
-    pickupFromBacklog: cfg.linear.pickupFromBacklog,
     stages: { ...cfg.stages },
-    linearMode: cfg.linear.mode,
   };
 }
 
@@ -218,10 +216,6 @@ export function applySettings(cfg: Config, patch: Partial<Settings>): Config {
       ...(patch.maxParallel !== undefined ? { maxParallel: patch.maxParallel } : {}),
       ...(patch.onClaudeLimit !== undefined ? { onClaudeLimit: patch.onClaudeLimit } : {}),
       ...(patch.noGates !== undefined ? { noGates: patch.noGates } : {}),
-    },
-    linear: {
-      ...next.linear,
-      ...(patch.pickupFromBacklog !== undefined ? { pickupFromBacklog: patch.pickupFromBacklog } : {}),
     },
     stages: { ...next.stages, ...(patch.stages ?? {}) },
   });

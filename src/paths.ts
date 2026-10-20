@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 
 /** Root of all Conductor state. Override with CONDUCTOR_HOME (tests, demo). */
 export function conductorHome(): string {
@@ -21,8 +21,23 @@ export const paths = {
   lock: () => join(conductorHome(), 'run', 'lock.json'),
   control: () => join(conductorHome(), 'run', 'control.sock'),
 };
+/**
+ * v2 data folders carry a `home.json` marker. A non-empty folder WITHOUT it is a v1 (or foreign) data folder: v2 refuses to
+ * use it in place (its run records would be rewritten in the v2 shape, which v1 cannot read) and points at `conductor migrate`.
+ */
+export function assertHomeIsUsable(home: string = paths.home()): void {
+  if (!existsSync(home)) return;
+  if (existsSync(join(home, 'home.json'))) return;
+  const entries = readdirSync(home).filter((n) => !n.startsWith('.'));
+  if (entries.length === 0) return;
+  throw new Error(`${home} contains data from Conductor v1 (or another tool), not a v2 data folder. v2 never modifies it in place — run "conductor migrate" to import it side-by-side, or point CONDUCTOR_HOME at an empty folder.`);
+}
+
 export function ensureHome(): void {
+  assertHomeIsUsable();
   for (const d of [paths.home(), paths.runs(), paths.logs(), paths.runtime()]) {
     mkdirSync(d, { recursive: true, mode: 0o700 });
   }
+  const marker = join(paths.home(), 'home.json');
+  if (!existsSync(marker)) writeFileSync(marker, JSON.stringify({ kind: 'conductor-home', generation: 2, createdAt: Date.now() }) + '\n', { mode: 0o600 });
 }

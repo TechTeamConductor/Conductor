@@ -8,7 +8,8 @@ import { backupPaths, backupRoot } from '../../src/schema/backup.ts';
 import { CorruptFileError, NewerVersionError } from '../../src/schema/errors.ts';
 import { loadConfig, saveConfig, loadState, saveState, normalizeConfig, defaultConfig } from '../../src/config.ts';
 import { RunStore, RUN_SCHEMA_VERSION } from '../../src/store.ts';
-import { conductorHome, paths } from '../../src/paths.ts';
+import { conductorHome, paths, ensureHome, assertHomeIsUsable } from '../../src/paths.ts';
+import { migrateRunV1ToV2 } from '../../src/schema/run-migrations.ts';
 import { sha256 } from '../../src/util.ts';
 
 const FIX = join(import.meta.dirname, '..', 'fixtures', 'real-shape-v1');
@@ -20,6 +21,7 @@ beforeEach(() => {
   process.env.CONDUCTOR_HOME = home;
   process.env.CONDUCTOR_BACKUP_DIR = backups; // tests must never write to the user's real backup directory
   _resetBackupMemory();
+  ensureHome(); // creates the (empty) v2 folder + marker; fixtures are copied in afterwards
 });
 
 const spec = (current: number, migrations: VersionSpec['migrations'] = {}): VersionSpec => ({ kind: 'thing', field: 'schemaVersion', current, assumeWhenMissing: 1, migrations });
@@ -140,20 +142,25 @@ test('state.json: stamped on write, legacy (unstamped) loads, newer refused, cor
   assert.ok(readdirSync(home).some((n) => n.startsWith('state.json.corrupt-')));
 });
 
-test('run.json: stamped on create/update; a legacy unstamped run (real shape) loads; newer is refused; corrupt is quarantined', () => {
+test('run.json: a legacy v1 run (real shape) is migrated in memory to v2; stamped on update; newer refused; corrupt quarantined', () => {
   cpSync(join(FIX, 'runs'), paths.runs(), { recursive: true });
   const store = new RunStore();
   const legacy = store.get('ENG-7')!;
   assert.equal(legacy.status, 'needs_human');
-  assert.equal(legacy.schemaVersion, undefined, 'legacy files carry no stamp and are treated as version 1');
+  assert.equal(legacy.itemId, '', 'unlinked until the importer attaches the card');
+  assert.equal((legacy.legacy as any).issueId, 'issue-0000', 'Linear-only fields are kept verbatim under `legacy`');
+  assert.equal((legacy as any).issueId, undefined);
+  assert.equal((legacy as any).teamId, undefined);
+  assert.deepEqual(legacy.effects, {}, 'pending Linear effects are dropped');
+  assert.equal(JSON.parse(readFileSync(join(paths.run('ENG-7'), 'run.json'), 'utf8')).issueId, 'issue-0000', 'reading never rewrites the file');
   store.update('ENG-7', (r) => void (r.title = 'edited'));
-  assert.equal(JSON.parse(readFileSync(join(paths.run('ENG-7'), 'run.json'), 'utf8')).schemaVersion, RUN_SCHEMA_VERSION);
+  const onDisk = JSON.parse(readFileSync(join(paths.run('ENG-7'), 'run.json'), 'utf8'));
+  assert.equal(onDisk.schemaVersion, RUN_SCHEMA_VERSION);
+  assert.equal(onDisk.issueId, undefined);
   // newer
   const f = join(paths.run('ENG-7'), 'run.json');
-  const j = JSON.parse(readFileSync(f, 'utf8'));
-  writeFileSync(f, JSON.stringify({ ...j, schemaVersion: 7 }));
-  const fresh = new RunStore();
-  assert.throws(() => fresh.get('ENG-7'), (e: any) => e instanceof NewerVersionError);
+  writeFileSync(f, JSON.stringify({ ...onDisk, schemaVersion: 7 }));
+  assert.throws(() => new RunStore().get('ENG-7'), (e: any) => e instanceof NewerVersionError);
   assert.equal(JSON.parse(readFileSync(f, 'utf8')).schemaVersion, 7, 'not rewritten');
   // corrupt
   mkdirSync(paths.run('ENG-8'), { recursive: true });
@@ -161,4 +168,46 @@ test('run.json: stamped on create/update; a legacy unstamped run (real shape) lo
   assert.equal(new RunStore().get('ENG-8'), null);
   assert.ok(readdirSync(paths.run('ENG-8')).some((n) => n.startsWith('run.json.corrupt-')));
   void quarantine;
+});
+
+test('N2: a read-only RunStore never renames, rewrites or creates anything (doctor / importer safety)', () => {
+  mkdirSync(paths.run('ENG-9'), { recursive: true });
+  writeFileSync(join(paths.run('ENG-9'), 'run.json'), '{oops');
+  const ro = new RunStore(paths.runs(), { readOnly: true });
+  assert.equal(ro.get('ENG-9'), null);
+  assert.deepEqual(readdirSync(paths.run('ENG-9')), ['run.json'], 'the corrupt file was left exactly where it was');
+  const missing = join(home, 'nowhere', 'runs');
+  new RunStore(missing, { readOnly: true });
+  assert.equal(existsSync(missing), false, 'opening read-only does not create the folder');
+});
+
+test('migrateRunV1ToV2: pure, idempotent on v2 data, flags assigned-pickup runs untrusted and moves bug links aside', () => {
+  const v1 = { key: 'X-1', issueId: 'i', teamId: 't', url: 'u', assignedPickup: true, expected: { stateId: 's', stage: 'building' }, effects: { a: { status: 'pending', kind: 'comment', attempts: 0 } }, bugs: [{ fp: 'f', title: 'b', linearId: 'L1', linearKey: 'X-2', status: 'open', loops: [1] }] };
+  const copy = JSON.stringify(v1);
+  const v2 = migrateRunV1ToV2(v1);
+  assert.equal(JSON.stringify(v1), copy, 'the input is not mutated');
+  assert.equal(v2.untrusted, true);
+  assert.deepEqual(v2.expected, { written: true, stage: 'building' });
+  assert.equal(v2.bugs[0].itemId, undefined);
+  assert.deepEqual(v2.bugs[0].legacy, { linearId: 'L1', linearKey: 'X-2' });
+  assert.deepEqual(v2.legacy.effects, v1.effects);
+  assert.equal(migrateRunV1ToV2({ ...v2 }).legacy.issueId, 'i', 'applying it to already-migrated data keeps what it carried over');
+});
+
+test('v2 refuses a v1 data folder in place (home marker) but accepts empty folders and its own', () => {
+  const v1home = mkdtempSync(join(tmpdir(), 'cond-v1home-'));
+  writeFileSync(join(v1home, 'config.json'), '{"version":1}');
+  mkdirSync(join(v1home, 'runs'));
+  assert.throws(() => assertHomeIsUsable(v1home), /Conductor v1[^]*conductor migrate/);
+  const empty = mkdtempSync(join(tmpdir(), 'cond-empty-'));
+  assert.doesNotThrow(() => assertHomeIsUsable(empty));
+  process.env.CONDUCTOR_HOME = v1home;
+  assert.throws(() => ensureHome(), /conductor migrate/, 'ensureHome refuses and leaves the v1 folder untouched');
+  assert.equal(existsSync(join(v1home, 'home.json')), false);
+  assert.deepEqual(readdirSync(v1home).sort(), ['config.json', 'runs']);
+  process.env.CONDUCTOR_HOME = empty;
+  ensureHome();
+  assert.ok(existsSync(join(empty, 'home.json')));
+  assert.doesNotThrow(() => assertHomeIsUsable(empty), 'a folder with the marker is fine even when it has content');
+  process.env.CONDUCTOR_HOME = home;
 });

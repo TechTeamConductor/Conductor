@@ -6,14 +6,13 @@ import type { AgentName, Config } from './types.ts';
 import { defaultConfig, normalizeConfig } from './config.ts';
 import { ensureHome } from './paths.ts';
 import { Agents } from './agents/provider.ts';
-import { FakeLinear } from './linear/fake.ts';
-import { provisionTeam } from './linear/provision.ts';
+import { Board } from './board/index.ts';
 import { MemoryStore } from './secrets.ts';
 import { createRuntime, ROOT, type Runtime } from './runtime.ts';
 
 export interface DemoHandle {
   rt: Runtime;
-  linear: FakeLinear;
+  board: Board;
   url: string;
   home: string;
   close(): Promise<void>;
@@ -21,7 +20,7 @@ export interface DemoHandle {
 
 const gitEnv = { GIT_AUTHOR_NAME: 'Demo', GIT_AUTHOR_EMAIL: 'demo@example.com', GIT_COMMITTER_NAME: 'Demo', GIT_COMMITTER_EMAIL: 'demo@example.com' };
 
-/** Full pipeline on scripted agents + an in-memory Linear: no keys, no quota, nothing leaves the machine. */
+/** Full pipeline on scripted agents + a throw-away board: no keys, no quota, nothing leaves the machine. */
 export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?: number } = {}): Promise<DemoHandle> {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'conductor-demo-')));
   process.env.CONDUCTOR_HOME = join(home, '.conductor');
@@ -67,20 +66,19 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
   chmodSync(fc, 0o755);
   chmodSync(fa, 0o755);
 
-  const linear = new FakeLinear({ key: 'DEMO' });
+  const board = Board.open({ dir: join(home, '.conductor', 'board') });
   const cfg: Config = normalizeConfig({
     ...defaultConfig(),
     ui: { port: opts.port ?? 4318, openBrowser: false },
-    linear: { ...defaultConfig().linear, teamId: linear.teamId, teamKey: 'DEMO', viewerId: linear.viewerId },
     repos: [{ name: 'demo-app', path: repoDir, baseBranch: 'main', gates: [{ name: 'test', cmd: 'node --test', kind: 'test' }], copyFiles: [], envPassthrough: [] }],
     agents: { claude: { bin: fc, isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } }, cursor: { bin: fa } },
     pipeline: { ...defaultConfig().pipeline, planApproval: 'first', planReview: 'always', timeoutsMin: { plan: 3, review: 3, build: 5, verify: 3, idle: 2, gate: 3 } },
     worktreeRoot: join(home, 'worktrees'),
   });
-  await provisionTeam(linear, linear.teamId, 'labels', cfg.linear.triggerLabel, { dryRun: false });
-  linear.seedIssue({ title: 'Add a friendly greeting function', description: 'Add `greet(name)` that returns "Hello, <name>!" with a unit test.', labels: ['conductor'] });
-  linear.seedIssue({ title: 'Support a dark-mode toggle', description: 'The settings page needs a dark-mode toggle that persists across reloads.', labels: ['conductor'] });
-  linear.seedIssue({ title: 'Migrate storage to a real database', description: 'Replace the JSON file store with a database.', labels: ['conductor'] });
+  const project = board.createProject({ key: 'DEMO', name: 'Demo app', repo: 'demo-app' });
+  board.user.createItem({ projectId: project.id, title: 'Add a friendly greeting function', description: 'Add `greet(name)` that returns "Hello, <name>!" with a unit test.' });
+  board.user.createItem({ projectId: project.id, title: 'Support a dark-mode toggle', description: 'The settings page needs a dark-mode toggle that persists across reloads.' });
+  board.user.createItem({ projectId: project.id, title: 'Migrate storage to a real database', description: 'Replace the JSON file store with a database.' });
 
   const persisted: Record<string, { approvedPlans: number }> = {};
   const cfgHolder: { current: Config } = { current: cfg };
@@ -88,7 +86,7 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
   const rt = await createRuntime({
     ephemeral: true,
     config: cfg,
-    linear,
+    board,
     agents,
     secretStore: new MemoryStore(),
     persistent: { load: () => ({ repos: persisted }), save: (s) => Object.assign(persisted, s.repos) },
@@ -96,22 +94,21 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
       claude: { found: true, version: '2.1.296 (demo)', ok: true, loggedIn: true, detail: 'Demo mode — scripted agent' },
       cursor: { found: true, version: '2026.10.19 (demo)', ok: true, loggedIn: true, detail: 'Demo mode — scripted agent' },
     }),
-    probe: async (t: 'claude' | 'cursor' | 'linear') => ({ ok: true, detail: `${t} (demo) answered`, durationMs: 120 }),
+    probe: async (t: 'claude' | 'cursor') => ({ ok: true, detail: `${t} (demo) answered`, durationMs: 120 }),
     openExec: async () => undefined,
     notify: () => undefined,
   });
   cfgHolder.current = rt.cfgRef.current;
-  rt.api.setProvisioned(true);
-  rt.api.setViewerName('Demo user');
   const port = await rt.server.listen(opts.port ?? 4318);
   rt.engine.start({ pollMs: opts.pollMs ?? 2000 });
   return {
     rt,
-    linear,
+    board,
     home,
     url: rt.server.loginUrl(),
     async close() {
       await rt.close();
+      board.close();
     },
   };
   void port; void dirname; void (null as unknown as AgentName);

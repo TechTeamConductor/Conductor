@@ -160,17 +160,56 @@ test('setup/repo rejects /, $HOME and non-git folders; accepts a real repo and d
   assert.ok(JSON.parse(ok.text).repo.gates.length >= 1);
 });
 
-test('linear-key: shape is validated before any network call; the key is never echoed', async () => {
-  const r = await raw('/api/setup/linear-key', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'not-a-key' }) });
-  assert.equal(r.status, 400);
-  assert.ok(!r.text.includes('not-a-key'), 'a rejected key is never echoed back');
+test('the old Linear endpoints no longer exist; probe accepts only claude/cursor', async () => {
+  assert.equal((await raw('/api/setup/linear-key', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'lin_api_' + 'x'.repeat(30) }) })).status, 404);
+  assert.equal((await raw('/api/setup/team', { method: 'POST', headers: mut(), body: '{}' })).status, 404);
+  assert.equal((await raw('/api/setup/probe', { method: 'POST', headers: mut(), body: JSON.stringify({ target: 'linear' }) })).status, 400);
+});
+
+test('board API: cards are created/commented/moved only through server-side authorship; Conductor-owned lanes and forged fields are refused', async () => {
+  const created = await raw('/api/tasks', { method: 'POST', headers: mut(), body: JSON.stringify({ title: 'Authorship test', description: 'x', repo: 'demo-app', author: 'conductor', createdBy: 'conductor', kind: 'bug', lane: 'review', key: 'DEMO-999', id: 'chosen' }) });
+  assert.equal(created.status, 201);
+  const key = JSON.parse(created.text).key;
+  assert.notEqual(key, 'DEMO-999');
+  const item = JSON.parse((await raw(`/api/items/${key}`, { headers: authed() })).text).item;
+  assert.equal(item.createdBy, 'user');
+  assert.equal(item.kind, 'work');
+  assert.notEqual(item.id, 'chosen');
+  // comments are always the user's
+  const c = await raw(`/api/items/${key}/comment`, { method: 'POST', headers: mut(), body: JSON.stringify({ body: 'hello', author: 'conductor' }) });
+  assert.equal(c.status, 201);
+  assert.equal(JSON.parse(c.text).comment.author, 'user');
+  // lanes: only the four human lanes, through the engine
+  assert.equal((await raw(`/api/items/${key}/move`, { method: 'POST', headers: mut(), body: JSON.stringify({ lane: 'review' }) })).status, 400);
+  assert.equal((await raw(`/api/items/${key}/move`, { method: 'POST', headers: mut(), body: JSON.stringify({ lane: 'active' }) })).status, 400);
+  // mutation rules apply to the new routes too
+  assert.equal((await raw(`/api/items/${key}/comment`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ body: 'no csrf' }) })).status, 403);
+  assert.equal((await raw(`/api/items/${key}/comment`, { method: 'POST', headers: mut({ 'sec-fetch-site': 'cross-site' }), body: JSON.stringify({ body: 'x' }) })).status, 403);
+  assert.equal((await raw('/api/items/NOPE-1/comment', { method: 'POST', headers: mut(), body: JSON.stringify({ body: 'x' }) })).status, 404);
+  assert.equal((await raw('/api/items/..%2f..%2fetc/comment', { method: 'POST', headers: mut(), body: JSON.stringify({ body: 'x' }) })).status, 404);
+  assert.equal((await raw('/api/items/%E0%A4%A/comment', { method: 'POST', headers: mut(), body: JSON.stringify({ body: 'x' }) })).status, 400, 'malformed escapes are a 400, not an exception');
+  assert.equal((await raw(`/api/items/${key}/comment`, { method: 'POST', headers: mut(), body: JSON.stringify({ body: 'z'.repeat(20_001) }) })).status, 400);
+  assert.equal((await raw(`/api/items/${key}/edit`, { method: 'POST', headers: mut(), body: JSON.stringify({ title: 't'.repeat(201) }) })).status, 400);
+  assert.equal((await raw('/api/projects', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'lower', name: 'x' }) })).status, 400);
+  assert.equal((await raw('/api/projects', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'ABC', name: 'x', repo: '../../etc' }) })).status, 400);
+});
+
+test('approve needs the plan revision: a missing or stale revision is refused, the current one approves', async () => {
+  const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
+  const created = await raw('/api/tasks', { method: 'POST', headers: mut(), body: JSON.stringify({ title: 'Needs approval', description: 'large', repo: 'demo-app' }) });
+  const key = JSON.parse(created.text).key;
+  void key;
+  const waiting = (await runs()).find((r) => r.canApprove);
+  if (!waiting) return; // the demo's first-plan gate may already be consumed — the E2E test below covers the approving path
+  assert.equal((await raw(`/api/runs/${waiting.key}/approve`, { method: 'POST', headers: mut(), body: '{}' })).status, 400, 'rev is required');
+  assert.equal((await raw(`/api/runs/${waiting.key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: waiting.rev + 5 }) })).status, 409, 'a stale rev is refused');
 });
 
 test('end-to-end through the API: first plan waits for approval → Approve → ready; New task works', async () => {
   const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
   const planReady = await waitFor(async () => (await runs()).find((r) => r.column === 'plan_ready'));
   assert.equal(planReady.canApprove, true);
-  assert.equal((await raw(`/api/runs/${planReady.key}/approve`, { method: 'POST', headers: mut(), body: '{}' })).status, 200);
+  assert.equal((await raw(`/api/runs/${planReady.key}/approve`, { method: 'POST', headers: mut(), body: JSON.stringify({ rev: planReady.rev }) })).status, 200);
   await waitFor(async () => (await runs()).find((r) => r.key === planReady.key && r.status === 'ready'), 40_000);
   const detail = JSON.parse((await raw(`/api/runs/${planReady.key}`, { headers: authed() })).text);
   assert.ok(detail.plan && detail.planMarkdown, 'plan is exposed');

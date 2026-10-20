@@ -9,8 +9,7 @@ import { ensureHome } from '../../src/paths.ts';
 import { RunStore } from '../../src/store.ts';
 import { Agents } from '../../src/agents/provider.ts';
 import { Engine } from '../../src/pipeline/engine.ts';
-import { FakeLinear } from '../../src/linear/fake.ts';
-import { provisionTeam } from '../../src/linear/provision.ts';
+import { Board, type Lane } from '../../src/board/index.ts';
 import { configureLog } from '../../src/log.ts';
 import { setNotifier } from '../../src/notify.ts';
 import type { Clock } from '../../src/util.ts';
@@ -39,7 +38,8 @@ export interface HarnessOpts {
   clock?: Clock;
   repoFiles?: Record<string, string>;
   gates?: boolean;
-  fakeLinear?: ConstructorParameters<typeof FakeLinear>[0];
+  /** Board redactor etc. */
+  board?: Parameters<typeof Board.open>[0];
 }
 export interface Harness {
   root: string;
@@ -47,15 +47,16 @@ export interface Harness {
   repoDir: string;
   fakeDir: string;
   cfg: Config;
-  linear: FakeLinear;
+  board: Board;
+  projectId: string;
   store: RunStore;
   agents: Agents;
   engine: Engine;
   notes: { title: string; message: string }[];
   scenario(obj: unknown): void;
   calls(): any[];
-  /** Create a trigger-labelled issue created by the viewer. */
-  issue(title: string, extra?: { description?: string; labels?: string[]; creatorId?: string; stateName?: string }): string;
+  /** Create a work card in To do (or `lane`), authored by the user. Returns its key. */
+  issue(title: string, extra?: { description?: string; lane?: 'todo' | 'backlog' }): string;
   /** tick → wait for jobs, repeat until nothing is queued/running (or maxTicks). */
   settle(maxTicks?: number): Promise<void>;
   run(key: string): Run;
@@ -102,10 +103,9 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
   makeRepo(repoDir, opts.repoFiles);
   const fakeDir = join(root, 'fake');
   mkdirSync(fakeDir, { recursive: true });
-  const linear = new FakeLinear(opts.fakeLinear);
+  const board = Board.open({ dir: join(home, 'board'), ...opts.board });
   const cfg = normalizeConfig({
     ...defaultConfig(),
-    linear: { ...defaultConfig().linear, teamId: linear.teamId, teamKey: linear.key, viewerId: linear.viewerId, pollSeconds: 15 },
     repos: [
       {
         name: 'demo',
@@ -121,7 +121,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
     worktreeRoot: join(root, 'worktrees'),
   });
   opts.config?.(cfg);
-  await provisionTeam(linear, linear.teamId, cfg.linear.mode, cfg.linear.triggerLabel, { dryRun: false });
+  const project = board.createProject({ key: 'ENG', name: 'Demo', repo: 'demo' });
   const store = new RunStore(join(home, 'runs'));
   const agents = new Agents(() => cfg, { clock: opts.clock, extraEnv: { FAKE_DIR: fakeDir } });
   const notes: { title: string; message: string }[] = [];
@@ -130,7 +130,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
   const engine = new Engine({
     getConfig: () => cfg,
     store,
-    linear: () => linear,
+    board,
     agents,
     clock: opts.clock,
     notify: (title, message) => notes.push({ title, message }),
@@ -138,7 +138,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
     secrets: () => [],
   });
   const h: Harness = {
-    root, home, repoDir, fakeDir, cfg, linear, store, agents, engine, notes,
+    root, home, repoDir, fakeDir, cfg, board, projectId: project.id, store, agents, engine, notes,
     scenario(obj) {
       writeFileSync(join(fakeDir, 'scenario.json'), JSON.stringify(obj, null, 2));
     },
@@ -147,8 +147,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
       return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
     },
     issue(title, extra = {}) {
-      const i = linear.seedIssue({ title, description: extra.description ?? `Please implement: ${title}`, labels: [cfg.linear.triggerLabel, ...(extra.labels ?? [])], creatorId: extra.creatorId, stateName: extra.stateName ?? 'Todo' });
-      return i.identifier;
+      return board.user.createItem({ projectId: project.id, title, description: extra.description ?? `Please implement: ${title}`, lane: (extra.lane ?? 'todo') as Lane }).key;
     },
     async settle(maxTicks = 40) {
       for (let i = 0; i < maxTicks; i++) {
@@ -156,7 +155,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
         await engine.idle();
         const busy = store.list().some((r) => r.status === 'queued' || r.status === 'running');
         if (!busy) {
-          await engine.tick(); // let reconcile observe the final Linear state once more
+          await engine.tick(); // let the projection observe the final state once more
           await engine.idle();
           if (!store.list().some((r) => r.status === 'queued' || r.status === 'running')) return;
         }
@@ -170,6 +169,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
     },
     async cleanup() {
       await engine.stop();
+      board.close();
       setNotifier(null);
       rmSync(root, { recursive: true, force: true });
     },

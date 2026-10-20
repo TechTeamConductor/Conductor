@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import type { AgentName, Config, LinearIssue, LinearPort, NextStep, RepoConfig, Run } from '../types.ts';
+import type { AgentName, Config, NextStep, RepoConfig, Run } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { newRun } from '../store.ts';
 import type { PersistentState } from '../config.ts';
@@ -11,32 +11,53 @@ import { loadEnvSecrets, redact } from '../redact.ts';
 import { logger } from '../log.ts';
 import { notify as defaultNotify } from '../notify.ts';
 import * as W from '../git/worktree.ts';
-import { attributeDescription, attributeProject, attributeTitle, attributeTrigger, currentStateMover, findTriggerLabelOnIssue, hasApproveCommand, viewerAttributedLabels, type IssueWithFlags } from '../linear/attribution.ts';
-import { resolveProvisioned, type Provisioned } from '../linear/provision.ts';
+import type { Board, Project, WorkItem } from '../board/index.ts';
+import { BoardError } from '../board/index.ts';
+import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
 
 const log = logger('engine');
 const TERMINAL = new Set(['finished', 'aborted']);
+/** Lanes a human may set (Conductor owns active / needs_you / review). */
+export const HUMAN_MOVES = ['backlog', 'todo', 'done', 'canceled'] as const;
+export type HumanMove = (typeof HUMAN_MOVES)[number];
+const TICK_MS = 5000;
 
 export interface EngineDeps {
   getConfig: () => Config;
   setConfig?: (cfg: Config) => void;
   store: RunStore;
-  linear: () => LinearPort | null;
+  board: Board;
   agents: Agents;
   clock?: Clock;
   notify?: (title: string, message: string) => void;
   persistent?: { load(): PersistentState; save(s: PersistentState): void };
-  /** Extra redaction secrets (e.g. the Linear API key). */
+  /** Extra redaction secrets (e.g. provider API keys). */
   secrets?: () => string[];
 }
 
 type Job = { ac: AbortController; promise: Promise<void> };
 
+/** 2–6 capital letters derived from a repository name, unique among `taken`. */
+export function deriveProjectKey(name: string, taken: ReadonlySet<string>): string {
+  const letters = name.toUpperCase().replace(/[^A-Z]/g, '');
+  const base = (letters + 'XXXXXX').slice(0, 6);
+  for (let n = 3; n <= 6; n++) {
+    const k = base.slice(0, n);
+    if (!taken.has(k)) return k;
+  }
+  for (let i = 0; i < 26 * 26; i++) {
+    const k = base.slice(0, 4) + String.fromCharCode(65 + Math.floor(i / 26)) + String.fromCharCode(65 + (i % 26));
+    if (!taken.has(k)) return k;
+  }
+  return base;
+}
+
 export class Engine {
   readonly store: RunStore;
+  readonly board: Board;
   private d: EngineDeps;
   private clock: Clock;
   private stages: Stages;
@@ -46,13 +67,7 @@ export class Engine {
   private globalPaused = false;
   private pauseReason: string | undefined;
   private lastPollAt: number | null = null;
-  private lastPollError: string | null = null;
-  private backoffUntil = 0;
-  private backoffStep = 0;
-  private ignoredMap = new Map<string, { key: string; reason: string; updatedAt: string }>();
-  private provCache: { at: number; value: Provisioned } | null = null;
-  private doneState: string | null | undefined;
-  private viewer: string | undefined;
+  private ignored: { key: string; reason: string }[] = [];
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private tickAgain = false;
@@ -60,16 +75,17 @@ export class Engine {
   private failCounts = new Map<string, number>();
   private quotaMap = new Map<AgentName, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
-  private moveCache = new Map<string, string>();
   private changeListeners = new Set<() => void>();
+  private unsubBoard: (() => void) | null = null;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
 
   constructor(deps: EngineDeps) {
     this.d = deps;
     this.store = deps.store;
+    this.board = deps.board;
     this.clock = deps.clock ?? systemClock;
     this.persistentDeps = deps.persistent ?? { load: loadState, save: saveState };
-    this.effects = new Effects({ store: deps.store, linear: deps.linear, secrets: (r) => this.secretsFor(r), viewerId: () => deps.getConfig().linear.viewerId ?? this.viewer });
+    this.effects = new Effects({ store: deps.store, board: deps.board, secrets: (r) => this.secretsFor(r), now: () => this.clock.now() });
     this.stages = new Stages(this.makeCtx());
   }
 
@@ -78,19 +94,12 @@ export class Engine {
     return {
       cfg: () => this.d.getConfig(),
       store: this.d.store,
-      linear: () => {
-        const l = this.d.linear();
-        if (!l) throw new Error('Linear is not configured');
-        return l;
-      },
+      board: this.d.board,
       agents: this.d.agents,
       clock: this.clock,
       effects: this.effects,
       notify: (t, m) => (this.d.notify ?? defaultNotify)(t, m),
       persistent: this.persistentDeps,
-      prov: () => this.prov(),
-      completedStateId: () => this.completedStateId(),
-      viewerId: () => this.viewerId(),
       secretsFor: (r) => this.secretsFor(r),
       signal: (key) => this.jobs.get(key)?.ac.signal ?? new AbortController().signal,
       emit: (key, ev) => this.emit(key, ev),
@@ -135,39 +144,8 @@ export class Engine {
     return [...extra, ...vals];
   }
 
-  private viewerId(): string {
-    const v = this.d.getConfig().linear.viewerId ?? this.viewer;
-    if (!v) throw new Error('Linear viewer is unknown — complete setup first');
-    return v;
-  }
-
-  private async prov(): Promise<Provisioned> {
-    const now = this.clock.now();
-    if (this.provCache && now - this.provCache.at < 60_000) return this.provCache.value;
-    const cfg = this.d.getConfig();
-    const linear = this.d.linear();
-    if (!linear || !cfg.linear.teamId) throw new Error('Linear is not set up yet');
-    const p = await resolveProvisioned(linear, cfg.linear.teamId, cfg.linear.mode, cfg.linear.triggerLabel);
-    if (!p) throw new Error('Linear labels/statuses are not created yet — open Setup → Team and click Create.');
-    this.provCache = { at: now, value: p };
-    return p;
-  }
-
-  private async completedStateId(): Promise<string | null> {
-    if (this.doneState !== undefined) return this.doneState;
-    const cfg = this.d.getConfig();
-    const linear = this.d.linear();
-    if (!linear || !cfg.linear.teamId) return null;
-    const info = await linear.teamSetup(cfg.linear.teamId);
-    const done = info.states.find((s) => s.type === 'completed' && /^done$/i.test(s.name)) ?? info.states.find((s) => s.type === 'completed');
-    this.doneState = done?.id ?? null;
-    return this.doneState;
-  }
-
-  /** Drop caches after setup/settings changes. */
+  /** Drop caches after settings changes. */
   invalidate(): void {
-    this.provCache = null;
-    this.doneState = undefined;
     this.changed();
   }
 
@@ -190,6 +168,8 @@ export class Engine {
     if (!this.stopped) return;
     this.stopped = false;
     this.recover();
+    // the board is local and synchronous: a change on it wakes the engine immediately (no polling lag)
+    this.unsubBoard = this.board.onChange(() => this.tickSoon());
     const loop = async () => {
       if (this.stopped) return;
       try {
@@ -198,8 +178,7 @@ export class Engine {
         log.error(`tick failed: ${errMsg(e)}`);
       }
       if (this.stopped) return;
-      const ms = opts.pollMs ?? Math.max(15, this.d.getConfig().linear.pollSeconds) * 1000 + Math.floor(Math.random() * 2000);
-      this.timer = setTimeout(loop, ms);
+      this.timer = setTimeout(loop, opts.pollMs ?? TICK_MS);
       this.timer.unref();
     };
     void loop();
@@ -208,6 +187,8 @@ export class Engine {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    this.unsubBoard?.();
+    this.unsubBoard = null;
     for (const j of this.jobs.values()) j.ac.abort();
     await Promise.allSettled([...this.jobs.values()].map((j) => j.promise));
   }
@@ -234,7 +215,7 @@ export class Engine {
     while (this.jobs.size) await Promise.allSettled([...this.jobs.values()].map((j) => j.promise));
   }
 
-  // ───────────────────────── polling ─────────────────────────
+  // ───────────────────────── each tick: flush → project → claim ─────────────────────────
   async tick(): Promise<void> {
     if (this.ticking) {
       this.tickAgain = true;
@@ -254,122 +235,96 @@ export class Engine {
   }
 
   private async pollOnce(): Promise<void> {
-    const cfg = this.d.getConfig();
-    const linear = this.d.linear();
-    if (!linear || !cfg.linear.teamId) {
-      this.lastPollError = 'Linear is not set up yet';
-      this.changed();
-      return;
+    this.lastPollAt = this.clock.now();
+    const ignored: { key: string; reason: string }[] = [];
+    // 1. re-drive every pending board effect (startup flush = the first tick; later ticks retry with back-off)
+    for (const run of this.d.store.list()) {
+      if (this.effects.hasPending(run)) await this.effects.flush(run.key).catch(() => undefined);
     }
-    const now = this.clock.now();
-    if (now < this.backoffUntil) return;
-    let issues: LinearIssue[];
-    try {
-      if (!cfg.linear.viewerId && !this.viewer) this.viewer = (await linear.viewer()).id;
-      await this.prov();
-      issues = await linear.candidates(cfg.linear.teamId, cfg.linear.triggerLabel, { includeAssigned: cfg.linear.allowAssignedToMe });
-      this.lastPollAt = now;
-      this.lastPollError = null;
-      this.backoffStep = 0;
-    } catch (e) {
-      this.lastPollError = truncate(errMsg(e), 300);
-      const rate = /rate.?limit|429/i.test(errMsg(e));
-      this.backoffStep = Math.min(this.backoffStep + 1, 6);
-      if (rate) this.backoffUntil = now + Math.min(10 * 60_000, 15_000 * 2 ** this.backoffStep);
-      log.warn(`poll failed: ${this.lastPollError}`);
-      this.changed();
-      return;
-    }
-    const byId = new Map(issues.map((i) => [i.id, i]));
+    // 2. level-triggered projection: the card's lane always converges to what the run says (heals any crash window)
     for (const run of this.d.store.list()) {
       try {
-        await this.reconcileRun(run, byId.get(run.issueId));
+        await this.project(run);
       } catch (e) {
-        log.warn(`${run.key}: reconcile failed: ${errMsg(e)}`);
+        log.warn(`${run.key}: projection failed: ${errMsg(e)}`);
       }
     }
-    for (const issue of issues) {
-      if (this.globalPaused) break; // paused from the dashboard: no new claims, no new Linear writes for new issues
-      if (this.d.store.has(issue.identifier)) continue;
+    // 3. claims
+    const runKeys = new Set(this.d.store.list().map((r) => r.key));
+    for (const item of this.board.items({ parentId: null })) {
+      if (runKeys.has(item.key)) continue;
+      if (item.lane === 'active' || item.lane === 'needs_you' || item.lane === 'review') {
+        // K4: never auto-reset such a card to "To do" — that would silently re-run a --force build after any data loss
+        ignored.push({ key: item.key, reason: `This card is in "${item.lane}" but Conductor has no run for it. Move it to To do to start it, or cancel it.` });
+        continue;
+      }
+      if (item.lane !== 'todo' || !item.autoStart || item.kind === 'bug' || item.kind === 'subtask') continue;
+      if (item.kind !== 'work') {
+        ignored.push({ key: item.key, reason: `Cards of kind "${item.kind}" are not supported yet — create it as a work item.` });
+        continue;
+      }
+      if (!this.board.claimable().some((c) => c.id === item.id)) {
+        ignored.push({ key: item.key, reason: 'Waiting for the cards it depends on to be done.' });
+        continue;
+      }
+      if (this.globalPaused) continue; // paused from the dashboard: no new claims
       try {
-        await this.maybeClaim(issue);
+        await this.maybeClaim(item);
       } catch (e) {
-        log.warn(`${issue.identifier}: claim failed: ${errMsg(e)}`);
+        log.warn(`${item.key}: claim failed: ${errMsg(e)}`);
       }
     }
-    for (const run of this.d.store.list()) {
-      if (!TERMINAL.has(run.status)) await this.effects.flush(run.key).catch(() => undefined);
-    }
+    this.ignored = ignored;
     this.changed();
   }
 
-  private ignore(issue: LinearIssue, reason: string): void {
-    this.ignoredMap.set(issue.id, { key: issue.identifier, reason, updatedAt: issue.updatedAt });
+  /** Converge the card's lane/stage to the run's state (level-triggered; idempotent). A run whose card vanished is an orphan. */
+  private async project(run: Run): Promise<void> {
+    const item = this.board.item(run.itemId);
+    const active = !TERMINAL.has(run.status);
+    if (!item) {
+      if (!active) return;
+      await this.stopJob(run.key);
+      this.d.store.update(run.key, (r) => {
+        r.status = 'aborted';
+        r.next = 'none';
+        r.history.push({ ts: this.clock.now(), text: 'The card was removed from the board — stopped' });
+      });
+      return;
+    }
+    if (this.effects.hasPending(run)) return;
+    if (item.lane !== laneForRun(run)) await this.effects.state(run.key, 'state', { stage: run.expected.stage });
   }
 
-  private async maybeClaim(issue: LinearIssue): Promise<void> {
+  private async maybeClaim(item: WorkItem): Promise<void> {
     const cfg = this.d.getConfig();
-    const seen = this.ignoredMap.get(issue.id);
-    if (seen && seen.updatedAt === issue.updatedAt) return;
-    this.ignoredMap.delete(issue.id);
-    const prov = await this.prov();
-    const viewerId = this.viewerId();
-    if (issue.labels.some((l) => l.id === prov.bugLabelId)) return; // our own bug sub-issues
-    if (issue.parentId && this.d.store.list().some((r) => r.issueId === issue.parentId)) return; // child of a Conductor run
-    const t = issue.state.type;
-    const pickable = t === 'unstarted' || (t === 'backlog' && cfg.linear.pickupFromBacklog);
-    if (!pickable) {
-      if (t === 'backlog' || t === 'triage') this.ignore(issue, `in ${issue.state.name} — move it to Todo to start`);
-      return;
-    }
-    const mine = issue.creatorId === viewerId || (cfg.linear.allowAssignedToMe && issue.assigneeId === viewerId);
-    if (!mine) {
-      this.ignore(issue, 'created by someone else (only issues you create are picked up)');
-      return;
-    }
-    const full = await this.linearOrThrow().issue(issue.id);
-    const assignedPickup = issue.creatorId !== viewerId && cfg.linear.allowAssignedToMe && issue.assigneeId === viewerId;
-    if (!assignedPickup) {
-      const triggerId = findTriggerLabelOnIssue(full, cfg.linear.triggerLabel)?.id ?? prov.triggerLabelId; // team vs workspace label
-      const a = attributeTrigger(full, triggerId, viewerId);
-      if (!a.ok) return this.ignore(issue, a.reason ?? 'trigger label was added by someone else');
-      const d = attributeDescription(full, viewerId);
-      if (!d.ok) return this.ignore(issue, d.reason ?? 'description was edited by someone else');
-      const ti = attributeTitle(full, viewerId);
-      if (!ti.ok) return this.ignore(issue, ti.reason ?? 'title was edited by someone else');
-    }
-    const repo = this.resolveRepo(full, assignedPickup ? undefined : viewerId);
+    const project = this.board.project(item.projectId);
+    const repo = this.resolveRepo(project);
     const seed = {
-      key: full.identifier,
-      issueId: full.id,
-      teamId: full.teamId,
-      title: full.title,
-      description: full.description ?? '',
-      descHash: sha1(full.description ?? ''),
-      url: full.url,
+      key: item.key,
+      itemId: item.id,
+      title: item.title,
+      description: item.description ?? '',
+      descHash: sha1(item.description ?? ''),
       repo: repo?.name ?? '',
-      branch: `conductor/${slug(full.identifier)}`,
+      branch: `conductor/${slug(item.key)}`,
       worktree: '',
       baseSha: '',
       loopBudget: cfg.pipeline.maxLoops,
     };
     try {
-      this.d.store.create({ ...newRun(seed), assignedPickup });
+      this.d.store.create({ ...newRun(seed), untrusted: item.createdBy === 'import' ? true : undefined });
     } catch (e) {
       if ((e as { code?: string }).code === 'exists') return;
       throw e;
     }
-    log.info(`${full.identifier}: claimed (${repo?.name ?? 'no repo yet'})`);
-    await this.stages.applyStage(full.identifier, 'planning');
-    await this.effects.comment(
-      full.identifier,
-      'claimed',
-      `🤖 **Conductor picked this up.** Plan (Claude) → build (Cursor) → independent verification (Claude).`,
-    );
+    log.info(`${item.key}: claimed (${repo?.name ?? 'no repo yet'})`);
+    await this.stages.applyStage(item.key, 'planning');
+    await this.effects.comment(item.key, 'claimed', `🤖 **Conductor picked this up.** Plan (Claude) → build (Cursor) → independent verification (Claude).`);
     if (!repo) {
       await this.stages.toNeedsHuman(
-        full.identifier,
-        `I could not tell which repository this belongs to. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none yet)'}. Add the label \`repo:<name>\` or a first line \`repo: <name>\` to the description, then move the issue back to Todo.`,
+        item.key,
+        `I could not tell which repository this belongs to. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none yet)'}. Set the project's repository, then move the card back to To do.`,
         'plan',
       );
     }
@@ -377,129 +332,30 @@ export class Engine {
     this.tickSoon();
   }
 
-  private linearOrThrow(): LinearPort {
-    const l = this.d.linear();
-    if (!l) throw new Error('Linear is not configured');
-    return l;
-  }
-
-  /** label `repo:<name>` > Linear project name > the only registered repo > `repo: <name>` first line. Registered repos only. */
-  resolveRepo(issue: LinearIssue, trustedFor?: string): RepoConfig | null {
+  /** The project's repository, or the only registered one. Registered repos only. */
+  resolveRepo(project: Project | undefined): RepoConfig | null {
     const repos = this.d.getConfig().repos;
-    const byName = (n: string) => repos.find((r) => r.name.toLowerCase() === n.trim().toLowerCase()) ?? null;
-    // labels / project steer which checkout a `--force` agent works in: only trust ones the API-key owner set (H2)
-    const labels = trustedFor ? viewerAttributedLabels(issue as IssueWithFlags, trustedFor) : issue.labels;
-    const projectName = !trustedFor || attributeProject(issue as IssueWithFlags, trustedFor).ok ? issue.projectName : null;
-    for (const l of labels) {
-      const m = /^repo:\s*(.+)$/i.exec(l.name);
-      if (m && byName(m[1]!)) return byName(m[1]!);
-    }
-    if (projectName && byName(projectName)) return byName(projectName);
-    if (repos.length === 1) return repos[0]!;
-    const first = (issue.description ?? '').split('\n').find((l) => l.trim());
-    const m = first ? /^repo:\s*([\w.-]+)\s*$/i.exec(first.trim()) : null;
-    if (m && byName(m[1]!)) return byName(m[1]!);
-    return null;
+    if (project?.repo) return repos.find((r) => r.name.toLowerCase() === project.repo.toLowerCase()) ?? null;
+    return repos.length === 1 ? repos[0]! : null;
   }
 
-  // ───────────────────────── reconcile (resume matrix) ─────────────────────────
-  private async reconcileRun(run: Run, issue: LinearIssue | undefined): Promise<void> {
-    const active = !TERMINAL.has(run.status);
-    if (!issue) {
-      if (!active) return;
-      let full: LinearIssue | null = null;
-      try {
-        full = await this.linearOrThrow().issue(run.issueId);
-      } catch (e) {
-        if (/not found|entity not found|no issue/i.test(errMsg(e))) full = null;
-        else return; // transient: try again next poll
-      }
-      const closed = full && (full.state.type === 'completed' || full.state.type === 'canceled');
-      await this.stopJob(run.key);
-      this.d.store.update(run.key, (r) => {
-        r.status = closed && full!.state.type === 'completed' ? 'finished' : 'aborted';
-        r.next = 'none';
-        r.history.push({ ts: this.clock.now(), text: closed ? `Issue ${full!.state.type} in Linear` : 'Issue removed or label dropped in Linear — stopped' });
-      });
-      return;
-    }
-    const t = issue.state.type;
-    if (t === 'backlog' || t === 'triage') {
-      if (active && run.status !== 'parked' && (await this.moveIsMine(run, issue))) await this.park(run);
-      return;
-    }
-    if (t === 'unstarted') {
-      const humanMoved = !!run.expected.stateId;
-      if ((run.status === 'parked' || (humanMoved && active) || (TERMINAL.has(run.status) && humanMoved)) && (await this.moveIsMine(run, issue))) {
-        await this.rerunFromHuman(run.key);
-      }
-      return;
-    }
-    // started
-    if (run.status === 'parked') {
-      this.d.store.update(run.key, (r) => {
-        r.status = restoredStatus(r);
-        r.parkedFrom = undefined;
-        r.history.push({ ts: this.clock.now(), text: 'Un-parked' });
-      });
-      return;
-    }
-    if (run.status === 'awaiting_approval') {
-      const cfg = this.d.getConfig();
-      let approved = false;
-      if (cfg.linear.mode === 'states') {
-        const prov = await this.prov().catch(() => null);
-        approved = !!prov?.stageStateIds && issue.state.id === prov.stageStateIds.building && (await this.moveIsMine(run, issue));
-      }
-      if (!approved) {
-        // Fail closed: `/approve` only counts when it comes AFTER the approval request we actually posted (anchored on that
-        // comment's stored id, not on a text marker a teammate could forge). No request posted yet => nothing can be approved.
-        const req = run.effects[`approval:${run.rev}`];
-        if (req?.status === 'done' && req.linearId) {
-          try {
-            const full = (await this.linearOrThrow().issue(run.issueId)) as IssueWithFlags;
-            const all = full.comments ?? [];
-            const anchor = all.findIndex((c) => c.id === req.linearId);
-            if (anchor >= 0 && !full.commentsTruncated) approved = hasApproveCommand(all.slice(anchor + 1), this.viewerId());
-          } catch {
-            /* transient */
-          }
-        }
-      }
-      if (approved) this.approve(run.key, 'human');
-    }
+  /** The project bound to a registered repo (created on first use). */
+  ensureProjectForRepo(repoName: string): Project {
+    const existing = this.board.projects().find((p) => p.repo === repoName);
+    if (existing) return existing;
+    const taken = new Set(this.board.projects().map((p) => p.key));
+    return this.board.createProject({ key: deriveProjectKey(repoName, taken), name: repoName, repo: repoName });
   }
 
-  /**
-   * Only the API-key owner may park / restart / approve by moving the issue (H1). The mover comes from issue history;
-   * an unknown or foreign mover is ignored (and remembered per issue revision so we do not re-fetch every poll).
-   */
-  private async moveIsMine(run: Run, issue: LinearIssue): Promise<boolean> {
-    const stamp = `${issue.updatedAt}|${issue.state.id}`;
-    const cached = this.moveCache.get(run.key);
-    if (cached?.startsWith(stamp)) return cached.endsWith('|yes');
-    let mine = false;
-    try {
-      const full = await this.linearOrThrow().issue(run.issueId);
-      const mover = currentStateMover(full as IssueWithFlags);
-      mine = !!mover && mover.actorId === this.viewerId();
-      if (!mine) {
-        this.d.store.appendEvent(run.key, { agent: 'conductor', stage: 'engine', kind: 'note', text: `Ignored a status change made by ${mover?.actorId ?? 'an unknown actor'} — only the Linear API-key owner can move a run.` });
-      }
-    } catch {
-      return false; // cannot verify who moved it: do nothing this poll
-    }
-    this.moveCache.set(run.key, `${stamp}|${mine ? 'yes' : 'no'}`);
-    return mine;
-  }
 
   private async park(run: Run): Promise<void> {
     await this.stopJob(run.key);
     this.d.store.update(run.key, (r) => {
       r.parkedFrom = r.status;
       r.status = 'parked';
-      r.history.push({ ts: this.clock.now(), text: 'Parked (moved to Backlog) — nothing will run until you move it to Todo' });
+      r.history.push({ ts: this.clock.now(), text: 'Parked (moved to Backlog) — nothing will run until you move it to To do' });
     });
+    await this.effects.state(run.key, 'state', { stage: run.expected.stage });
   }
 
   private async stopJob(key: string): Promise<void> {
@@ -509,37 +365,19 @@ export class Engine {
     await j.promise.catch(() => undefined);
   }
 
-  /** Human drag-to-Todo / dashboard Retry. Implements the resume matrix. */
+  /** Human move to To do / dashboard Retry. Implements the resume matrix. */
   private async rerunFromHuman(key: string): Promise<void> {
     const run0 = this.d.store.get(key);
     if (!run0) return;
     await this.stopJob(key);
     const cfg = this.d.getConfig();
-    let issue: LinearIssue | null = null;
-    try {
-      issue = await this.linearOrThrow().issue(run0.issueId);
-    } catch {
-      /* continue with what we have */
-    }
-    if (issue && !run0.assignedPickup) {
-      const viewerId = this.viewerId();
-      const d = attributeDescription(issue, viewerId);
-      if (!d.ok) {
-        await this.stages.toNeedsHuman(key, `Cannot restart: ${d.reason ?? 'the description was edited by someone else'}`, 'plan');
-        return;
-      }
-      const ti = attributeTitle(issue, viewerId);
-      if (!ti.ok) {
-        await this.stages.toNeedsHuman(key, `Cannot restart: ${ti.reason ?? 'the title was edited by someone else'}`, 'plan');
-        return;
-      }
-    }
+    const item = this.board.item(run0.itemId);
     // rolling limit on human restarts: even the owner's own automation must not be able to spin this forever
     const nowT = this.clock.now();
     const recent = (run0.restartTimes ?? []).filter((t) => nowT - t < 3_600_000);
     if (recent.length >= 5) {
       this.d.store.update(key, (r) => void (r.restartTimes = recent));
-      await this.stages.toNeedsHuman(key, 'This run was restarted 5 times within an hour, so Conductor is pausing it to protect your quota. Wait a while (or fix the underlying problem), then move it to Todo again.', run0.next);
+      await this.stages.toNeedsHuman(key, 'This run was restarted 5 times within an hour, so Conductor is pausing it to protect your quota. Wait a while (or fix the underlying problem), then move it to To do again.', run0.next);
       return;
     }
     const was = run0.status === 'parked' ? (run0.parkedFrom ?? 'running') : run0.status;
@@ -555,19 +393,19 @@ export class Engine {
         log.warn(`${key}: backup/reset skipped: ${errMsg(e)}`);
       }
     }
-    const repo = run0.repo ? null : issue ? this.resolveRepo(issue, run0.assignedPickup ? undefined : this.viewerId()) : null;
-    const obsolete = retryStage ? [] : run0.bugs.filter((b) => b.status === 'open' && b.linearId);
+    const repo = run0.repo ? null : this.resolveRepo(item ? this.board.project(item.projectId) : undefined);
+    const obsolete = retryStage ? [] : run0.bugs.filter((b) => b.status === 'open' && b.itemId);
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
       r.restartTimes = [...recent, nowT];
-      r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-issue cap becomes a dead end)
+      r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-card cap becomes a dead end)
       r.buildFails = 0;
       r.limitStreak = 0;
       r.limitEpisode = 0;
-      if (issue) {
-        r.title = issue.title;
-        r.description = issue.description ?? '';
-        r.descHash = sha1(issue.description ?? '');
+      if (item) {
+        r.title = item.title;
+        r.description = item.description ?? '';
+        r.descHash = sha1(item.description ?? '');
       }
       if (repo) r.repo = repo.name;
       r.status = 'queued';
@@ -598,12 +436,11 @@ export class Engine {
       }
     });
     if (obsolete.length) {
-      const done = await this.completedStateId().catch(() => null);
       const rev = this.d.store.get(key)?.rev ?? run0.rev + 1;
-      if (done) for (const b of obsolete) await this.effects.close(key, `bugclose:${b.fp}:rerun${rev}`, b.linearId!, done);
+      for (const b of obsolete) await this.effects.close(key, `bugclose:${b.fp}:rerun${rev}`, b.itemId!, 'done');
     }
     if (!this.d.store.get(key)!.repo) {
-      await this.stages.toNeedsHuman(key, `Still no repository for this issue. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none)'}. Add the label \`repo:<name>\` and move it back to Todo.`, 'plan');
+      await this.stages.toNeedsHuman(key, `Still no repository for this card. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none)'}. Set the project's repository and move it back to To do.`, 'plan');
       return;
     }
     await this.stages.applyStage(key, retryStage === 'build' ? 'building' : retryStage === 'verify' ? 'verifying' : 'planning');
@@ -731,10 +568,74 @@ export class Engine {
     });
   }
 
-  // ───────────────────────── controls (dashboard / API) ─────────────────────────
-  approve(key: string, by: 'human' | 'auto' = 'human'): void {
+  // ───────────────────────── human commands (dashboard / API) ─────────────────────────
+  /**
+   * The ONLY way a human moves a card that has a run (condition K2): the run record changes first, the card's lane follows
+   * from it. Humans may set backlog / todo / done / canceled; Conductor owns active / needs_you / review.
+   */
+  async applyHumanMove(key: string, lane: string): Promise<void> {
+    if (!(HUMAN_MOVES as readonly string[]).includes(lane)) {
+      throw new EngineError('bad_lane', `You can move cards to ${HUMAN_MOVES.join(', ')} only — Conductor owns the other lanes.`);
+    }
+    const run = this.d.store.get(key);
+    if (!run) {
+      const item = this.board.item(key);
+      if (!item) throw new EngineError('missing', 'Unknown card.');
+      try {
+        this.board.user.moveLane(item.id, lane);
+      } catch (e) {
+        if (e instanceof BoardError) throw new EngineError(e.code, e.message);
+        throw e;
+      }
+      this.tickSoon();
+      return;
+    }
+    const s = run.status;
+    switch (lane as HumanMove) {
+      case 'backlog':
+        if (s === 'parked') return;
+        if (s === 'finished' || s === 'aborted') throw new EngineError('bad_state', 'This card is already finished or canceled — use Retry to run it again.');
+        await this.park(run);
+        break;
+      case 'todo':
+        if (s === 'failed') {
+          this.d.store.update(key, (r) => {
+            r.status = 'queued';
+            r.lastError = undefined;
+            r.history.push({ ts: this.clock.now(), text: 'Retrying after an internal error (requested by you)' });
+          });
+          this.failCounts.delete(key);
+        } else {
+          this.failCounts.delete(key);
+          await this.rerunFromHuman(key);
+        }
+        break;
+      case 'done':
+        if (s === 'finished') return;
+        if (s === 'aborted') throw new EngineError('bad_state', 'This card was canceled — it cannot be marked done.');
+        await this.stopJob(key);
+        this.d.store.update(key, (r) => {
+          r.status = 'finished';
+          r.next = 'none';
+          r.history.push({ ts: this.clock.now(), text: 'Marked done by you' });
+        });
+        await this.effects.state(key, 'state', { stage: run.expected.stage });
+        break;
+      case 'canceled':
+        if (s === 'aborted') return;
+        if (s === 'finished') throw new EngineError('bad_state', 'This card is already done.');
+        await this.abort(key);
+        break;
+    }
+    this.changed();
+    this.tickSoon();
+  }
+
+  /** `rev` (when given) must be the current plan revision: an approval for a replaced plan is refused. */
+  approve(key: string, by: 'human' | 'auto' = 'human', rev?: number): void {
     const run = this.d.store.get(key);
     if (!run || run.status !== 'awaiting_approval') throw new EngineError('bad_state', 'This run is not waiting for approval.');
+    if (rev !== undefined && rev !== run.rev) throw new EngineError('stale', 'This plan was replaced by a newer revision — review it and approve again.');
     this.stages.markApproved(key, by);
     this.tickSoon();
   }
@@ -747,7 +648,7 @@ export class Engine {
     }
     this.failCounts.delete(key);
     if (run.status === 'parked') {
-      throw new EngineError('bad_state', 'This issue is parked in Backlog. Move it to Todo in Linear to continue — Conductor never moves your issues out of Backlog itself.');
+      throw new EngineError('bad_state', 'This card is parked in Backlog. Move it to To do to continue — Conductor never moves your cards out of Backlog itself.');
     }
     if (run.status === 'failed') {
       // an internal hiccup: retry the same step, don't throw the work away
@@ -773,7 +674,7 @@ export class Engine {
         r.history.push({ ts: this.clock.now(), text: 'Resumed manually' });
       });
     } else if (run.status === 'parked') {
-      throw new EngineError('bad_state', 'This issue is parked in Backlog. Move it to Todo in Linear to continue — Conductor never moves your issues out of Backlog itself.');
+      throw new EngineError('bad_state', 'This card is parked in Backlog. Move it to To do to continue — Conductor never moves your cards out of Backlog itself.');
     } else throw new EngineError('bad_state', 'Nothing to resume.');
     this.tickSoon();
   }
@@ -781,13 +682,16 @@ export class Engine {
   async abort(key: string): Promise<void> {
     const run = this.d.store.get(key);
     if (!run) throw new EngineError('missing', 'Unknown run.');
+    if (run.status === 'finished' || run.status === 'aborted') return; // already over: nothing to stop
     await this.stopJob(key);
     this.d.store.update(key, (r) => {
       r.status = 'aborted';
       r.next = 'none';
       r.history.push({ ts: this.clock.now(), text: 'Aborted from the dashboard' });
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: r.expected.stage } });
+      Effects.enqueue(r, `abort:${this.clock.now()}`, { kind: 'comment', payload: { body: '🤖 **Conductor stopped** this run at your request. Move the card to **To do** to start it again.' } });
     });
-    await this.effects.comment(key, `abort:${this.clock.now()}`, '🤖 **Conductor stopped** this run at your request. Move the issue to **Todo** to start it again.');
+    await this.effects.flush(key);
     this.changed();
   }
 
@@ -814,22 +718,19 @@ export class Engine {
 
   async createTask(input: { title: string; description?: string; repo?: string }): Promise<{ key: string; url: string }> {
     const cfg = this.d.getConfig();
-    const prov = await this.prov();
-    const linear = this.linearOrThrow();
-    if (!cfg.linear.teamId) throw new EngineError('setup', 'Pick a Linear team first.');
     const repoName = input.repo?.trim();
     if (repoName && !cfg.repos.some((r) => r.name === repoName)) throw new EngineError('bad_repo', `"${repoName}" is not a registered repository.`);
     if (!repoName && cfg.repos.length !== 1) throw new EngineError('bad_repo', 'Choose which repository this task is for.');
-    const desc = `${repoName ? `repo: ${repoName}\n\n` : ''}${input.description ?? ''}`.trim();
-    const issue = await linear.createIssue({
-      teamId: cfg.linear.teamId,
-      title: input.title.trim().slice(0, 200),
-      description: desc,
-      labelIds: [prov.triggerLabelId],
-      stateId: prov.todoStateId ?? undefined,
-    });
-    this.tickSoon();
-    return { key: issue.identifier, url: issue.url };
+    const repo = repoName ?? cfg.repos[0]!.name;
+    const project = this.ensureProjectForRepo(repo);
+    try {
+      const item = this.board.user.createItem({ projectId: project.id, title: input.title.trim().slice(0, 200), description: input.description ?? '', lane: 'todo' });
+      this.tickSoon();
+      return { key: item.key, url: '' };
+    } catch (e) {
+      if (e instanceof BoardError) throw new EngineError(e.code, e.message);
+      throw e;
+    }
   }
 
   // ───────────────────────── introspection ─────────────────────────
@@ -840,6 +741,7 @@ export class Engine {
       const p = this.activePause(a);
       if (p) pp[a] = p;
     }
+    const storageProblem = this.effects.storageProblem();
     return {
       paused: this.globalPaused,
       pauseReason: this.pauseReason,
@@ -847,9 +749,10 @@ export class Engine {
       running: this.jobs.size,
       maxParallel: this.d.getConfig().pipeline.maxParallel,
       lastPollAt: this.lastPollAt,
-      lastPollError: this.lastPollError,
-      pollSeconds: this.d.getConfig().linear.pollSeconds,
-      ignored: [...this.ignoredMap.values()].map((i) => ({ key: i.key, reason: i.reason })),
+      lastPollError: storageProblem,
+      storageProblem,
+      pollSeconds: TICK_MS / 1000,
+      ignored: [...this.ignored],
       now,
       quota: { claude: this.quotaMap.get('claude') },
     };
@@ -857,12 +760,6 @@ export class Engine {
   isRunning(key: string): boolean {
     return this.jobs.has(key);
   }
-}
-
-/** What a parked run goes back to when its issue leaves Backlog. */
-function restoredStatus(r: Run): Run['status'] {
-  const was = r.parkedFrom;
-  return was && ['awaiting_approval', 'needs_human', 'ready'].includes(was) ? was : 'queued';
 }
 
 export class EngineError extends Error {

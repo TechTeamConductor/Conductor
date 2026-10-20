@@ -1,8 +1,8 @@
 import type { Harness } from './harness.ts';
 
+/** Bodies of every comment on a card (user and Conductor). */
 export async function comments(h: Harness, key: string): Promise<string[]> {
-  const i = h.linear.issueByKey(key);
-  return ((await h.linear.issue(i.id)).comments ?? []).map((c) => c.body);
+  return h.board.comments(key).map((c) => c.body);
 }
-export const labelNames = (h: Harness, key: string): string[] => h.linear.issueByKey(key).labels.map((l) => l.name);
-export const stateOf = (h: Harness, key: string) => h.linear.issueByKey(key).state;
+export const laneOf = (h: Harness, key: string) => h.board.item(key)!.lane;
+export const stageOf = (h: Harness, key: string) => h.board.item(key)!.stage;

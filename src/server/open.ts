@@ -3,7 +3,7 @@ import type { Config, Run } from '../types.ts';
 import { resolveBin } from '../config.ts';
 import { isUuid, shellQuote } from '../util.ts';
 
-export const OPEN_TARGETS = ['cursor', 'terminal-claude', 'terminal-cursor', 'claude-desktop', 'finder', 'linear'] as const;
+export const OPEN_TARGETS = ['cursor', 'terminal-claude', 'terminal-cursor', 'claude-desktop', 'finder'] as const;
 export type OpenTarget = (typeof OPEN_TARGETS)[number];
 
 export class OpenError extends Error {
@@ -44,11 +44,6 @@ export function terminalCommand(worktree: string, agent: 'claude' | 'agent', ses
 export async function openRun(run: Run, cfg: Config, target: string, exec: ExecFn = defaultExec): Promise<{ detail: string }> {
   if (!(OPEN_TARGETS as readonly string[]).includes(target)) throw new OpenError('bad_target', `unknown target "${target}"`);
   const t = target as OpenTarget;
-  if (t === 'linear') {
-    if (!/^https:\/\/linear\.app\//.test(run.url)) throw new OpenError('bad_url', 'this issue has no Linear URL');
-    await exec('/usr/bin/open', [run.url]);
-    return { detail: 'Opened in your browser' };
-  }
   if (!run.worktree || !SAFE_PATH.test(run.worktree)) throw new OpenError('no_worktree', 'This run has no worktree yet (or it was cleaned up).');
   if (t === 'finder') {
     await exec('/usr/bin/open', [run.worktree]);

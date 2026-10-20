@@ -49,7 +49,7 @@ export function fence(source: string, text: string, max = 24_000): string {
 export function taskBlock(args: { key: string; title: string; description: string; comments?: string[] }): string {
   const parts = [`Issue key: ${args.key}`, `Title: ${args.title}`, '', 'Description:', args.description || '(none)'];
   if (args.comments?.length) parts.push('', 'Clarifications from the requester (oldest first):', ...args.comments.map((c, i) => `${i + 1}. ${c}`));
-  return fence('linear-issue', parts.join('\n'));
+  return fence('task-card', parts.join('\n'));
 }
 
 export function conventionsBlock(files: { name: string; text: string }[]): string {

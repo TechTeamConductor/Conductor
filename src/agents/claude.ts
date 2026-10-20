@@ -42,7 +42,7 @@ export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'iso
     '--verbose',
     ...(c.isolation === 'safe-mode' ? ['--safe-mode'] : ['--setting-sources', 'project,local']),
     '--tools', 'Read,Grep,Glob',
-    // M5: the read-only stages still have Read — keep credential files out of reach (the reply is posted to Linear)
+    // M5: the read-only stages still have Read — keep credential files out of reach (the reply is posted on the card)
     '--disallowedTools', ...CLAUDE_DENIED_READS,
     '--disable-slash-commands',
     '--strict-mcp-config',

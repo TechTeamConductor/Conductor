@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { makeHarness } from './helpers/harness.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { comments, labelNames } from './helpers/util.ts';
+import { comments, laneOf, stageOf } from './helpers/util.ts';
 
 const bug = { title: 'Feature returns wrong value for 0', severity: 'major', file: 'feature.mjs', line: 1, evidence: 'feature() ignores input', repro: 'feature(0)', suggestedFix: 'handle 0' };
 
-test('verifier fails → bug sub-issue (never trigger-labelled) → fix loop → pass → sub-issue closed', async () => {
+test('verifier fails → bug child card (never claimed as a task) → fix loop → pass → child closed', async () => {
   const h = await makeHarness();
   try {
     h.scenario({ cursor: { '*': { build: [{ savePrompt: true }, { savePrompt: true }] } }, claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'One real problem.', bugs: [bug] } }, { json: { verdict: 'pass' } }] } } });
@@ -18,13 +18,14 @@ test('verifier fails → bug sub-issue (never trigger-labelled) → fix loop →
     assert.equal(run.loop, 2, 'one fix loop');
     assert.equal(run.bugs.length, 1);
     assert.equal(run.bugs[0]!.status, 'closed');
-    // sub-issue exists, is a child, carries the bug label and NOT the trigger label, and is now completed
-    const kids = await h.linear.children(h.linear.issueByKey(key).id);
+    // the bug child exists, is a child card of kind 'bug' (never claimable), and is now done
+    const kids = h.board.children(h.board.item(key)!.id);
     assert.equal(kids.length, 1);
     assert.ok(kids[0]!.title.startsWith('[Bug]'));
-    assert.ok(kids[0]!.labels.some((l) => l.name === 'conductor-bug'));
-    assert.ok(!kids[0]!.labels.some((l) => l.name === 'conductor'));
-    assert.equal(kids[0]!.state.type, 'completed');
+    assert.equal(kids[0]!.kind, 'bug');
+    assert.equal(kids[0]!.createdBy, 'conductor');
+    assert.equal(kids[0]!.lane, 'done');
+    assert.equal(h.board.claimable().length, 0, 'a bug child is never a task'); 
     // fix prompt reached the builder with the finding; the second build used the fix template
     const calls = h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build');
     assert.equal(calls.length, 2);
@@ -34,15 +35,16 @@ test('verifier fails → bug sub-issue (never trigger-labelled) → fix loop →
     assert.ok(fixPrompt.includes('One real problem') || fixPrompt.includes('Verifier'), 'the verifier summary is included');
     const cs = await comments(h, key);
     assert.ok(cs.some((c) => c.includes('Verification failed (loop 1')));
-    assert.ok(labelNames(h, key).includes('conductor:ready'));
-    // the engine must not have treated its own sub-issue as a new task
+    assert.equal(laneOf(h, key), 'review');
+    assert.equal(stageOf(h, key), 'ready');
+    // the engine must not have treated its own bug card as a new task
     assert.equal(h.store.list().length, 1);
   } finally {
     await h.cleanup();
   }
 });
 
-test('loop cap → needs_human with evidence; Todo retries verify with extra budget', async () => {
+test('loop cap → needs_human with evidence; To do retries verify with extra budget', async () => {
   const h = await makeHarness({ config: (c) => void (c.pipeline.maxLoops = 2) });
   try {
     h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'Still broken.', bugs: [bug] } }] } } });
@@ -52,13 +54,14 @@ test('loop cap → needs_human with evidence; Todo retries verify with extra bud
     assert.equal(run.status, 'needs_human');
     assert.equal(run.needsHuman?.origin, 'verify');
     assert.equal(run.loop, 2);
-    assert.ok(labelNames(h, key).includes('conductor:needs-human'));
+    assert.equal(stageOf(h, key), 'needs_human');
+    assert.equal(laneOf(h, key), 'needs_you');
     assert.ok((await comments(h, key)).some((c) => c.includes('needs you')));
-    // only one sub-issue despite two failing loops (fingerprint dedupe)
-    assert.equal((await h.linear.children(h.linear.issueByKey(key).id)).length, 1);
-    // human fixes the scenario and drags it back to Todo → retries verification with a fresh budget
+    // only one bug card despite two failing loops (fingerprint dedupe)
+    assert.equal(h.board.children(h.board.item(key)!.id).length, 1);
+    // human fixes the scenario and moves it back to To do → retries verification with a fresh budget
     h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'pass' } }] } } });
-    h.linear.humanMove(h.linear.issueByKey(key).id, 'Todo');
+    await h.engine.applyHumanMove(key, 'todo');
     await h.settle();
     run = h.run(key);
     assert.equal(run.status, 'ready');

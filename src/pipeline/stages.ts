@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
-  AgentName, AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, LinearIssue, NextStep, Plan,
+  AgentName, AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, NextStep, Plan,
   PlanReview, RepoConfig, Run, SessionRec, StageName, Verdict,
 } from '../types.ts';
 import type { EmitEvent } from '../agents/claude.ts';
@@ -16,8 +16,9 @@ import * as G from '../git/gates.ts';
 import { gitOk } from '../git/exec.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
 import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
-import { attributeDescription, attributeTitle, attributeTrigger, findTriggerLabelOnIssue, viewerComments } from '../linear/attribution.ts';
-import { BUG_LABEL, type StageKey } from '../linear/names.ts';
+import type { StageKey } from '../board/lanes.ts';
+import type { WorkItem } from '../board/index.ts';
+import { Effects } from './effects.ts';
 import type { PipelineCtx } from './context.ts';
 import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
@@ -75,48 +76,54 @@ export class Stages {
     this.c.emit(key, { agent: 'conductor', stage, kind: 'note', text });
   }
 
-  /** Move the issue to the stage's Linear representation (labels mode or states mode). */
+  /** Project the stage label (and the lane derived from the run's status) onto the board card. */
   async applyStage(key: string, stage: StageKey): Promise<void> {
     try {
-      const prov = await this.c.prov();
-      const cfg = this.c.cfg();
-      if (cfg.linear.mode === 'states' && prov.stageStateIds) {
-        await this.c.effects.state(key, 'state', { stateId: prov.stageStateIds[stage] }, stage);
-        return;
-      }
-      const stateId = stage === 'ready' && prov.inReviewStateId ? prov.inReviewStateId : prov.inProgressStateId;
-      const add = prov.stageLabelIds[stage];
-      const remove = Object.entries(prov.stageLabelIds).filter(([k]) => k !== stage).map(([, v]) => v);
-      await this.c.effects.state(key, 'state', { stateId, addLabelIds: [add], removeLabelIds: remove }, stage);
+      await this.c.effects.state(key, 'state', { stage });
     } catch (e) {
-      log.warn(`${key}: could not update Linear stage "${stage}": ${errMsg(e)}`);
+      log.warn(`${key}: could not update the board stage "${stage}": ${errMsg(e)}`);
     }
+  }
+
+  /** A question was answered: ready + the answer comment + the board projection in ONE run write (K1). */
+  private async deliverAnswer(key: string, rev: number, answer: string): Promise<void> {
+    const secrets = this.c.secretsFor(this.run(key));
+    const run = this.patch(key, (r) => {
+      r.answered = true;
+      r.status = 'ready';
+      r.next = 'none';
+      r.needsHuman = undefined;
+      r.history.push({ ts: this.c.clock.now(), text: 'Answered (no code change needed)' });
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'ready' } }, secrets);
+      Effects.enqueue(r, `answer:${rev}`, { kind: 'comment', payload: { body: `🤖 **Answer** — no code change was needed\n\n${truncate(answer, 24_000)}` } }, secrets);
+    });
+    await this.c.effects.flush(key);
+    this.c.notify(`${key} answered`, truncate(run.title, 80));
   }
 
   async toNeedsHuman(key: string, reasonRaw: string, origin: NextStep, commentRaw?: string): Promise<void> {
     const now = this.c.clock.now();
     const secrets = this.c.secretsFor(this.run(key));
-    const reason = redact(reasonRaw, secrets); // agent/gate text can carry secrets into the UI, notifications and Linear (H3)
+    const reason = redact(reasonRaw, secrets); // agent/gate text can carry secrets into the UI, notifications and the board (H3)
     const comment = commentRaw === undefined ? undefined : redact(commentRaw, secrets);
+    const body = `🤖 **Conductor needs you**\n\n${comment ?? reason}\n\n_To retry: move this card back to **To do** (or use Retry in the dashboard). Anything you add as a comment is included in the next attempt._`;
     const run = this.patch(key, (r) => {
       r.status = 'needs_human';
       r.needsHuman = { reason: truncate(reason, 600), origin, at: now };
       r.next = 'none';
       r.history.push({ ts: now, text: `Needs you: ${truncate(reason, 200)}` });
+      // K1: the status change and its board effects are ONE write — a crash can never leave "needs you" without its explanation
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'needs_human' } }, secrets);
+      Effects.enqueue(r, `needs:${now}`, { kind: 'comment', payload: { body } }, secrets);
     });
     this.c.emit(key, { agent: 'conductor', stage: run.stage ?? 'engine', kind: 'error', text: `Needs human: ${reason}` });
-    await this.applyStage(key, 'needs_human');
-    await this.c.effects.comment(
-      key,
-      `needs:${now}`,
-      `🤖 **Conductor needs you**\n\n${comment ?? reason}\n\n_To retry: move this issue back to **Todo** (or use Retry in the dashboard). Anything you add as a comment is included in the next attempt._`,
-    );
+    await this.c.effects.flush(key);
     this.c.notify(`${key} needs you`, truncate(reason, 160));
   }
 
   /**
    * Pause (never fail) on a provider usage limit. With a known reset time we wait for it; with an unknown one
-   * (Cursor) we back off 15 m → 30 m → 1 h → 2 h → 4 h → 6 h. One Linear comment and one notification per limit
+   * (Cursor) we back off 15 m → 30 m → 1 h → 2 h → 4 h → 6 h. One board comment and one notification per limit
    * *episode* (a streak of consecutive rejections), and rejected attempts never count toward the run budget.
    */
   async pauseForLimit(key: string, limit: LimitInfo): Promise<void> {
@@ -126,7 +133,7 @@ export class Stages {
     const episode = streak === 1 ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
     if (episode > 6) {
       // M12: a run that keeps getting rejected (or a provider that keeps faking limits) must not stall silently forever
-      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} plan limits, then move it to Todo to retry.`, before.next);
+      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} plan limits, then move it to To do to retry.`, before.next);
     }
     const known = !!limit.resetsAt && limit.resetsAt > now;
     const backoffMin = Math.min(360, 15 * 2 ** (streak - 1));
@@ -172,7 +179,7 @@ export class Stages {
       if (res.ok) r.limitStreak = 0;
     });
   }
-  /** A limit-rejected attempt did no work: it must not eat the per-issue run budget. */
+  /** A limit-rejected attempt did no work: it must not eat the per-card run budget. */
   private refundIfLimit(key: string, res: AgentResult): void {
     if (!res.ok && res.errorKind === 'limit') this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
   }
@@ -185,37 +192,23 @@ export class Stages {
     };
   }
 
-  /** Every stage start re-checks that the issue is still the one the viewer asked for (description/attribution). */
-  private async integrity(run: Run): Promise<{ issue: LinearIssue | null; problem: string | null }> {
-    let issue: LinearIssue;
-    try {
-      issue = await this.c.linear().issue(run.issueId);
-    } catch (e) {
-      log.warn(`${run.key}: integrity check skipped (Linear unreachable): ${errMsg(e)}`);
-      return { issue: null, problem: null };
+  /**
+   * Every stage start re-checks that the card is still the one the human approved: the plan and its acceptance criteria were
+   * written against the description text and the builder reads a snapshot, so a description edit halts the run at the next
+   * stage boundary (restart re-plans).
+   */
+  private integrity(run: Run): { item: WorkItem | null; problem: string | null } {
+    const item = this.c.board.item(run.itemId) ?? null;
+    if (!item) return { item: null, problem: 'The card for this run no longer exists on the board.' };
+    if (sha1(item.description ?? '') !== run.descHash) {
+      return { item, problem: 'The card description changed after Conductor started it. Move the card back to To do to re-plan with the new text.' };
     }
-    if (sha1(issue.description ?? '') !== run.descHash) {
-      return { issue, problem: 'The issue description changed after Conductor claimed it. Move the issue back to Todo to re-plan with the new text.' };
-    }
-    if (run.assignedPickup) return { issue, problem: null };
-    try {
-      const prov = await this.c.prov();
-      const triggerId = findTriggerLabelOnIssue(issue, this.c.cfg().linear.triggerLabel)?.id ?? prov.triggerLabelId;
-      const a = attributeTrigger(issue, triggerId, this.c.viewerId());
-      if (!a.ok) return { issue, problem: a.reason ?? 'trigger label attribution failed' };
-      const d = attributeDescription(issue, this.c.viewerId());
-      if (!d.ok) return { issue, problem: d.reason ?? 'description attribution failed' };
-      const ti = attributeTitle(issue, this.c.viewerId());
-      if (!ti.ok) return { issue, problem: ti.reason ?? 'title attribution failed' };
-    } catch {
-      /* provisioning lookup failed: not an integrity problem */
-    }
-    return { issue, problem: null };
+    return { item, problem: null };
   }
 
   /**
    * One read-only agent call with validation, one corrective retry, hang/max-turn retry, limit pausing and
-   * the per-issue agent-run cap. Returns {kind:'stop'} after it has already moved the run to paused/needs_human/aborted.
+   * the per-card agent-run cap. Returns {kind:'stop'} after it has already moved the run to paused/needs_human/aborted.
    */
   private async callReadOnly(
     key: string,
@@ -232,7 +225,7 @@ export class Stages {
       const run = this.run(key);
       if (this.c.signal(key).aborted) return { kind: 'stop' };
       if (run.agentRuns >= this.c.cfg().pipeline.maxAgentRunsPerIssue) {
-        await this.toNeedsHuman(key, `This issue has used its limit of ${this.c.cfg().pipeline.maxAgentRunsPerIssue} agent runs. Review the work so far, then move it back to Todo to continue.`, run.next);
+        await this.toNeedsHuman(key, `This card has used its limit of ${this.c.cfg().pipeline.maxAgentRunsPerIssue} agent runs. Review the work so far, then move it back to To do to continue.`, run.next);
         return { kind: 'stop' };
       }
       this.patch(key, (r) => {
@@ -287,7 +280,7 @@ export class Stages {
             this.note(key, stage, 'Hit the turn cap — retrying once with a higher cap.');
             continue;
           }
-          await this.toNeedsHuman(key, 'The agent ran out of turns twice. The task may be too large — consider splitting the issue.', run.next);
+          await this.toNeedsHuman(key, 'The agent ran out of turns twice. The task may be too large — consider splitting the card.', run.next);
           return { kind: 'stop' };
         case 'parse':
           if (!retried) {
@@ -343,7 +336,7 @@ export class Stages {
       const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
       if (!inst.ok) {
         if (this.c.signal(key).aborted) return false;
-        await this.toNeedsHuman(key, `Installing dependencies failed in the worktree. Fix the repo's setup command, then move the issue back to Todo.\n\n\`\`\`\n${truncate(inst.output.slice(-1500), 1500)}\n\`\`\``, 'plan');
+        await this.toNeedsHuman(key, `Installing dependencies failed in the worktree. Fix the repo's setup command, then move the card back to To do.\n\n\`\`\`\n${truncate(inst.output.slice(-1500), 1500)}\n\`\`\``, 'plan');
         return false;
       }
       this.patch(key, (r) => {
@@ -389,10 +382,10 @@ export class Stages {
     await this.applyStage(key, 'planning');
     if (!(await this.ensureWorkspace(key))) return;
     run = this.run(key);
-    const { issue, problem } = await this.integrity(run);
+    const { item, problem } = this.integrity(run);
     if (problem) return this.toNeedsHuman(key, problem, 'plan');
     const repo = this.repo(run);
-    const comments = issue ? viewerComments(issue, this.c.viewerId()).slice(-20).map((c) => truncate(c.body, 2000)) : [];
+    const comments = item ? this.c.board.comments(item.id).filter((c) => c.author === 'user').slice(-20).map((c) => truncate(c.body, 2000)) : [];
     const prompt = render(loadTemplate('plan'), {
       preamble: preamble('plan'),
       key: run.key,
@@ -435,20 +428,11 @@ export class Stages {
     });
     if (plan.blocked.is) {
       const qs = plan.blocked.questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
-      return this.toNeedsHuman(key, `The planner needs a decision before it can proceed:\n${qs}`, 'plan', `The planner needs your input before it can proceed:\n\n${qs}\n\nAnswer in a comment, then move this issue back to **Todo**.`);
+      return this.toNeedsHuman(key, `The planner needs a decision before it can proceed:\n${qs}`, 'plan', `The planner needs your input before it can proceed:\n\n${qs}\n\nAnswer in a comment, then move this card back to **To do**.`);
     }
     if (plan.deliverable === 'answer' && String(plan.answer ?? '').trim()) {
-      // a question / analysis: deliver the answer in Linear and finish — never push it through build + verify
-      this.patch(key, (r) => {
-        r.answered = true;
-        r.status = 'ready';
-        r.next = 'none';
-        r.needsHuman = undefined;
-        r.history.push({ ts: this.c.clock.now(), text: 'Answered (no code change needed)' });
-      });
-      await this.applyStage(key, 'ready');
-      await this.c.effects.comment(key, `answer:${run.rev}`, `🤖 **Answer** — no code change was needed\n\n${truncate(plan.answer!, 24_000)}`);
-      this.c.notify(`${key} answered`, truncate(run.title, 80));
+      // a question / analysis: deliver the answer on the card and finish — never push it through build + verify
+      await this.deliverAnswer(key, run.rev, plan.answer!);
       return;
     }
     await this.c.effects.comment(key, `plan:${run.rev}`, `🤖 **Conductor plan** (revision ${run.rev}, complexity ${plan.complexity})\n\n${truncate(md, 24_000)}`);
@@ -517,7 +501,7 @@ export class Stages {
     const cfg = this.c.cfg();
     const approved = this.c.persistent.load().repos[run.repo]?.approvedPlans ?? 0;
     const touchesProtected = W.diffScopeViolations(plan.filesToChange.map((f) => f.path), []).length > 0;
-    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected;
+    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected || run.untrusted === true;
     if (!required) {
       this.patch(key, (r) => {
         r.planApproved = true;
@@ -526,17 +510,17 @@ export class Stages {
       });
       return;
     }
+    const why = touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : run.untrusted ? ' (the task text came from an unverified source)' : approved === 0 ? ' (first plan for this repo)' : '';
+    const secrets = this.c.secretsFor(run);
     this.patch(key, (r) => {
       r.status = 'awaiting_approval';
       r.next = 'approval';
       r.history.push({ ts: this.c.clock.now(), text: 'Waiting for plan approval' });
+      // K1: the status change and its board effects are ONE write
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'plan_ready' } }, secrets);
+      Effects.enqueue(r, `approval:${run.rev}`, { kind: 'comment', payload: { body: `🤖 **Plan ready — your approval is needed${why}.**\n\nPress **Approve** on this card in the dashboard. To change the plan, add a comment and move the card back to **To do**.` } }, secrets);
     });
-    await this.applyStage(key, 'plan_ready');
-    await this.c.effects.comment(
-      key,
-      `approval:${run.rev}`,
-      `🤖 **Plan ready — your approval is needed${touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : approved === 0 ? ' (first plan for this repo)' : ''}.**\n\nReply \`/approve\` on this issue, or press **Approve** in the dashboard. To change the plan, add a comment and move the issue back to **Todo**.`,
-    );
+    await this.c.effects.flush(key);
     this.c.notify(`${key}: plan ready`, 'Your approval is needed.');
   }
 
@@ -550,9 +534,8 @@ export class Stages {
       r.stageStartedAt = this.c.clock.now();
     });
     await this.applyStage(key, 'building');
-    const { issue, problem } = await this.integrity(run);
+    const { problem } = this.integrity(run);
     if (problem) return this.toNeedsHuman(key, problem, 'plan');
-    void issue;
     const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
     if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
     if (!(await this.ensureWorkspace(key))) return;
@@ -576,7 +559,7 @@ export class Stages {
       try {
         refs = await W.backupRefs(run.worktree, run.key, run.rev);
       } catch (e) {
-        return this.toNeedsHuman(key, `Unfinished work from an interrupted build could not be backed up (${truncate(errMsg(e), 160)}), so Conductor will not discard it. Check the worktree, then move the issue to Todo.`, 'build');
+        return this.toNeedsHuman(key, `Unfinished work from an interrupted build could not be backed up (${truncate(errMsg(e), 160)}), so Conductor will not discard it. Check the worktree, then move the card to To do.`, 'build');
       }
       await W.resetToCommit(run.worktree, known);
       this.note(key, 'build', `Discarded partial work from an interrupted build${refs.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
@@ -625,7 +608,7 @@ export class Stages {
       r.agentRuns += 1;
     });
     if (run.agentRuns + 1 > cfg.pipeline.maxAgentRunsPerIssue) {
-      return this.toNeedsHuman(key, `This issue has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
+      return this.toNeedsHuman(key, `This card has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
     }
     const metaSnap = await snapshotGitMeta(repo.path).catch(() => null);
     const res = await this.c.agents.build({
@@ -671,16 +654,7 @@ export class Stages {
           const answerText = redact(String(res.text ?? ''), secrets).trim();
           if (plan.filesToChange.length === 0 && answerText.length >= 40) {
             // the plan itself changed nothing (a question): the builder's reply is the deliverable — finish as "answered"
-            this.patch(key, (r) => {
-              r.answered = true;
-              r.status = 'ready';
-              r.next = 'none';
-              r.needsHuman = undefined;
-              r.history.push({ ts: this.c.clock.now(), text: 'Answered (no code change needed)' });
-            });
-            await this.applyStage(key, 'ready');
-            await this.c.effects.comment(key, `answer:${run.rev}`, `🤖 **Answer** — no code change was needed\n\n${truncate(answerText, 24_000)}`);
-            this.c.notify(`${key} answered`, truncate(run.title, 80));
+            await this.deliverAnswer(key, run.rev, answerText);
             return;
           }
           return this.toNeedsHuman(key, 'The builder finished without changing any files. The task may need to be clarified.', 'build');
@@ -788,7 +762,7 @@ export class Stages {
       r.stageStartedAt = this.c.clock.now();
     });
     await this.applyStage(key, 'verifying');
-    const { problem } = await this.integrity(run);
+    const { problem } = this.integrity(run);
     if (problem) return this.toNeedsHuman(key, problem, 'plan');
     const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
     if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
@@ -824,7 +798,7 @@ export class Stages {
     // 2) the diff the verifier reads
     const diff = await W.diffAgainst(run.worktree, run.baseSha);
     if (diff.files.length === 0) {
-      return this.toNeedsHuman(key, 'There is nothing to verify: the branch has no changes compared with its base. The build may not have run — move the issue back to Todo to try again.', 'build');
+      return this.toNeedsHuman(key, 'There is nothing to verify: the branch has no changes compared with its base. The build may not have run — move the card back to To do to try again.', 'build');
     }
     this.c.store.writeArtifact(key, 'diffstat.txt', diff.stat);
     try {
@@ -904,14 +878,12 @@ export class Stages {
         key,
         `The verifier did not pass this change, but found nothing the builder can fix: ${truncate(verdict.summary, 300)}`,
         'verify',
-        `The independent verifier could not give a clean pass, and it did not report a concrete problem for the builder to fix, so I am not looping.\n\n${detail}\n\nIf you are happy with the branch as it is, you can merge it; to have me verify again, move the issue back to **Todo**.`,
+        `The independent verifier could not give a clean pass, and it did not report a concrete problem for the builder to fix, so I am not looping.\n\n${detail}\n\nIf you are happy with the branch as it is, you can merge it; to have me verify again, move the card back to **To do**.`,
       );
     }
 
     // bug records: upsert by fingerprint, close those not re-observed
     const seen = new Set<string>();
-    const prov = await this.c.prov().catch(() => null);
-    const done = await this.c.completedStateId().catch(() => null);
     const reopened = new Map<string, BugRec>();
     const detailOf = new Map<string, string>();
     for (const b of bugs) {
@@ -933,30 +905,27 @@ export class Stages {
       });
     }
 
-    // Linear: file at most N sub-issues per loop / per run (most severe first); summarise the rest in the comment.
+    // Board: file at most N bug cards per loop / per run (most severe first); summarise the rest in the comment.
     const PER_LOOP = 5;
     const PER_RUN = 8;
     const rank: Record<string, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
     const overflow: Bug[] = [];
-    if (!pass && prov) {
+    if (!pass) {
       let createdNow = 0;
       for (const b of [...failing].sort((x, y) => (rank[x.severity] ?? 9) - (rank[y.severity] ?? 9))) {
         const fp = bugFingerprint(b);
         const cur = this.run(key).bugs.find((x) => x.fp === fp);
         const re = reopened.get(fp);
-        if (re?.linearId && prov.todoStateId) {
-          await this.c.effects.close(key, `bugreopen:${fp}:${run.rev}:${run.loop}`, re.linearId, prov.todoStateId);
-        } else if (cur?.linearId) {
-          await this.c.effects.commentOn(key, `bugseen:${fp}:${run.rev}:${run.loop}`, cur.linearId, `Still failing after loop ${run.loop}:\n\n${detailOf.get(fp) ?? b.evidence}`);
-        } else if (createdNow < PER_LOOP && this.run(key).bugs.filter((x) => x.linearId).length + createdNow < PER_RUN) {
+        if (re?.itemId) {
+          await this.c.effects.close(key, `bugreopen:${fp}:${run.rev}:${run.loop}`, re.itemId, 'todo');
+        } else if (cur?.itemId) {
+          await this.c.effects.commentOn(key, `bugseen:${fp}:${run.rev}:${run.loop}`, cur.itemId, `Still failing after loop ${run.loop}:\n\n${detailOf.get(fp) ?? b.evidence}`);
+        } else if (createdNow < PER_LOOP && this.run(key).bugs.filter((x) => x.itemId).length + createdNow < PER_RUN) {
           createdNow += 1;
           await this.c.effects.subIssue(key, `bug:${fp}`, {
             fp,
             title: `[Bug] ${b.title}`,
             description: `Found by Conductor's independent verification of **${run.key}** (loop ${run.loop}).\n\n${detailOf.get(fp) ?? b.evidence}`,
-            labelIds: [prov.bugLabelId],
-            stateId: prov.todoStateId ?? undefined,
-            teamId: run.teamId,
           });
         } else overflow.push(b);
       }
@@ -972,7 +941,7 @@ export class Stages {
       }
       r.verdict = pass ? 'pass' : 'fail';
     });
-    if (done) for (const b of toClose) if (b.linearId) await this.c.effects.close(key, `bugclose:${b.fp}:${run.rev}:${run.loop}`, b.linearId, done);
+    for (const b of toClose) if (b.itemId) await this.c.effects.close(key, `bugclose:${b.fp}:${run.rev}:${run.loop}`, b.itemId, 'done');
 
     if (pass) return this.markReady(key, plan, verdict, cmp, diffStat);
 
@@ -989,13 +958,7 @@ export class Stages {
     const repo = this.repo(run);
     const acTable = verdict.acceptance.length ? ['| AC | Status | Evidence |', '| --- | --- | --- |', ...verdict.acceptance.map((a) => `| ${a.id} | ${a.status} | ${a.evidence.replace(/\|/g, '\\|').replace(/\n+/g, ' ')} |`)].join('\n') : '';
     const gates = cmp.passed.length || cmp.preExisting.length || cmp.unverified.length ? `Gates passed: ${cmp.passed.join(', ') || '—'}${cmp.preExisting.length ? `\nPre-existing failures (not caused by this change): ${cmp.preExisting.join(', ')}` : ''}` : '';
-    this.patch(key, (r) => {
-      r.status = 'ready';
-      r.next = 'none';
-      r.needsHuman = undefined;
-      r.history.push({ ts: this.c.clock.now(), text: `Verified — ready for your review${r.unverified ? ' (unverified by tests)' : ''}` });
-    });
-    await this.applyStage(key, 'ready');
+    const secrets = this.c.secretsFor(run);
     const body = [
       `🤖 **Ready for review ✅**${run.unverified ? ' — ⚠️ **not verified by automated tests**' : ''}`,
       '',
@@ -1017,7 +980,16 @@ export class Stages {
     ]
       .filter((l) => l !== undefined)
       .join('\n');
-    await this.c.effects.comment(key, `ready:${run.rev}:${run.loop}`, body);
+    this.patch(key, (r) => {
+      r.status = 'ready';
+      r.next = 'none';
+      r.needsHuman = undefined;
+      r.history.push({ ts: this.c.clock.now(), text: `Verified — ready for your review${r.unverified ? ' (unverified by tests)' : ''}` });
+      // K1: "ready" and its board effects are ONE write
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'ready' } }, secrets);
+      Effects.enqueue(r, `ready:${run.rev}:${run.loop}`, { kind: 'comment', payload: { body } }, secrets);
+    });
+    await this.c.effects.flush(key);
     const st = this.c.persistent.load();
     void plan;
     void st;
@@ -1046,4 +1018,3 @@ export class Stages {
   static sha256 = sha256;
   static fmt = fmtDuration;
 }
-void BUG_LABEL;

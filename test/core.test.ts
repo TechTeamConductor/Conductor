@@ -18,7 +18,7 @@ import { Auth } from '../src/server/auth.ts';
 import type { Plan, Run } from '../src/types.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'cond-core-'));
-const seed = { key: 'ENG-1', issueId: 'i1', teamId: 't', title: 'T', description: 'D', descHash: 'h', url: 'https://linear.app/x/issue/ENG-1', repo: 'r', branch: 'conductor/eng-1', worktree: '/w/ENG-1', baseSha: 'abc', loopBudget: 3 };
+const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHash: 'h', repo: 'r', branch: 'conductor/eng-1', worktree: '/w/ENG-1', baseSha: 'abc', loopBudget: 3 };
 
 test('config: defaults are safe; hostile/garbage input is clamped, never trusted', () => {
   const d = defaultConfig();
@@ -41,10 +41,12 @@ test('config: defaults are safe; hostile/garbage input is clamped, never trusted
 });
 test('config: applySettings only touches whitelisted settings', () => {
   const c = defaultConfig();
-  const next = applySettings(c, { maxLoops: 5, planApproval: 'manual', pickupFromBacklog: true, ['agents' as any]: { claude: { bin: '/evil' } }, ['worktreeRoot' as any]: '/etc' } as any);
+  const next = applySettings(c, { maxLoops: 5, planApproval: 'manual', pickupFromBacklog: true, linearMode: 'states', ['agents' as any]: { claude: { bin: '/evil' } }, ['worktreeRoot' as any]: '/etc' } as any);
   assert.equal(next.pipeline.maxLoops, 5);
   assert.equal(next.pipeline.planApproval, 'manual');
-  assert.equal(next.linear.pickupFromBacklog, true);
+  assert.equal(next.linear.pickupFromBacklog, false, 'Linear settings are gone from the settings surface (ignored)');
+  assert.equal(next.linear.mode, 'labels');
+  assert.equal('pickupFromBacklog' in toSettings(next), false);
   assert.equal(next.agents.claude.bin, 'claude', 'agent binary cannot be changed through the settings API');
   assert.equal(next.worktreeRoot, undefined);
   assert.equal(toSettings(next).maxLoops, 5);
@@ -160,15 +162,13 @@ test('open: terminal command is injection-proof for hostile worktree paths; targ
   const run = { ...newRun(seed), sessions: [{ id: uuid, agent: 'claude', stage: 'plan', loop: 1, rev: 1, startedAt: 1, status: 'ok' }, { id: '99999999-2222-3333-4444-555555555555', agent: 'cursor', stage: 'build', loop: 1, rev: 1, startedAt: 2, status: 'ok' }] } as Run;
   const cfg = defaultConfig();
   await assert.rejects(() => openRun(run, cfg, 'rm -rf /', exec), /unknown target/);
-  await assert.rejects(() => openRun({ ...run, url: 'http://evil.example/x' }, cfg, 'linear', exec), /Linear URL/);
-  await openRun(run, cfg, 'linear', exec);
+  await assert.rejects(() => openRun(run, cfg, 'linear', exec), /unknown target/, 'the old Linear target no longer exists');
   await openRun(run, cfg, 'cursor', exec);
   await openRun(run, cfg, 'terminal-claude', exec);
   await openRun(run, cfg, 'terminal-cursor', exec);
-  assert.deepEqual(calls[0].args, ['https://linear.app/x/issue/ENG-1']);
-  assert.deepEqual(calls[1].args, ['-a', 'Cursor', '/w/ENG-1']);
-  assert.ok(String(calls[2].args.at(-1)).endsWith(`claude --resume ${uuid}`));
-  assert.ok(String(calls[3].args.at(-1)).includes('agent --resume 99999999-'));
+  assert.deepEqual(calls[0].args, ['-a', 'Cursor', '/w/ENG-1']);
+  assert.ok(String(calls[1].args.at(-1)).endsWith(`claude --resume ${uuid}`));
+  assert.ok(String(calls[2].args.at(-1)).includes('agent --resume 99999999-'));
   await assert.rejects(() => openRun({ ...run, worktree: '' }, cfg, 'cursor', exec), /no worktree/i);
   await assert.rejects(() => openRun({ ...run, sessions: [] }, cfg, 'terminal-claude', exec), /No Claude session/);
 });
