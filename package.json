@@ -12,8 +12,8 @@
     "demo": "node bin/conductor.mjs demo",
     "doctor": "node bin/conductor.mjs doctor",
     "open": "node bin/conductor.mjs open",
-    "test": "node --test --test-concurrency=4 \"test/**/*.test.ts\"",
-    "test:live": "LIVE=1 node --test --test-concurrency=1 \"test/live/**/*.test.ts\"",
+    "test": "node --test --import ./test/preload.ts --test-concurrency=4 \"test/**/*.test.ts\"",
+    "test:live": "LIVE=1 node --test --import ./test/preload.ts --test-concurrency=1 \"test/live/**/*.test.ts\"",
     "check": "tsc --noEmit"
   },
   "devDependencies": {

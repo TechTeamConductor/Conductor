@@ -65,6 +65,11 @@ export interface ItemFilter {
   kind?: ItemKind;
 }
 
+const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** Items are the only entity with nested values (dependsOn, external): copy them on every way out and in (no aliasing of board state). */
+function cloneItem(i: WorkItem): WorkItem {
+  return { ...i, dependsOn: [...i.dependsOn], external: i.external ? { ...i.external } : undefined };
+}
 const clean = (s: string): string => s.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
 const asString = (v: unknown, name: string): string => {
   if (typeof v !== 'string') throw new BoardError('bad_input', `"${name}" must be a string.`);
@@ -88,6 +93,8 @@ export class Board {
   private compactEvery: number;
   private seq = 0;
   private opsSinceSnapshot = 0;
+  private nextCompactAt = 0;
+  private closed = false;
   private listeners = new Set<(c: BoardChange) => void>();
   private projectsById = new Map<string, Project>();
   private milestonesById = new Map<string, Milestone>();
@@ -104,6 +111,7 @@ export class Board {
     this.now = opts.now ?? (() => Date.now());
     this.redactFn = opts.redact ?? ((s) => defaultRedact(s));
     this.compactEvery = opts.compactEvery ?? 500;
+    this.nextCompactAt = this.compactEvery;
     this.journal = new Journal(this.dir, { readOnly: this.readOnly, fault: opts.fault });
     this.journal.lock({});
     try {
@@ -210,18 +218,33 @@ export class Board {
 
   private requireWritable(): void {
     if (this.readOnly) throw new BoardError('read_only', 'This board was opened read-only.');
+    if (this.closed) throw new BoardError('closed', 'This board is closed.');
+    if (this.journal.failed) throw new BoardError('storage_failed', `The board stopped accepting writes after a storage error (${this.journal.failed}). Restart Conductor to recover.`);
   }
 
   /** Durable first, memory second: a failed append leaves memory untouched. */
   private commit<T extends JournalOp>(build: (seq: number, ts: number) => T, change: BoardChange): T {
     this.requireWritable();
     const op = build(this.seq + 1, this.now());
-    this.journal.append(op);
+    try {
+      this.journal.append(op);
+    } catch (e) {
+      // the journal rolled itself back and is now failed: nothing was acknowledged, nothing changed in memory
+      throw new BoardError('storage_failed', `The board could not be written: ${(e as Error).message}`);
+    }
     this.seq = op.seq;
     this.applyOp(op);
     this.opsSinceSnapshot++;
     this.emit(change);
-    if (this.opsSinceSnapshot >= this.compactEvery) this.compact();
+    if (this.opsSinceSnapshot >= this.nextCompactAt) {
+      try {
+        this.compact();
+        this.nextCompactAt = this.compactEvery;
+      } catch {
+        // the op is durable and in memory; a failed compaction only means a longer journal — never fail the write, retry later
+        this.nextCompactAt = this.opsSinceSnapshot + this.compactEvery;
+      }
+    }
     return op;
   }
 
@@ -233,13 +256,15 @@ export class Board {
   }
 
   close(): void {
-    if (!this.readOnly && this.opsSinceSnapshot > 0) {
+    if (this.closed) return;
+    if (!this.readOnly && !this.journal.failed && this.opsSinceSnapshot > 0) {
       try {
         this.compact();
       } catch {
         /* the journal still has everything */
       }
     }
+    this.closed = true;
     this.journal.close();
   }
 
@@ -265,6 +290,7 @@ export class Board {
     const key = asString(input.key, 'key');
     if (!PROJECT_KEY_RE.test(key)) throw new BoardError('bad_key', 'A project key is 2–6 capital letters (e.g. APP).');
     if ([...this.projectsById.values()].some((p) => p.key === key)) throw new BoardError('exists', `Project ${key} already exists.`);
+    if (input.repo !== undefined && input.repo !== '' && !REPO_NAME_RE.test(input.repo)) throw new BoardError('bad_input', 'A repository name uses letters, numbers, dots, dashes and underscores only.');
     const p: Project = { id: randomUUID(), key, name: this.text('user', asString(input.name, 'name'), 120, 'name', { oneLine: true }), repo: input.repo ?? '', nextSeq: 1, createdAt: this.now() };
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'project', e: p }), { type: 'project', id: p.id });
     return { ...p };
@@ -272,9 +298,13 @@ export class Board {
   setProject(id: string, patch: { name?: string; repo?: string; archived?: boolean }): Project {
     const cur = this.projectsById.get(id);
     if (!cur) throw new BoardError('not_found', 'Unknown project.');
-    const next: Project = { ...cur, ...(patch.name !== undefined ? { name: this.text('user', patch.name, 120, 'name', { oneLine: true }) } : {}), ...(patch.repo !== undefined ? { repo: String(patch.repo) } : {}), ...(patch.archived !== undefined ? { archived: !!patch.archived } : {}) };
+    const next: Project = { ...cur, ...(patch.name !== undefined ? { name: this.text('user', patch.name, 120, 'name', { oneLine: true }) } : {}), ...(patch.repo !== undefined ? { repo: this.checkRepo(patch.repo) } : {}), ...(patch.archived !== undefined ? { archived: !!patch.archived } : {}) };
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'project', e: next }), { type: 'project', id });
     return { ...next };
+  }
+  private checkRepo(r: string): string {
+    if (r !== '' && !REPO_NAME_RE.test(String(r))) throw new BoardError('bad_input', 'A repository name uses letters, numbers, dots, dashes and underscores only.');
+    return String(r);
   }
   project(idOrKey: string): Project | undefined {
     const p = this.projectsById.get(idOrKey) ?? [...this.projectsById.values()].find((x) => x.key === idOrKey);
@@ -372,7 +402,7 @@ export class Board {
     this.requireWritable();
     if (input.idemKey) {
       const existing = this.itemIdem.get(input.idemKey);
-      if (existing) return { ...this.itemsById.get(existing)! };
+      if (existing) return cloneItem(this.itemsById.get(existing)!);
     }
     const project = this.projectsById.get(input.projectId);
     if (!project) throw new BoardError('not_found', 'Unknown project.');
@@ -424,33 +454,36 @@ export class Board {
       createdBy: actor,
       createdAt: ts,
       updatedAt: ts,
-      external: input.external,
+      external: input.external ? { ...input.external } : undefined,
       idemKey: input.idemKey,
     };
     // ONE journal line carries the item and the project's bumped counter (C2): a torn write can never re-issue a key.
     this.commit((seq, t) => ({ v: 1, seq, ts: t, t: 'item', e: item, nextSeq: { projectId: project.id, value: n } }), { type: 'item', id: item.id });
-    return { ...item };
+    return cloneItem(item);
   }
 
   item(idOrKey: string): WorkItem | undefined {
     const i = this.itemsById.get(idOrKey) ?? this.itemsByKey.get(idOrKey);
-    return i ? { ...i, dependsOn: [...i.dependsOn] } : undefined;
+    return i ? cloneItem(i) : undefined;
   }
   items(f: ItemFilter = {}): WorkItem[] {
     const lanes = f.lane === undefined ? null : Array.isArray(f.lane) ? f.lane : [f.lane];
     return [...this.itemsById.values()]
       .filter((i) => (!f.projectId || i.projectId === f.projectId) && (!lanes || lanes.includes(i.lane)) && (f.parentId === undefined || i.parentId === f.parentId) && (!f.kind || i.kind === f.kind))
       .sort((a, b) => a.createdAt - b.createdAt || a.key.localeCompare(b.key, undefined, { numeric: true }))
-      .map((i) => ({ ...i, dependsOn: [...i.dependsOn] }));
+      .map(cloneItem);
   }
   children(id: string): WorkItem[] {
     return this.items({ parentId: id });
   }
 
-  /** Items the engine may start: top-level, in To do, auto-start kinds, all dependencies done. (The engine also requires "no run yet".) */
-  claimable(): WorkItem[] {
+  /**
+   * Items the engine may start: top-level, in To do, auto-start, all dependencies done. Only `work` by default (K4: ask/research
+   * cards have no runner until M5 — otherwise they would run through the build pipeline). The engine also requires "no run yet".
+   */
+  claimable(kinds: readonly ItemKind[] = ['work']): WorkItem[] {
     return this.items({ lane: 'todo', parentId: null }).filter((i) => {
-      if (!i.autoStart || !AUTO_START_KINDS.has(i.kind)) return false;
+      if (!i.autoStart || !kinds.includes(i.kind) || !AUTO_START_KINDS.has(i.kind)) return false;
       return i.dependsOn.every((d) => this.itemsById.get(d)?.lane === 'done');
     });
   }
@@ -461,10 +494,10 @@ export class Board {
     if (!LANES.includes(lane)) throw new BoardError('bad_input', 'Unknown lane.');
     if (actor === 'user' && !HUMAN_LANES.includes(lane)) throw new BoardError('forbidden_lane', `You can move cards to ${HUMAN_LANES.join(', ')} only — Conductor owns the other lanes.`);
     const stage = opts.stage !== undefined ? opts.stage : lane === cur.lane ? cur.stage : undefined;
-    if (cur.lane === lane && cur.stage === stage) return { ...cur, dependsOn: [...cur.dependsOn] }; // idempotent: no journal line
+    if (cur.lane === lane && cur.stage === stage) return cloneItem(cur); // idempotent: no journal line
     const next: WorkItem = { ...cur, lane, stage, updatedAt: this.now() };
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'item', e: next }), { type: 'item', id: cur.id });
-    return { ...next, dependsOn: [...next.dependsOn] };
+    return cloneItem(next);
   }
 
   setFields(id: string, patch: { title?: string; description?: string; milestoneId?: string | null }, actor: Actor): WorkItem {
@@ -480,10 +513,10 @@ export class Board {
         next.milestoneId = patch.milestoneId;
       } else next = { ...next, milestoneId: undefined };
     }
-    if (next.title === cur.title && next.description === cur.description && next.milestoneId === cur.milestoneId) return { ...cur, dependsOn: [...cur.dependsOn] };
+    if (next.title === cur.title && next.description === cur.description && next.milestoneId === cur.milestoneId) return cloneItem(cur);
     next.updatedAt = this.now();
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'item', e: next }), { type: 'item', id: cur.id });
-    return { ...next, dependsOn: [...next.dependsOn] };
+    return cloneItem(next);
   }
 
   setDependsOn(id: string, deps: string[], _actor: Actor): WorkItem {
@@ -491,7 +524,7 @@ export class Board {
     if (!cur) throw new BoardError('not_found', 'Unknown item.');
     const next: WorkItem = { ...cur, dependsOn: this.checkDeps(cur.projectId, cur.id, deps), updatedAt: this.now() };
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'item', e: next }), { type: 'item', id: cur.id });
-    return { ...next, dependsOn: [...next.dependsOn] };
+    return cloneItem(next);
   }
 
   // ─────────────────────────── comments ───────────────────────────
@@ -535,9 +568,9 @@ export class Board {
  * from a request body.
  */
 export class UserBoard {
-  private b: Board;
+  #b: Board; // truly private: not reachable from a request-driven caller
   constructor(b: Board) {
-    this.b = b;
+    this.#b = b;
   }
   private obj(v: unknown): Record<string, unknown> {
     if (!v || typeof v !== 'object' || Array.isArray(v)) throw new BoardError('bad_input', 'Expected a JSON object.');
@@ -545,7 +578,7 @@ export class UserBoard {
   }
   createProject(input: unknown): Project {
     const o = this.obj(input);
-    return this.b.createProject({ key: asString(o.key, 'key'), name: asString(o.name, 'name'), repo: typeof o.repo === 'string' ? o.repo : undefined });
+    return this.#b.createProject({ key: asString(o.key, 'key'), name: asString(o.name, 'name'), repo: typeof o.repo === 'string' ? o.repo : undefined });
   }
   createItem(input: unknown): WorkItem {
     const o = this.obj(input);
@@ -553,7 +586,7 @@ export class UserBoard {
     if (!USER_KINDS.includes(kind)) throw new BoardError('forbidden', 'That kind of item cannot be created from the dashboard.');
     const lane = o.lane === undefined ? 'todo' : (o.lane as Lane);
     if (lane !== 'todo' && lane !== 'backlog') throw new BoardError('forbidden_lane', 'New items start in Backlog or To do.');
-    return this.b.createItem(
+    return this.#b.createItem(
       {
         projectId: asString(o.projectId, 'projectId'),
         title: asString(o.title, 'title'),
@@ -569,28 +602,28 @@ export class UserBoard {
     );
   }
   comment(itemId: string, body: unknown): BoardComment {
-    return this.b.addComment(itemId, asString(body, 'body'), 'user');
+    return this.#b.addComment(itemId, asString(body, 'body'), 'user');
   }
   setFields(itemId: string, input: unknown): WorkItem {
     const o = this.obj(input);
-    return this.b.setFields(itemId, { title: o.title === undefined ? undefined : asString(o.title, 'title'), description: o.description === undefined ? undefined : asString(o.description, 'description'), milestoneId: o.milestoneId === null ? null : typeof o.milestoneId === 'string' ? o.milestoneId : undefined }, 'user');
+    return this.#b.setFields(itemId, { title: o.title === undefined ? undefined : asString(o.title, 'title'), description: o.description === undefined ? undefined : asString(o.description, 'description'), milestoneId: o.milestoneId === null ? null : typeof o.milestoneId === 'string' ? o.milestoneId : undefined }, 'user');
   }
   /** Plain lane change for items WITHOUT a run. (The HTTP layer routes items that have a run through the engine's commands first.) */
   moveLane(itemId: string, lane: unknown): WorkItem {
     if (typeof lane !== 'string' || !LANES.includes(lane as Lane)) throw new BoardError('bad_input', 'Unknown lane.');
-    return this.b.setLane(itemId, lane as Lane, 'user');
+    return this.#b.setLane(itemId, lane as Lane, 'user');
   }
   setDependsOn(itemId: string, deps: unknown): WorkItem {
     if (!Array.isArray(deps)) throw new BoardError('bad_input', '"dependsOn" must be an array.');
-    return this.b.setDependsOn(itemId, deps.map((d) => asString(d, 'dependsOn[]')), 'user');
+    return this.#b.setDependsOn(itemId, deps.map((d) => asString(d, 'dependsOn[]')), 'user');
   }
   createMilestone(input: unknown): Milestone {
     const o = this.obj(input);
-    return this.b.createMilestone({ projectId: asString(o.projectId, 'projectId'), title: asString(o.title, 'title'), description: typeof o.description === 'string' ? o.description : '', dueAt: typeof o.dueAt === 'number' ? o.dueAt : undefined }, 'user');
+    return this.#b.createMilestone({ projectId: asString(o.projectId, 'projectId'), title: asString(o.title, 'title'), description: typeof o.description === 'string' ? o.description : '', dueAt: typeof o.dueAt === 'number' ? o.dueAt : undefined }, 'user');
   }
   addDecision(input: unknown): Decision {
     const o = this.obj(input);
-    return this.b.addDecision({ projectId: asString(o.projectId, 'projectId'), itemId: typeof o.itemId === 'string' ? o.itemId : undefined, title: asString(o.title, 'title'), body: typeof o.body === 'string' ? o.body : '' }, 'user');
+    return this.#b.addDecision({ projectId: asString(o.projectId, 'projectId'), itemId: typeof o.itemId === 'string' ? o.itemId : undefined, title: asString(o.title, 'title'), body: typeof o.body === 'string' ? o.body : '' }, 'user');
   }
 }
 

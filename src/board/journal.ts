@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { acquireLock, type LockInfo } from '../lock.ts';
 import { loadVersioned, type VersionSpec } from '../schema/version.ts';
@@ -44,6 +44,10 @@ export class Journal {
   readonly snapshotFile: string;
   readonly journalFile: string;
   private fd: number | null = null;
+  /** Size of the journal file as far as WE know it (offset to truncate back to when an append fails). */
+  private size = 0;
+  /** Set after an I/O failure on append: every later append throws until the board is reopened. */
+  private failedWith: string | null = null;
   private releaseLock: (() => void) | null = null;
   private fault: FaultHook;
   readonly readOnly: boolean;
@@ -90,7 +94,7 @@ export class Journal {
         let op: JournalOp | null = null;
         try {
           op = JSON.parse(line) as JournalOp;
-          if (!op || typeof op !== 'object' || typeof (op as any).seq !== 'number' || !OP_KINDS.has((op as any).t)) throw new Error('not an operation');
+          if (!op || typeof op !== 'object' || typeof (op as any).seq !== 'number' || !OP_KINDS.has((op as any).t) || !(op as any).e || typeof (op as any).e !== 'object') throw new Error('not an operation');
         } catch {
           op = null;
         }
@@ -126,22 +130,68 @@ export class Journal {
         }
       }
     }
+    this.size = existsSync(this.journalFile) ? statSync(this.journalFile).size : 0;
+    if (!this.readOnly) this.cleanStaleTemps();
     return { snapshot, ops, tornBytes };
   }
 
+  /** Snapshot temp files left behind by a crash mid-compaction are garbage. */
+  private cleanStaleTemps(): void {
+    try {
+      for (const f of readdirSync(this.dir)) if (/^snapshot\.json\..+\.tmp$/.test(f)) unlinkSync(join(this.dir, f));
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** Non-null once an append failed: the board must refuse further writes (reopen to recover). */
+  get failed(): string | null {
+    return this.failedWith;
+  }
+
   private openJournal(): number {
-    if (this.fd === null) this.fd = openSync(this.journalFile, 'a', 0o600);
+    if (this.fd === null) {
+      const existed = existsSync(this.journalFile);
+      this.fd = openSync(this.journalFile, 'a', 0o600);
+      if (!existed) fsyncDir(this.dir); // make the new file's directory entry durable
+    }
     return this.fd;
   }
 
+  /**
+   * Durably append one line. On ANY I/O error the journal is rolled back to its previous size (so a half-written line can never
+   * swallow later acknowledged writes) and then marked failed: later appends throw until the board is reopened.
+   */
   append(op: JournalOp): void {
     if (this.readOnly) throw new Error('journal is read-only');
+    if (this.failedWith) throw new Error(`journal is unusable after an earlier write failure (${this.failedWith}) — reopen the board`);
     this.fault('journal:before-append');
-    const fd = this.openJournal();
     const line = Buffer.from(JSON.stringify(op) + '\n', 'utf8');
-    let off = 0;
-    while (off < line.length) off += writeSync(fd, line, off, line.length - off);
-    fsyncSync(fd);
+    const before = this.size;
+    let fd: number | null = null;
+    try {
+      fd = this.openJournal();
+      const half = Math.floor(line.length / 2);
+      let off = 0;
+      while (off < line.length) {
+        off += writeSync(fd, line, off, Math.min(line.length - off, off < half ? half - off : line.length - off));
+        if (off >= half && off < line.length) this.fault('journal:mid-append');
+      }
+      this.fault('journal:before-fsync');
+      fsyncSync(fd);
+    } catch (e) {
+      this.failedWith = (e as Error).message;
+      try {
+        if (fd !== null) {
+          ftruncateSync(fd, before); // drop whatever part of the line reached the file
+          fsyncSync(fd);
+        }
+      } catch {
+        /* the journal is marked failed either way; load() also tolerates a torn tail */
+      }
+      throw e;
+    }
+    this.size = before + line.length;
     this.fault('journal:after-append');
   }
 
@@ -166,6 +216,7 @@ export class Journal {
     if (this.fd !== null) {
       ftruncateSync(this.fd, 0);
       fsyncSync(this.fd);
+      this.size = 0;
     } else if (existsSync(this.journalFile) && statSync(this.journalFile).size > 0) {
       const f = openSync(this.journalFile, 'r+');
       try {
@@ -174,6 +225,7 @@ export class Journal {
       } finally {
         closeSync(f);
       }
+      this.size = 0;
     }
     this.fault('compact:after-journal-truncate');
   }

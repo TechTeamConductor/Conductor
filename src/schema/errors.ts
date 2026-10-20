@@ -19,7 +19,7 @@ export class CorruptFileError extends Error {
   kind: string;
   file: string;
   constructor(kind: string, file: string, detail: string) {
-    super(`${kind} (${file}) is corrupt: ${detail}. Conductor will not guess — nothing was changed. A backup copy of the file has been kept next to it.`);
+    super(`${kind} (${file}) is corrupt: ${detail}. Conductor will not guess — nothing was changed.`);
     this.name = 'CorruptFileError';
     this.kind = kind;
     this.file = file;

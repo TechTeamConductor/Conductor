@@ -131,7 +131,9 @@ test('claimable(): only top-level To-do items of auto-start kinds whose dependen
   const child = b.createItem({ projectId: p.id, title: 'child', parentId: ok.id }, 'user');
   const bug = b.createItem({ projectId: p.id, title: 'bug', kind: 'bug' }, 'conductor');
   const manual = b.createItem({ projectId: p.id, title: 'manual', autoStart: false }, 'user');
-  assert.deepEqual(b.claimable().map((i) => i.key), [ok.key]);
+  const ask = b.createItem({ projectId: p.id, title: 'a question', kind: 'ask' }, 'user');
+  assert.deepEqual(b.claimable().map((i) => i.key), [ok.key], 'only `work` is claimable by default (K4: ask/research have no runner yet)');
+  assert.ok(b.claimable(['work', 'ask']).some((i) => i.id === ask.id), 'other kinds are available when a runner exists');
   b.setLane(dep.id, 'done', 'user');
   assert.deepEqual(b.claimable().map((i) => i.key).sort(), [blocked.key, ok.key].sort());
   assert.ok(![child, bug, manual].some((i) => b.claimable().some((c) => c.id === i.id)));
@@ -344,8 +346,12 @@ function assertConsistent(dir: string, acked: number): void {
   const items = b.items();
   const keys = items.map((i) => i.key);
   assert.equal(new Set(keys).size, keys.length, 'no duplicate keys');
-  // ack sequence: 1 = project, then (item, comment) pairs → acknowledged items = ceil((acked-1)/2)
-  assert.ok(items.length >= Math.ceil(Math.max(0, acked - 1) / 2), `acknowledged items survived (acked ${acked}, items ${items.length})`);
+  // ack sequence: 1 = project, then per round i: item i (ack 2+2i) and its comment (ack 3+2i)
+  for (let i = 0; 2 + 2 * i <= acked; i++) {
+    const it = items.find((x) => x.title === `item ${i}`);
+    assert.ok(it, `acknowledged item ${i} survived (acked ${acked})`);
+    if (3 + 2 * i <= acked) assert.deepEqual(b.comments(it!.id).map((c) => c.body), [`comment ${i}`], `acknowledged comment ${i} survived`);
+  }
   const p = b.project('CRA');
   if (items.length) {
     const max = Math.max(...keys.map((k) => Number(k.split('-')[1])));
@@ -381,5 +387,91 @@ test('clean run in the child completes and the final state is complete', () => {
   assert.equal(b.items().length, 12);
   assert.equal(b.items().flatMap((i) => b.comments(i.id)).length, 12);
   assert.ok(existsSync(join(dir, 'snapshot.json')));
+  b.close();
+});
+
+// ───────────────────────────── review B1 / B2 ─────────────────────────────
+test('B1 — a write that fails mid-line is rolled back, the board then refuses writes, and every acknowledged write survives', () => {
+  for (const point of ['journal:mid-append', 'journal:before-fsync']) {
+    const dir = tmp();
+    let armed = false;
+    const b = open(dir, { fault: (p: string) => { if (armed && p === point) throw new Error(`injected I/O error at ${point}`); } });
+    const p = mk(b);
+    const a = b.createItem({ projectId: p.id, title: 'acknowledged' }, 'user');
+    armed = true;
+    assert.throws(() => b.createItem({ projectId: p.id, title: 'doomed' }, 'user'), (e: any) => e instanceof BoardError && e.code === 'storage_failed');
+    armed = false;
+    assert.equal(b.items().length, 1, 'nothing changed in memory');
+    assert.throws(() => b.createItem({ projectId: p.id, title: 'after the failure' }, 'user'), (e: any) => e instanceof BoardError && e.code === 'storage_failed', 'later writes are refused, not appended after a half line');
+    assert.equal(b.items().length, 1);
+    b.close(); // must not compact a failed journal
+    const lines = readFileSync(join(dir, 'journal.ndjson'), 'utf8').split('\n').filter(Boolean);
+    for (const l of lines) JSON.parse(l); // every line on disk is whole
+    const r = open(dir);
+    assert.deepEqual(r.items().map((i) => i.title), ['acknowledged'], point);
+    assert.equal(r.recoveredTornBytes, 0, 'the half line was rolled back, not left for the next open to ignore');
+    assert.equal(r.createItem({ projectId: p.id, title: 'fresh start' }, 'user').key, 'APP-2', 'the doomed key was never issued');
+    r.close();
+    void a;
+  }
+});
+
+test('B1 — a failing compaction never fails the write (the op is already durable) and a retry is idempotent', () => {
+  const dir = tmp();
+  let armed = true;
+  const b = open(dir, { compactEvery: 3, fault: (pt: string) => { if (armed && pt === 'compact:after-snapshot-temp') throw new Error('injected compaction failure'); } });
+  const p = mk(b);
+  const made = [1, 2, 3, 4].map((n) => b.createItem({ projectId: p.id, title: `t${n}`, idemKey: `k${n}` }, 'user')); // crosses the compaction threshold
+  assert.equal(b.items().length, 4);
+  assert.equal(b.createItem({ projectId: p.id, title: 'retry', idemKey: 'k2' }, 'user').id, made[1]!.id, 'a caller retry does not duplicate');
+  armed = false;
+  b.close();
+  const r = open(dir);
+  assert.equal(r.items().length, 4);
+  r.close();
+});
+
+test('B1 — writes after close() are refused (no lock is held any more)', () => {
+  const b = open(tmp());
+  const p = mk(b);
+  b.close();
+  b.close(); // idempotent
+  assert.throws(() => b.createItem({ projectId: p.id, title: 'late' }, 'user'), (e: any) => e instanceof BoardError && e.code === 'closed');
+  assert.equal(b.projects().length, 1, 'reads still work');
+});
+
+test('B2 — objects handed out never alias board state (mutating them changes nothing, even after compaction)', () => {
+  const dir = tmp();
+  const b = open(dir);
+  const bar = b.createProject({ key: 'BAR', name: 'Bar' });
+  const dep = b.createItem({ projectId: bar.id, title: 'dep' }, 'user');
+  const link = { system: 'linear' as const, key: 'BAR-9', url: 'https://linear.app/x/issue/BAR-9' };
+  const made = b.createItem({ projectId: bar.id, key: 'BAR-9', title: 'imp', dependsOn: [dep.id], external: link }, 'import');
+  made.dependsOn.push('evil');
+  made.external!.url = 'https://evil.example';
+  link.url = 'https://evil.example/2'; // the caller's own object is not retained either
+  for (const copy of [b.item('BAR-9')!, b.items().find((i) => i.key === 'BAR-9')!]) {
+    copy.dependsOn.length = 0;
+    copy.external!.key = 'HACKED';
+  }
+  const fresh = b.item('BAR-9')!;
+  assert.deepEqual(fresh.dependsOn, [dep.id]);
+  assert.deepEqual(fresh.external, { system: 'linear', key: 'BAR-9', url: 'https://linear.app/x/issue/BAR-9' });
+  b.compact();
+  b.close();
+  const r = open(dir);
+  assert.deepEqual(r.item('BAR-9')!.dependsOn, [dep.id]);
+  assert.equal(r.item('BAR-9')!.external!.key, 'BAR-9');
+  r.close();
+});
+
+test('N5 — repository names are validated (no path-like or oversized values), UserBoard rejects wrongly typed fields', () => {
+  const b = open(tmp());
+  assert.throws(() => b.createProject({ key: 'ABC', name: 'x', repo: '../../etc' }), /letters, numbers/);
+  assert.throws(() => b.user.createProject({ key: 'ABC', name: 'x', repo: 'a'.repeat(100) }), /letters, numbers/);
+  const p = b.createProject({ key: 'ABC', name: 'x', repo: 'my-app' });
+  assert.throws(() => b.setProject(p.id, { repo: 'a/b' }), /letters, numbers/);
+  assert.equal(b.setProject(p.id, { repo: 'other_app' }).repo, 'other_app');
+  assert.equal((b.user as any).b, undefined, 'the facade does not expose the board');
   b.close();
 });
