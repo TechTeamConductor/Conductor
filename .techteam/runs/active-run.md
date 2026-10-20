@@ -1,20 +1,27 @@
 # Run checkpoint
 
-- Run ID / root Linear issue: conductor-v1 / none (no Linear connector available in this session)
-- User goal: Build a local master system: Linear issue → Claude analyses+plans → Cursor agent builds → Claude verifies → bugs back to Cursor; one dashboard; visible runs; minimal user effort.
-- Current graph state: Implementation ~complete. 433+ tests green; live Cursor E2E + no-push adversarial test pass. Awaiting independent code review (Reviewer) + security review (Security) + Frontend specialist final report. Real instance running for the user's setup (port 4317).
+- Run ID / root Linear issue: workspace-v2 / none (Linear is being removed; no tracker connector in this session)
+- User goal: build the "AI-Native Autonomous Engineering Workspace" (`.techteam/plans/workspace-v2-requirements.md`, verbatim): desktop app (Win `.exe` + Linux `.deb`), 3 CLIs (Codex/Claude/Cursor) per-role, native board replacing Linear, plan-before-execution with decomposition, persistent offline-capable project context, 3 modes (Quick Ask / Engineering / Deep Research), automation policies, onboarding, versioned migrations.
+- Previous run: `conductor-v1` — COMPLETE and committed (`56c7f2d`, tag `v1.0.0-rc2`); its final report is still to be written (`.techteam/runs/final-report-conductor-v1.md`, not yet written).
+- Current graph state: **planning phase**. Master plan rev 2 + sub-plans M1 and M2 written; awaiting Reviewer re-review. No v2 source edited.
 - Completed tasks and evidence:
-  - Environment + CLI contract probes (see plan §1): Cursor headless build verified live; Claude headless blocked by weekly quota (resets 2026-10-21 14:00 Europe/London); `--setting-sources project,local` strips user agents/skills.
-- In-progress tasks and owner: Reviewer (code review), Security (attack review), Frontend (UI polish).
-- Blocked tasks and exact blocker: none (Claude live verification blocked by quota until reset; mitigated by fixtures).
-- Decisions / assumptions made: see plan §6 (trigger label `conductor`; auto planApproval; cursor-cli default builder; no PR/merge; stay on `main`).
-- Files/artifacts changed: full source tree (src/, ui/, prompts/, fixtures/, test/, docs/), `.techteam/**`, evidence screenshots in `.techteam/runs/evidence/`.
-- Checks already run and outcomes: `npm run check` clean; `npm test` 433 tests (432 pass, 1 opt-in Keychain smoke run separately: pass); LIVE real-Cursor E2E pass (54 s); LIVE no-push adversarial pass (8/8 attacks blocked after widening deny list); `doctor --isolation` on real Claude: isolated; demo + real wizard verified in browser (desktop+mobile, no console errors).
-- Last successful checkpoint: all of the above (commit b304551 + later uncommitted work).
-- Next concrete action: triage review findings → fix → re-run suites → final report (`.techteam/runs/final-report-conductor-v1.md`).
+  - v1 security batch + BAR-363 question-task fix committed (`56c7f2d`): `npm run check` clean, `npm test` 483 tests / 479 pass / 4 opt-in skips, live suite (`LIVE=1 test/live/*`) 3/3 pass (Cursor E2E, no-push, question) — run 2026-10-20.
+  - Tag `v1.0.0-rc2`; backup of real config/state/runs at `~/.conductor-backups/20261020-134302/`.
+  - Research: Codex non-interactive docs, electron-builder toolsets, Electron safeStorage (sources in plan §1).
+  - Reviewer review #1 of the master plan: **Changes requested** (12 blocking) → `.techteam/reviews/workspace-v2-plan-review.md`. Rev 2 addresses all 12 (see plan header).
+- In-progress tasks and owner: Reviewer (re-review of rev 2 + M1 + M2 sub-plans).
+- Blocked tasks and exact blocker:
+  - Restarting the user's live v1 instance onto the fixed code: **blocked by the permission classifier** (kill of a running process). The live instance (pid 11390, :4317) still runs pre-fix v1 code; BAR-363 stays `needs_human` until the user restarts it (needs the user's OK or a manual restart).
+  - Codex live verification: binary is broken (`ENOENT` native vendor binary); repairing needs a download → user permission (asked at end of M2).
+  - Electron/electron-builder/Docker downloads: user permission (asked at M7).
+- Decisions / assumptions made: D1–D8 in the master plan §6 (parallel build deferred; no auto-install of CLIs; Windows = preview; automation default keeps v1 forced holds; research no-repo + summaries off; Linear import history-only; Codex not an implementer). v2 developed in an isolated local clone `/Volumes/Sandisk/github/techteam-conductor-v2` so the running v1 tool (served from the original tree) is not disturbed; throw-away `CONDUCTOR_HOME` for all tests.
+- Files/artifacts changed: `.techteam/plans/workspace-v2{,-requirements,-m1,-m2}.md`, `.techteam/reviews/workspace-v2-plan-review.md`, this file.
+- Checks already run and outcomes: see "Completed tasks".
+- Last successful checkpoint: commit `56c7f2d` (v1) — v2 has no commits yet.
+- Next concrete action: Reviewer re-review → on **Approved** (at least M1 + M2 sub-plans) create the v2 clone and start **M1a** (board store + `src/schema/` versioning framework, no engine change).
 - Retry count / alternate strategy tried: 0
-- Plan status: approved
-- Plan artifact: `.techteam/plans/conductor-v1.md`
-- Plan reviewed by: Reviewer (agent a07376f7888331a08), 3 rounds
-- Plan review artifact: `.techteam/reviews/conductor-v1-plan-review.md` (Decision: Approved)
-- Plan approved at: 2026-10-20 (after round 3)
+- Plan status: pending_reviewer (rev 2)
+- Plan artifact: `.techteam/plans/workspace-v2.md` (+ `-m1`, `-m2`, `-requirements`)
+- Plan reviewed by: Reviewer agent `a398525bdb5f63c18` (round 1: Changes requested)
+- Plan review artifact: `.techteam/reviews/workspace-v2-plan-review.md`
+- Plan approved at: —
