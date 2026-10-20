@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CEILINGS, localDay, take, used } from '../src/limits/budget.ts';
 
+process.env.TZ = 'America/Los_Angeles'; // the day rule is the LOCAL date: pin a non-UTC zone so a UTC regression fails
 const home = () => { const h = mkdtempSync(join(tmpdir(), 'bud-')); process.env.CONDUCTOR_HOME = h; return h; };
 
 test('counters: per-day window on the LOCAL date, ceilings are constants, restart-safe, old windows dropped', () => {

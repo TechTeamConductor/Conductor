@@ -42,6 +42,8 @@ export interface HarnessOpts {
   board?: Parameters<typeof Board.open>[0];
   /** A stand-in for the project context engine (default: the real one). */
   context?: import('../../src/context/service.ts').ContextLike;
+  /** Connectivity probe fetcher (default: probe off). */
+  offlineFetcher?: import('../../src/net/offline.ts').Fetcher | null;
 }
 export interface Harness {
   root: string;
@@ -139,6 +141,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
     persistent: { load: () => ({ repos: approved }), save: (s) => Object.assign(approved, s.repos) },
     secrets: () => [],
     context: opts.context,
+    offlineFetcher: opts.offlineFetcher,
   });
   const h: Harness = {
     root, home, repoDir, fakeDir, cfg, board, projectId: project.id, store, agents, engine, notes,

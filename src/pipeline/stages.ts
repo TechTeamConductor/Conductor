@@ -118,6 +118,8 @@ export class Stages {
         return called.kind === 'ok' ? { kind: 'ok', json: called.json } : { kind: 'stop', hold: called.hold };
       },
       applyHold: (k, hold) => this.applyHold(k, hold),
+      looksOffline: (res) => this.looksOffline(res),
+      refundRun: (k) => this.patch(k, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1))),
       analysisSlot: (k) => ctx.analysisSlot(ctx.signal(k)),
       projectBlocks: (k, consumer, files) => this.projectBlocks(k, consumer, files),
       protectedPaths: PROTECTED,
@@ -259,6 +261,15 @@ export class Stages {
   }
 
   /**
+   * A CLI that is offline usually HANGS rather than printing a network error: a timeout or generic failure while the probe says "offline"
+   * is a network failure (plan §2b-3a). Only the probe's verdict counts — never the CLI's or the model's words.
+   */
+  async looksOffline(res: AgentResult): Promise<boolean> {
+    if (res.ok || !(res.errorKind === 'timeout_idle' || res.errorKind === 'timeout_hard' || res.errorKind === 'agent')) return false;
+    return (await this.c.networkState()) === 'offline';
+  }
+
+  /**
    * The network is unreachable: pause (never fail), refund the attempt (done by the caller), back off 30 s → 5 min, and resume by itself when
    * the engine's probe says the network is back. One comment and one notification per episode; a cumulative 24 h ceiling and an episode cap
    * keep a CLI that keeps reporting network errors from pausing and resuming forever.
@@ -385,6 +396,7 @@ export class Stages {
         secrets: this.c.secretsFor(run),
         maxTurnsFactor: turnsFactor,
       });
+      if (await this.looksOffline(res)) res.errorKind = 'network';
       this.finishSession(key, res);
       this.refundIfLimit(key, res);
       if (res.fellBack && res.from && res.from !== res.agent) {
@@ -915,6 +927,10 @@ export class Stages {
       case 'spawn':
         return this.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
       default: {
+        if (await this.looksOffline(res)) {
+          this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
+          return this.pauseForOffline(key, res.error ?? 'network unreachable');
+        }
         const tries = run.buildFails ?? 0;
         this.patch(key, (r) => {
           r.buildFails = tries + 1;

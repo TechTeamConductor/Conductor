@@ -17,6 +17,9 @@ import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
 import { OFFLINE_OPERATIONS } from '../net/offline.ts';
+import { contextStatus, refreshContext, DEFAULT_STALE_DAYS } from '../context/incremental.ts';
+import { loadContext } from '../context/store.ts';
+import { normalizeProjects } from '../config.ts';
 import { AskError, type AskService } from '../asks/service.ts';
 import { ASK_ID_RE } from '../asks/store.ts';
 import { detectGates } from '../git/gates.ts';
@@ -311,6 +314,15 @@ export class Api {
     };
   }
 
+  /** A board project key → its repository, validated before anything touches a path. */
+  private contextTarget(key: string): { key: string; repo: { name: string; path: string; baseBranch: string; gates: any[] } } {
+    if (!/^[A-Z]{2,6}$/.test(key)) throw new ApiFail(404, 'not_found', 'Unknown project.');
+    const project = this.d.board.projects().find((p) => p.key === key);
+    const repo = project && this.d.getConfig().repos.find((r) => r.name === project.repo);
+    if (!project || !repo) throw new ApiFail(404, 'not_found', 'Unknown project or it has no repository yet.');
+    return { key, repo };
+  }
+
   private asksSvc(): AskService {
     if (!this.d.asks) throw new ApiFail(501, 'not_available', 'Quick Ask is not available here.');
     return this.d.asks;
@@ -377,6 +389,13 @@ export class Api {
         if (!rec) throw new ApiFail(404, 'not_found', 'Unknown question.');
         return { json: rec };
       }
+      if ((m = /^\/api\/projects\/([^/]+)\/context$/.exec(path))) {
+        const { key, repo } = this.contextTarget(safeDecode(m[1]!));
+        const status = await contextStatus(key, repo, { staleDays: this.d.getConfig().projects?.[key]?.context?.staleDays ?? DEFAULT_STALE_DAYS });
+        const l = loadContext(key);
+        const f = l.state === 'ok' ? l.facts : null;
+        return { json: { key, status, summaries: this.d.getConfig().projects?.[key]?.context?.summaries === true, facts: f && { languages: f.languages, frameworks: f.frameworks, packageManagers: f.packageManagers, tests: f.tests, modules: f.modules.length, files: f.counts.files, truncated: f.counts.truncated } } };
+      }
       if (path === '/api/offline') return { json: { online: (await this.d.engine.probe.check()) !== 'offline', checkedAt: this.d.engine.probe.last()?.at ?? null, operations: OFFLINE_OPERATIONS } };
       if ((m = /^\/api\/items\/([^/]+)$/.exec(path))) return { json: this.itemView(safeDecode(m[1]!)) };
       if ((m = /^\/api\/runs\/([^/]+)\/log$/.exec(path))) {
@@ -385,6 +404,25 @@ export class Api {
       throw new ApiFail(404, 'not_found', 'No such endpoint.');
     }
 
+    if ((m = /^\/api\/projects\/([^/]+)\/context\/scan$/.exec(path)) && method === 'POST') {
+      for (const k of Object.keys(body)) if (k !== 'full') throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      if (body.full !== undefined && typeof body.full !== 'boolean') throw new ApiFail(400, 'bad_request', '"full" must be true or false.');
+      const { key, repo } = this.contextTarget(safeDecode(m[1]!));
+      const r = await refreshContext(key, repo, { full: body.full === true, staleDays: this.d.getConfig().projects?.[key]?.context?.staleDays ?? DEFAULT_STALE_DAYS });
+      return { json: { action: r.action, rescanned: r.rescanned, reused: r.reused, status: r.status, error: r.error ?? null } };
+    }
+    if ((m = /^\/api\/projects\/([^/]+)\/context\/settings$/.exec(path)) && method === 'PUT') {
+      const { key } = this.contextTarget(safeDecode(m[1]!));
+      for (const k of Object.keys(body)) if (!['summaries', 'staleDays', 'packBytes'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      if (body.summaries !== undefined && typeof body.summaries !== 'boolean') throw new ApiFail(400, 'bad_request', '"summaries" must be true or false.');
+      for (const k of ['staleDays', 'packBytes']) if (body[k] !== undefined && (typeof body[k] !== 'number' || !Number.isFinite(body[k]))) throw new ApiFail(400, 'bad_request', `"${k}" must be a number.`);
+      const cfg = this.d.getConfig();
+      const cur = cfg.projects?.[key]?.context ?? { summaries: false, staleDays: 14, packBytes: 8192 };
+      const next = normalizeProjects({ [key]: { context: { ...cur, ...body } } });
+      cfg.projects = { ...(cfg.projects ?? {}), ...next };
+      this.d.saveConfig(cfg);
+      return { json: { ok: true, context: cfg.projects[key]!.context, notice: cfg.projects[key]!.context!.summaries ? 'Directory summaries spend model quota (a small number of calls per day, see pipeline.contextRunsPerDay).' : undefined } };
+    }
     if (method === 'POST' && path === '/api/ask') {
       const allowed = new Set(['question', 'repo', 'allowChange']);
       for (const k of Object.keys(body)) if (!allowed.has(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);

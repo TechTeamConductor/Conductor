@@ -144,6 +144,7 @@ export class Engine {
       tickSoon: () => this.tickSoon(),
       analysisSlot: (signal) => this.analysisSem.acquire(signal),
       context: this.context,
+      networkState: () => this.probe.check(),
       recordQuota: (agent, q) => {
         this.quotaMap.set(agent, { utilization7d: q.utilization7d, utilization5h: q.utilization5h, resetsAt: q.resetsAt, rejected: q.status === 'rejected' });
         this.changed();
@@ -937,7 +938,7 @@ export class Engine {
       running: this.jobs.size,
       maxParallel: this.d.getConfig().pipeline.maxParallel,
       lastPollAt: this.lastPollAt,
-      offline: this.probe.last()?.state === 'offline',
+      offline: this.probe.last()?.state === 'offline' && this.clock.now() - (this.probe.last()?.at ?? 0) < 60_000,
       lastPollError: storageProblem,
       storageProblem,
       pollSeconds: TICK_MS / 1000,

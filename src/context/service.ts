@@ -118,7 +118,7 @@ export class ContextService implements ContextLike {
     if (!projectKey) return null;
     const r = await refreshContext(projectKey, { name: repo.name, path: repo.path, baseBranch: repo.baseBranch, gates: repo.gates }, { staleDays: this.settings(projectKey).staleDays, now: this.now });
     if (this.summarise && this.settings(projectKey).summaries && r.status.state === 'fresh') {
-      void refreshSummaries(projectKey, { call: this.summarise, perDay: this.getConfig().pipeline.contextRunsPerDay, now: this.now() }).catch((e) => log.warn(`${projectKey}: summaries failed: ${errMsg(e)}`));
+      void refreshSummaries(projectKey, { call: this.summarise, perDay: this.getConfig().pipeline.contextRunsPerDay, now: this.now(), secrets: run.key ? [] : [] }).catch((e) => log.warn(`${projectKey}: summaries failed: ${errMsg(e)}`));
     }
     return r;
   }

@@ -89,6 +89,10 @@ if (step.limit) {
   out({ type: 'result', subtype: 'error', is_error: true, result: "You've hit your usage limit. Upgrade your plan to continue.", session_id: sid });
   process.exit(1);
 }
+if (step.network) {
+  process.stderr.write(String(step.error ?? 'getaddrinfo ENOTFOUND api.cursor.sh') + '\n');
+  process.exit(1);
+}
 if (step.error) {
   process.stderr.write(String(step.error) + '\n');
   process.exit(1);

@@ -66,3 +66,74 @@ test('the episode cap ends a run that keeps going offline in needs-you (it canno
     assert.match(h.run(key).needsHuman!.reason, /network repeatedly/);
   } finally { await h.cleanup(); }
 });
+
+import { SCAN_ENV } from '../src/context/gitread.ts';
+import { OFFLINE_RUN_CEILING_MS } from '../src/net/offline.ts';
+
+test('MJ-3: a paused-offline run stays paused while the probe says offline and resumes by itself when it says online; the comment is posted once', async () => {
+  let up = false;
+  const clock = { t: 1_000_000, now() { return this.t; }, advance(ms: number) { this.t += ms; } };
+  const h = await makeHarness({ clock: clock as any, offlineFetcher: async () => { if (!up) throw Object.assign(new Error('fetch failed'), { cause: { code: 'ENOTFOUND' } }); return {}; } });
+  try {
+    h.scenario({ claude: { '*': { plan: [{ network: true }, {}] } } });
+    const key = h.issue('Add the greeting');
+    await h.settle();
+    assert.equal(h.run(key).status, 'paused');
+    const comments = () => h.board.comments(key).filter((c) => /Paused — no network/.test(c.body)).length;
+    assert.equal(comments(), 1);
+    clock.advance(60_000);
+    await h.engine.tick();
+    assert.equal(h.run(key).status, 'paused', 'still offline: the pause is extended, not resumed');
+    assert.ok((h.run(key).pausedUntil ?? 0) > clock.now());
+    up = true;
+    clock.advance(600_000);
+    await h.settle();
+    assert.equal(h.run(key).status, 'ready', 'resumed by itself when the probe said online');
+    assert.equal(comments(), 1, 'one comment per episode');
+  } finally { await h.cleanup(); }
+});
+
+test('MJ-1: a CLI that HANGS while the probe says offline is a network failure (refunded, paused), not a failed attempt; online ⇒ an ordinary failure', async () => {
+  const h = await makeHarness({ offlineFetcher: async () => { throw Object.assign(new Error('fetch failed'), { cause: { code: 'ENOTFOUND' } }); } });
+  try {
+    h.cfg.pipeline.timeoutsMin.idle = 1;
+    h.scenario({ claude: { '*': { plan: [{ error: 'boom' }] } } });
+    const key = h.issue('Add the greeting');
+    await h.settle();
+    assert.equal(h.run(key).status, 'paused');
+    assert.equal(h.run(key).pauseReason, 'offline');
+    assert.equal(h.run(key).agentRuns, 0);
+  } finally { await h.cleanup(); }
+  const h2 = await makeHarness({ offlineFetcher: async () => ({}) });
+  try {
+    h2.scenario({ claude: { '*': { plan: [{ error: 'boom' }, { error: 'boom' }] } } });
+    const key = h2.issue('Add the greeting');
+    await h2.settle();
+    assert.equal(h2.run(key).status, 'needs_human');
+  } finally { await h2.cleanup(); }
+});
+
+test('MJ-3: the cumulative 24 h ceiling ends the run in needs-you; a Cursor network failure is classified too; the scan env pins NO_LAZY_FETCH and no global config', async () => {
+  const h = await makeHarness();
+  try {
+    h.scenario({ claude: { '*': { plan: [{ network: true }] } } });
+    const key = h.issue('Add the greeting');
+    await h.settle();
+    h.store.update(key, (r) => { r.offline = { episodes: 1, streak: 0, totalMs: OFFLINE_RUN_CEILING_MS }; });
+    h.engine.resume(key);
+    await h.settle();
+    assert.equal(h.run(key).status, 'needs_human');
+    assert.match(h.run(key).needsHuman!.reason, /24 hours in total/);
+  } finally { await h.cleanup(); }
+  const h2 = await makeHarness();
+  try {
+    h2.cfg.roles.planning.providers = ['cursor'];
+    h2.scenario({ cursor: { '*': { plan: [{ network: true }] } } });
+    const key = h2.issue('Add the greeting');
+    await h2.settle();
+    assert.equal(h2.run(key).pauseReason, 'offline');
+  } finally { await h2.cleanup(); }
+  assert.equal(SCAN_ENV.GIT_NO_LAZY_FETCH, '1');
+  assert.equal(SCAN_ENV.GIT_CONFIG_GLOBAL, '/dev/null');
+  assert.equal(SCAN_ENV.GIT_CONFIG_NOSYSTEM, '1');
+});

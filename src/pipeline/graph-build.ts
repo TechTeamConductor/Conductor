@@ -63,6 +63,8 @@ export interface GraphHost {
    */
   callAnalysis(key: string, prompt: string, role: Role, label: string): Promise<{ kind: 'ok'; json: unknown } | { kind: 'stop'; hold?: Hold }>;
   applyHold(key: string, hold: Hold | undefined): Promise<void>;
+  looksOffline(res: AgentResult): Promise<boolean>;
+  refundRun(key: string): Run;
   /** Fenced project-context blocks for a prompt (builder: facts only; read-only: facts + history). */
   projectBlocks(key: string, consumer: 'builder' | 'readonly', files?: string[]): Promise<{ projectFacts: string; projectHistory: string; projectNotes: string }>;
   /** One slot of the engine's single cap on concurrent analysis calls (null = the run was stopped while waiting). */
@@ -431,6 +433,10 @@ export class GraphBuilder {
         if (res.errorKind === 'limit') return h.pauseForLimit(key, res.limit ?? { provider: out.provider, resetsAt: null, message: res.error ?? 'limit' });
         if (res.errorKind === 'network') return h.applyHold(key, { type: 'offline', message: res.error ?? 'network unreachable' });
         if (res.errorKind === 'spawn') return h.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
+        if (await h.looksOffline(res)) {
+          h.refundRun(key);
+          return h.applyHold(key, { type: 'offline', message: res.error ?? 'network unreachable' });
+        }
         const tries = h.run(key).buildFails ?? 0;
         h.patch(key, (r) => {
           r.buildFails = tries + 1;
