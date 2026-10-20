@@ -88,7 +88,16 @@ export class Api {
   }
 
   // ───────────────────────── reads ─────────────────────────
-  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota'] } {
+  /** Cards that have no run yet (Backlog / To do …) — part of the live feed so a card never shows twice while it is being claimed. */
+  private cards(ignored: { key: string; reason: string }[] | undefined): ApiState['cards'] {
+    const why = new Map((ignored ?? []).map((i) => [i.key, i.reason]));
+    return this.d.board
+      .items({ parentId: null })
+      .filter((i) => !this.d.store.has(i.key) && i.kind !== 'bug' && i.kind !== 'subtask' && ['backlog', 'todo', 'active', 'needs_you', 'review'].includes(i.lane))
+      .map((i) => ({ key: i.key, title: i.title, lane: i.lane, kind: i.kind, createdAt: i.createdAt, updatedAt: i.updatedAt, note: why.get(i.key) }));
+  }
+
+  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota']; cards: ApiState['cards'] } {
     const cfg = this.d.getConfig();
     const now = Date.now();
     const st = this.d.engine.status();
@@ -117,6 +126,7 @@ export class Api {
         storageProblem: st.storageProblem,
       },
       quota: st.quota,
+      cards: this.cards(st.ignored),
     };
   }
 
@@ -149,6 +159,7 @@ export class Api {
       settings: toSettings(cfg),
       repos: cfg.repos.map((r) => this.repoView(r, persist)),
       runs: live.runs,
+      cards: live.cards,
     };
   }
 
@@ -168,7 +179,8 @@ export class Api {
     if (!KEY_RE.test(key)) throw new ApiFail(404, 'not_found', 'Unknown run.');
     const run = this.d.store.get(key);
     if (!run) throw new ApiFail(404, 'not_found', 'Unknown run.');
-    return toDetail(this.d.store, run, this.d.getConfig(), Date.now());
+    const notes = this.d.board.comments(run.itemId).map((c) => ({ id: c.id, author: c.author, body: c.body, ts: c.ts }));
+    return { ...toDetail(this.d.store, run, this.d.getConfig(), Date.now()), notes };
   }
 
   /** Everything the board view needs: projects + top-level items (children are fetched with the item). */

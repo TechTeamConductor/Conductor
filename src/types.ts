@@ -361,12 +361,32 @@ export interface ApiRunSummary {
   canRetry: boolean;
   canAbort: boolean;
   canCleanup: boolean;
+  canPark: boolean; // move the card to Backlog
+  canFinish: boolean; // mark it done
 }
 export interface ApiSession extends SessionRec {
   resumeCommand: string; // e.g. `cd '/path' && claude --resume <id>`
 }
 export interface ApiBug extends BugRec {}
+/** A card on the board that has NO run (Backlog / To do): shown as a plain card with Start / Park / Cancel. */
+export interface ApiCard {
+  key: string;
+  title: string;
+  lane: string;
+  kind: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Why Conductor is not running it (e.g. waiting for a dependency), when known. */
+  note?: string;
+}
+export interface ApiNote {
+  id: string;
+  author: 'user' | 'conductor';
+  body: string;
+  ts: number;
+}
 export interface ApiRunDetail extends ApiRunSummary {
+  notes: ApiNote[];
   description: string;
   worktree: string;
   baseSha: string;
@@ -435,6 +455,7 @@ export interface ApiState {
   settings: Settings;
   repos: ApiRepo[];
   runs: ApiRunSummary[];
+  cards: ApiCard[];
 }
 export interface ApiError {
   error: { code: string; message: string };

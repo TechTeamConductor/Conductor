@@ -105,6 +105,8 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
     canRetry: ['needs_human', 'failed', 'ready', 'aborted', 'finished', 'parked'].includes(st),
     canAbort: ['queued', 'running', 'awaiting_approval', 'needs_human', 'paused', 'parked', 'failed'].includes(st),
     canCleanup: ['ready', 'finished', 'aborted'].includes(st) && !!run.worktree,
+    canPark: !['finished', 'aborted', 'parked'].includes(st),
+    canFinish: !['finished', 'aborted'].includes(st),
   };
 }
 
@@ -128,6 +130,7 @@ export function toDetail(store: RunStore, run: Run, cfg: Config, now: number): A
   const sessions: ApiSession[] = run.sessions.map((s) => ({ ...s, resumeCommand: resumeCommand(run, s) }));
   return {
     ...base,
+    notes: [], // filled in by the API (the board owns comments)
     description: run.description,
     worktree: run.worktree,
     baseSha: run.baseSha,

@@ -13,6 +13,8 @@ const SSE_DEAD_MS = 50000;
 const LOG_PAGE = 2000;
 
 const COLUMNS = [
+  { id: 'backlog', label: 'Backlog', icon: 'archive', hint: 'Parked: nothing runs until you start it', cards: true },
+  { id: 'todo', label: 'To do', icon: 'clipboard', hint: 'Starts by itself', cards: true },
   { id: 'queued', label: 'Queued', icon: 'clock', hint: 'Waiting for a free slot' },
   { id: 'planning', label: 'Planning', icon: 'pen', hint: 'Claude writes the plan' },
   { id: 'plan_ready', label: 'Plan ready', icon: 'clipboard', hint: 'Waiting for your approval', ask: true },
@@ -22,7 +24,7 @@ const COLUMNS = [
   { id: 'paused', label: 'Paused', icon: 'pause', hint: 'On hold, resumes by itself' },
   { id: 'ready', label: 'Ready for review', icon: 'check', hint: 'Verified. You review and merge' },
 ];
-const MOBILE_ORDER = ['needs_human', 'plan_ready', 'paused', 'ready', 'building', 'verifying', 'planning', 'queued'];
+const MOBILE_ORDER = ['needs_human', 'plan_ready', 'paused', 'ready', 'building', 'verifying', 'planning', 'queued', 'todo', 'backlog'];
 const COL_BY_ID = Object.fromEntries(COLUMNS.map((c) => [c.id, c]));
 const WORKING_COLUMNS = ['planning', 'building', 'verifying'];
 const WAITING_COLUMNS = ['plan_ready', 'needs_human', 'ready'];
@@ -32,7 +34,7 @@ const STATUS_LABEL = {
   parked: 'Parked', ready: 'Ready for review', aborted: 'Aborted', failed: 'Failed', finished: 'Finished',
 };
 const COLUMN_ICON = {
-  queued: 'clock', planning: 'pen', plan_ready: 'clipboard', building: 'code', verifying: 'shield',
+  backlog: 'archive', todo: 'clipboard', queued: 'clock', planning: 'pen', plan_ready: 'clipboard', building: 'code', verifying: 'shield',
   needs_human: 'alert', paused: 'pause', ready: 'check', closed: 'archive',
 };
 const AGENT_LABEL = { claude: 'Claude', cursor: 'Cursor', conductor: 'Conductor' };
@@ -45,7 +47,7 @@ const TABS = [
 const OPEN_LABEL = {
   cursor: 'Opened the worktree in Cursor', 'terminal-claude': 'Opened Claude in Terminal',
   'terminal-cursor': 'Opened Cursor in Terminal', 'claude-desktop': 'Opened in the Claude app',
-  finder: 'Shown in Finder', linear: 'Opened in Linear',
+  finder: 'Shown in Finder',
 };
 
 /* ───────────────────────── app state ───────────────────────── */
@@ -309,12 +311,12 @@ function normalizeState(d) {
   d.health = d.health || {};
   d.health.claude = d.health.claude || { found: false, ok: false };
   d.health.cursor = d.health.cursor || { found: false, ok: false };
-  d.health.linear = d.health.linear || { ok: false };
+  d.cards = Array.isArray(d.cards) ? d.cards : [];
   d.health.warnings = Array.isArray(d.health.warnings) ? d.health.warnings : [];
   d.quota = d.quota || {};
-  d.engine = Object.assign({ paused: false, providerPause: {}, running: 0, maxParallel: 0, lastPollAt: null, lastPollError: null, pollSeconds: 30 }, d.engine || {});
+  d.engine = Object.assign({ paused: false, providerPause: {}, running: 0, maxParallel: 0, lastPollAt: null, lastPollError: null, storageProblem: null, pollSeconds: 5 }, d.engine || {});
   d.engine.providerPause = d.engine.providerPause || {};
-  d.settings = Object.assign({ planApproval: 'auto', planReview: 'auto', maxLoops: 3, maxParallel: 2, onClaudeLimit: 'wait', noGates: 'warn', pickupFromBacklog: false, linearMode: 'labels' }, d.settings || {});
+  d.settings = Object.assign({ planApproval: 'auto', planReview: 'auto', maxLoops: 3, maxParallel: 2, onClaudeLimit: 'wait', noGates: 'warn' }, d.settings || {});
   d.settings.stages = Object.assign({ plan: 'claude', review: 'claude', verify: 'claude' }, d.settings.stages || {});
   return d;
 }
@@ -437,6 +439,7 @@ async function resyncAfterDrop() {
 function onStateEvent(d) {
   if (!S.state) return;
   if (Array.isArray(d.runs)) S.state.runs = d.runs;
+  if (Array.isArray(d.cards)) S.state.cards = d.cards;
   if (d.engine) { S.state.engine = Object.assign({}, S.state.engine, d.engine); S.state.engine.providerPause = S.state.engine.providerPause || {}; }
   if (d.quota) S.state.quota = d.quota;
   if (d.now) S.offset = d.now - Date.now();
@@ -486,7 +489,7 @@ function engineView(eng) {
     return { cls: 'st-planning', icon: 'clock', label: 'Waiting for ' + names, title: waiting.map((a) => pp[a].reason).filter(Boolean).join('\n') || 'Usage limit reached' };
   }
   const busy = eng.maxParallel ? ` · ${eng.running || 0}/${eng.maxParallel} busy` : '';
-  const polled = eng.lastPollAt ? 'Last Linear poll ' + fmtAgo(eng.lastPollAt) : 'Waiting for the first Linear poll';
+  const polled = eng.lastPollAt ? 'Last checked the board ' + fmtAgo(eng.lastPollAt) : 'Waiting for the first check';
   return { cls: 'st-ready', icon: 'check', label: 'Running' + busy, pulse: (eng.running || 0) > 0, title: polled };
 }
 function updateHeader(wizard) {
@@ -577,8 +580,8 @@ function computeBanners(wizard) {
       : `Stages that need ${AGENT_LABEL[a]} wait. Nothing is lost, runs resume by themselves.`);
     out.push({ id: 'pp-' + a, cls: 'b-limit', icon: 'clock', title: `${AGENT_LABEL[a]} usage limit`, text: ' — resuming automatically at ' + fmtWhen(p.until), until: p.until, lines });
   }
-  if (eng.lastPollError) {
-    out.push({ id: 'poll', cls: 'b-error', icon: 'warn', title: 'Linear polling is failing', text: ' ' + eng.lastPollError, lines: ['Conductor keeps retrying. Running stages are not affected.'] });
+  if (eng.storageProblem || eng.lastPollError) {
+    out.push({ id: 'storage', cls: 'b-error', icon: 'warn', title: 'The board cannot be saved right now', text: ' ' + (eng.storageProblem || eng.lastPollError), lines: ['Check free disk space and permissions on the data folder. Conductor keeps retrying; running stages are not affected.'] });
   }
   const hl = st.health || {};
   const agents = [['claude', 'Claude Code'], ['cursor', 'Cursor agent']];
@@ -587,9 +590,6 @@ function computeBanners(wizard) {
     if (a && !a.ok) {
       out.push({ id: 'h-' + id, cls: 'b-error', icon: 'warn', title: `${name} needs attention`, text: ' ' + (a.detail || (a.found === false ? 'Not found on your PATH.' : a.loggedIn === false ? 'Not signed in.' : 'The last health check failed.')), action: { label: 'Open setup', href: '#/setup' } });
     }
-  }
-  if (hl.linear && !hl.linear.ok) {
-    out.push({ id: 'h-linear', cls: 'b-error', icon: 'warn', title: 'Linear needs attention', text: ' ' + (hl.linear.detail || 'The Linear key was rejected or is missing.'), action: { label: 'Open setup', href: '#/setup' } });
   }
   if (Array.isArray(hl.warnings) && hl.warnings.length) {
     const key = 'warn:' + hl.warnings.join('\n');
@@ -635,7 +635,9 @@ function tick() { for (const el of document.querySelectorAll('[data-t0],[data-t1
 
 /* ───────────────────────── run actions (cards + drawer) ───────────────────────── */
 const runUrl = (key, what) => `/api/runs/${enc(key)}/${what}`;
-const actApprove = (key) => runAction(key, 'approve', () => api('POST', runUrl(key, 'approve')), `Plan for ${key} approved. Cursor starts building.`);
+const runRev = (key) => { const r = S.state && S.state.runs.find((x) => x.key === key); return r ? r.rev : 0; };
+const actApprove = (key) => runAction(key, 'approve', () => api('POST', runUrl(key, 'approve'), { rev: runRev(key) }), `Plan for ${key} approved. Cursor starts building.`);
+const actMove = (key, lane, msg) => runAction(key, 'move:' + lane, () => api('POST', `/api/items/${enc(key)}/move`, { lane }), msg);
 const actRetry = (key) => runAction(key, 'retry', () => api('POST', runUrl(key, 'retry')), `${key}: retry started.`);
 const actResume = (key) => runAction(key, 'resume', () => api('POST', runUrl(key, 'resume')), `${key} resumed.`);
 const actOpen = (key, target) => runAction(key, 'open:' + target, () => api('POST', runUrl(key, 'open'), { target }), OPEN_LABEL[target] || 'Opened');
@@ -680,20 +682,20 @@ function buildBoardView() {
       h('p', { class: 'col-sub' }, c.hint), list, empty);
     B.cols.set(c.id, { el, list, count, empty, title });
   }
-  B.pollEl = h('span', { class: 'num' }, '30');
+  B.pollEl = h('span', { class: 'num' }, '5');
   B.empty = h('section', { class: 'empty', 'aria-labelledby': 'empty-h' },
     h('h2', { id: 'empty-h', class: 'empty-title' }, 'Nothing in flight'),
-    h('p', null, 'Conductor is watching Linear. Tasks you create with the trigger label start here.'),
+    h('p', null, 'Create a task and Conductor plans it, builds it and verifies it. Your cards live right here on the board.'),
     h('ol', { class: 'flow', 'aria-label': 'How a task moves' },
-      h('li', null, h('b', null, 'Plan'), h('span', null, 'Claude reads the issue and writes a plan')),
+      h('li', null, h('b', null, 'Plan'), h('span', null, 'Claude reads the card and writes a plan')),
       h('li', null, h('b', null, 'Approve'), h('span', null, 'You confirm the first plan per repo')),
       h('li', null, h('b', null, 'Build'), h('span', null, 'Cursor writes the code in a worktree')),
       h('li', null, h('b', null, 'Verify'), h('span', null, 'Gates and Claude check every criterion')),
       h('li', null, h('b', null, 'Review'), h('span', null, 'You merge. Conductor never pushes'))),
     h('ol', { class: 'how' },
-      h('li', null, 'In Linear, create an issue in ', h('b', null, 'Todo'), ' and add the label ', h('code', null, 'conductor'), '.'),
-      h('li', null, 'Or press ', h('b', null, 'New task'), ' here, which does the same thing.'),
-      h('li', null, 'Conductor checks Linear about every ', B.pollEl, ' seconds.')),
+      h('li', null, 'Press ', h('b', null, 'New task'), ' and describe what you want.'),
+      h('li', null, 'Conductor picks it up straight away: the card moves through the stages by itself.'),
+      h('li', null, 'You only step in when a card says ', h('b', null, 'Needs you'), ' or a plan needs approval.')),
     h('div', { class: 'row' },
       h('button', { type: 'button', class: 'btn btn-primary', data: { act: 'new-task' } }, icon('plus'), h('span', null, 'New task')),
       h('button', { type: 'button', class: 'btn', data: { act: 'open-setup' } }, icon('sliders'), h('span', null, 'Repositories and setup'))));
@@ -715,12 +717,14 @@ function updateBoard() {
   const st = S.state;
   const open = st.runs.filter((r) => r.column !== 'closed');
   const closed = st.runs.filter((r) => r.column === 'closed');
+  const cardsBy = { backlog: st.cards.filter((c) => c.lane === 'backlog'), todo: st.cards.filter((c) => c.lane === 'todo') };
+  const idle = cardsBy.backlog.length + cardsBy.todo.length;
   const byCol = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
-  toggleHidden(B.empty, open.length > 0);
-  toggleHidden(B.board, open.length === 0);
-  setText(B.pollEl, st.engine.pollSeconds || 30);
+  toggleHidden(B.empty, open.length > 0 || idle > 0);
+  toggleHidden(B.board, open.length === 0 && idle === 0);
+  setText(B.pollEl, st.engine.pollSeconds || 5);
 
   const order = S.isMobile ? MOBILE_ORDER : COLUMNS.map((c) => c.id);
   const osig = order.join();
@@ -729,6 +733,14 @@ function updateBoard() {
   const seen = new Set();
   for (const c of COLUMNS) {
     const col = B.cols.get(c.id);
+    if (c.cards) { // run-less cards (Backlog / To do): plain cards with their own actions
+      const cl = cardsBy[c.id];
+      reconcile(col.list, cl.map(idleCard));
+      setText(col.count, cl.length);
+      col.el.classList.toggle('is-empty', !cl.length);
+      toggleHidden(col.empty, cl.length > 0);
+      continue;
+    }
     const list = byCol.get(c.id);
     const els = list.map((r) => {
       seen.add(r.key);
@@ -748,6 +760,15 @@ function updateBoard() {
   for (const [k, el] of B.cards) if (!seen.has(k)) { el.remove(); B.cards.delete(k); }
   updateSummary(byCol);
   updateHistory(closed);
+}
+
+function idleCard(c) {
+  const move = (lane, msg) => () => runAction(c.key, 'move:' + lane, () => api('POST', `/api/items/${enc(c.key)}/move`, { lane }), msg);
+  const btns = c.lane === 'backlog'
+    ? [h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: move('todo', `${c.key} will start now.`) }, 'Start')]
+    : [h('button', { type: 'button', class: 'btn btn-sm', onclick: move('backlog', `${c.key} moved to Backlog.`) }, 'Park')];
+  btns.push(h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: move('canceled', `${c.key} canceled.`) }, 'Cancel'));
+  return h('li', { class: 'card idle-card' }, h('div', { class: 'card-top' }, h('span', { class: 'card-key' }, c.key)), h('p', { class: 'card-title' }, c.title), c.note ? h('p', { class: 'muted' }, c.note) : null, h('div', { class: 'card-actions' }, btns));
 }
 
 function updateSummary(byCol) {
@@ -770,8 +791,8 @@ function updateSummary(byCol) {
   }
   const lp = S.state.engine.lastPollAt;
   B.polled.replaceChildren();
-  if (lp) B.polled.append('Linear checked ', h('span', { class: 'num', data: { ago: lp } }, ''));
-  else B.polled.append('Waiting for the first Linear check');
+  if (lp) B.polled.append('Board checked ', h('span', { class: 'num', data: { ago: lp } }, ''));
+  else B.polled.append('Waiting for the first check');
 }
 
 function histRow(r) {
@@ -1047,7 +1068,7 @@ function detailErrorNode(e) {
   const gone = e instanceof ApiFail && e.status === 404;
   return h('div', { class: 'callout c-bad', role: 'alert' }, icon('warn'), h('div', { class: 'callout-body' },
     h('b', null, gone ? 'This run no longer exists' : "Couldn't load this run"),
-    h('div', { class: 'pre' }, gone ? 'It may have been removed from Linear or cleaned up. Close this panel to go back to the board.' : e.message),
+    h('div', { class: 'pre' }, gone ? 'It may have been removed or cleaned up. Close this panel to go back to the board.' : e.message),
     gone ? null : h('div', { class: 'row' }, btn('Try again', { icon: 'refresh', cls: 'btn-sm', onclick: () => fetchDetail() }))));
 }
 function fillPanel(id, node) {
@@ -1093,12 +1114,12 @@ function nextAction(r) {
     case 'needs_human': return r.needsHuman ? `Sort out the blocker below, then press ${retryLabel(r)}.` : 'Check the run, then press Retry.';
     case 'ready': return `Review branch ${r.branch || ''} and merge it yourself${r.unverified ? '. Look closely: this run is unverified' : ''}. Conductor never pushes or merges.`;
     case 'paused': return r.pausedUntil ? `On hold by a usage limit. It resumes automatically at ${fmtWhen(r.pausedUntil)}, or press Resume now to try immediately.` : 'On hold by a usage limit. It resumes automatically.';
-    case 'parked': return 'Parked because the Linear issue moved to Backlog or Triage. Move it back to Todo, or press Resume now.';
+    case 'parked': return 'Parked in Backlog: nothing runs. Press Move to To do to restart it (it re-plans and keeps the work so far).';
     case 'queued': return 'Waiting for a free worker slot. Nothing for you to do.';
     case 'running': return r.agent ? `${AGENT_LABEL[r.agent]} is working. Nothing for you to do.` : 'Working. Nothing for you to do.';
     case 'failed': return 'Infrastructure failure. Conductor retries automatically, or press Retry to try now.';
     case 'aborted': return r.canCleanup ? 'This run was stopped. The worktree is kept until you remove it.' : 'This run was stopped.';
-    case 'finished': return r.canCleanup ? 'Completed in Linear. You can remove the worktree.' : 'Completed in Linear.';
+    case 'finished': return r.canCleanup ? 'Marked done. You can remove the worktree.' : 'Marked done.';
     default: return '';
   }
 }
@@ -1115,8 +1136,10 @@ function renderOverview(d) {
   const bar = h('div', { class: 'actions' });
   if (d.canApprove) bar.appendChild(actBtn(d, 'approve', 'Approve plan', 'tick', 'btn-primary', () => actApprove(d.key)));
   if (d.canRetry) bar.appendChild(actBtn(d, 'retry', retryLabel(d), 'refresh', d.status === 'needs_human' ? 'btn-primary' : '', () => actRetry(d.key)));
-  if (d.status === 'paused' || d.status === 'parked') bar.appendChild(actBtn(d, 'resume', 'Resume now', 'play', 'btn-primary', () => actResume(d.key)));
-  bar.appendChild(actBtn(d, 'open:linear', 'Open in Linear', 'external', '', () => actOpen(d.key, 'linear')));
+  if (d.status === 'paused') bar.appendChild(actBtn(d, 'resume', 'Resume now', 'play', 'btn-primary', () => actResume(d.key)));
+  if (d.status === 'parked') bar.appendChild(actBtn(d, 'move:todo', 'Move to To do (restart)', 'play', 'btn-primary', () => actMove(d.key, 'todo', `${d.key} restarted.`)));
+  if (d.canPark) bar.appendChild(actBtn(d, 'move:backlog', 'Park in Backlog', 'archive', '', () => actMove(d.key, 'backlog', `${d.key} parked in Backlog.`)));
+  if (d.canFinish) bar.appendChild(actBtn(d, 'move:done', 'Mark done', 'tick', '', () => actMove(d.key, 'done', `${d.key} marked done.`)));
   if (d.canCleanup) bar.appendChild(actBtn(d, 'cleanup', 'Remove worktree', 'folder', '', () => actCleanup(d.key)));
   if (d.canAbort) bar.appendChild(actBtn(d, 'abort', 'Abort run', 'x-circle', 'btn-danger', () => actAbort(d.key)));
   root.appendChild(bar);
@@ -1160,9 +1183,43 @@ function renderOverview(d) {
   if (d.diffStat) root.appendChild(h('div', { class: 'sec' }, h('h3', null, 'Changes'), h('pre', { class: 'diffstat mono' }, d.diffStat)));
   if (d.description) {
     root.appendChild(h('details', { class: 'sec details-sec', open: true },
-      h('summary', null, icon('chevron', 'chev'), 'Issue description'), h('div', { class: 'desc' }, d.description)));
+      h('summary', null, icon('chevron', 'chev'), 'Task description'), h('div', { class: 'desc' }, d.description)));
   }
+  root.appendChild(notesSection(d));
   return root;
+}
+
+/* ───────────────────────── notes: the card's conversation (your notes are included in the next attempt) ───────────────────────── */
+function notesSection(d) {
+  const notes = Array.isArray(d.notes) ? d.notes : [];
+  const sec = h('div', { class: 'sec notes-sec' }, h('h3', null, 'Notes'));
+  if (notes.length) {
+    sec.appendChild(h('ul', { class: 'notes' }, notes.map((n) => {
+      const who = n.author === 'user' ? 'You' : 'Conductor';
+      const long = n.body.length > 500;
+      const body = long
+        ? h('details', null, h('summary', null, n.body.slice(0, 160).replace(/\s+/g, ' ') + '…'), h('div', { class: 'pre' }, n.body))
+        : h('div', { class: 'pre' }, n.body);
+      return h('li', { class: 'note note-' + n.author }, h('div', { class: 'note-meta' }, h('b', null, who), ' · ', h('span', { title: fmtFull(n.ts) }, fmtAgo(n.ts))), body);
+    })));
+  } else sec.appendChild(h('p', { class: 'muted' }, 'Nothing yet. Notes you add here are read by the planner the next time this card runs.'));
+  const idN = uid('note');
+  const ta = h('textarea', { class: 'textarea', id: idN, rows: '3', maxlength: '20000', placeholder: 'Answer a question, add context or a constraint…' });
+  const add = h('button', { type: 'button', class: 'btn', onclick: async () => {
+    const text = ta.value.trim();
+    if (!text) { ta.focus(); return; }
+    setBusy(add, true);
+    try {
+      await api('POST', `/api/items/${enc(d.key)}/comment`, { body: text });
+      ta.value = '';
+      toast('good', 'Note added. It is included the next time this card runs.');
+      await fetchDetail();
+    } catch (e) { toast('error', e.message); }
+    setBusy(add, false);
+  } }, 'Add note');
+  sec.appendChild(h('div', { class: 'field' }, h('label', { class: 'label', for: idN }, 'Add a note'), ta));
+  sec.appendChild(h('div', { class: 'row' }, add));
+  return sec;
 }
 
 /* ───────────────────────── sessions & timeline ───────────────────────── */
@@ -1190,8 +1247,7 @@ function renderSessions(d) {
       ob('Cursor', 'terminal', 'terminal-cursor', has('cursor'), 'No Cursor session yet')),
     h('span', { class: 'sep', 'aria-hidden': 'true' }),
     h('div', { class: 'grp' },
-      ob('Show in Finder', 'folder', 'finder', !!d.worktree, 'No worktree yet'),
-      ob('Open in Linear', 'external', 'linear', true))));
+      ob('Show in Finder', 'folder', 'finder', !!d.worktree, 'No worktree yet'))));
 
   if (!d.sessions.length) {
     root.appendChild(h('div', { class: 'empty-note' }, h('b', null, 'No agent sessions yet'), 'Sessions appear here as soon as Claude or Cursor starts working. Each one has a command you can paste to continue it yourself.'));
@@ -1544,7 +1600,7 @@ function renderPlan(d) {
       actBtn(d, 'approve', 'Approve plan', 'tick', 'btn-primary', () => actApprove(d.key))));
   }
   if (!p && !md) {
-    root.appendChild(h('div', { class: 'empty-note' }, h('b', null, 'No plan yet'), 'Claude writes the plan as soon as the run starts planning. It appears here, and Conductor also posts it as a Linear comment.'));
+    root.appendChild(h('div', { class: 'empty-note' }, h('b', null, 'No plan yet'), 'Claude writes the plan as soon as the run starts planning. It appears here, and Conductor also adds it to the card as a note.'));
     return root;
   }
   if (p) {
@@ -1558,7 +1614,7 @@ function renderPlan(d) {
     if (p.blocked && p.blocked.is) {
       root.appendChild(h('div', { class: 'callout c-bad' }, icon('alert'), h('div', { class: 'callout-body' },
         h('b', null, 'Claude is blocked and has questions'), bulletList(p.blocked.questions || []),
-        h('p', { class: 'muted' }, 'Answer in the Linear issue, then press Retry.'))));
+        h('p', { class: 'muted' }, 'Add your answer as a note on this card, then press Retry.'))));
     }
   }
   if (rv) {
@@ -1718,12 +1774,12 @@ function bugTracker(d) {
   const open = d.bugs.filter((b) => b.status === 'open').length;
   return h('section', { class: 'sec' }, h('h3', null, `All tracked bugs (${open} open of ${d.bugs.length})`),
     h('div', { class: 'table-wrap' }, h('table', { class: 'table gate-table' },
-      h('thead', null, h('tr', null, h('th', null, 'Severity'), h('th', null, 'Bug'), h('th', null, 'Status'), h('th', null, 'Linear'), h('th', null, 'Seen in'))),
+      h('thead', null, h('tr', null, h('th', null, 'Severity'), h('th', null, 'Bug'), h('th', null, 'Status'), h('th', null, 'Card'), h('th', null, 'Seen in'))),
       h('tbody', null, d.bugs.map((b) => h('tr', null,
         h('td', { data: { label: 'Severity' } }, sevBadge(b.severity)),
         h('td', { data: { label: 'Bug' } }, b.title, b.file ? h('code', { class: 'gate-cmd' }, b.file) : null),
         h('td', { data: { label: 'Status' } }, b.status === 'open' ? badge('bad', 'Open', 'alert') : badge('good', 'Closed', 'tick')),
-        h('td', { data: { label: 'Linear' } }, b.linearKey ? h('code', null, b.linearKey) : h('span', { class: 'muted' }, 'not filed')),
+        h('td', { data: { label: 'Card' } }, b.itemKey ? h('code', null, b.itemKey) : h('span', { class: 'muted' }, 'not filed')),
         h('td', { data: { label: 'Seen in' } }, (b.loops || []).map((n) => 'loop ' + n).join(', ') || '')))))));
 }
 
@@ -1784,7 +1840,7 @@ function openNewTask() {
     try {
       const r = await api('POST', '/api/tasks', body);
       $('#dlg').close();
-      toast('good', `Created ${r.key} in Linear (Todo). Conductor picks it up within about ${S.state.engine.pollSeconds || 30} seconds.`, { href: r.url, hrefLabel: 'Open in Linear' });
+      toast('good', `Created ${r.key} in To do. Conductor starts on it right away.`);
       loadState().catch(() => {});
     } catch (ex) {
       showErr(ex.message);
@@ -1792,7 +1848,7 @@ function openNewTask() {
     }
   };
   const dlg = dlgShell('New task', [
-    h('p', { class: 'muted', id: idT + '-intro' }, 'Creates a Linear issue in Todo with the trigger label. Conductor plans it, builds it and verifies it without further input.'),
+    h('p', { class: 'muted', id: idT + '-intro' }, 'Creates a card in To do. Conductor plans it, builds it and verifies it without further input.'),
     field(idT, 'Title', title),
     field(idD, 'Description', desc, 'Optional, but the plan is only as good as the brief.'),
     repos.length
@@ -1818,8 +1874,6 @@ function openSettings() {
     maxParallel: num(1, 8, s.maxParallel),
     onClaudeLimit: sel([['wait', 'Wait until the limit resets'], ['cursor', 'Use Cursor for read-only stages']], s.onClaudeLimit),
     noGates: sel([['warn', 'Continue, marked Unverified'], ['block', 'Block the run']], s.noGates),
-    linearMode: sel([['labels', 'Labels (no workflow changes)'], ['states', 'Statuses (adds workflow statuses)']], s.linearMode),
-    backlog: h('input', { type: 'checkbox', checked: !!s.pickupFromBacklog }),
   };
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
   const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save changes');
@@ -1831,8 +1885,8 @@ function openSettings() {
     const next = {
       planApproval: c.planApproval.value, planReview: c.planReview.value,
       maxLoops: Number(c.maxLoops.value), maxParallel: Number(c.maxParallel.value),
-      onClaudeLimit: c.onClaudeLimit.value, noGates: c.noGates.value, pickupFromBacklog: c.backlog.checked,
-      stages: { plan: c.stPlan.value, review: c.stReview.value, verify: c.stVerify.value }, linearMode: c.linearMode.value,
+      onClaudeLimit: c.onClaudeLimit.value, noGates: c.noGates.value,
+      stages: { plan: c.stPlan.value, review: c.stReview.value, verify: c.stVerify.value },
     };
     const patch = {};
     for (const k of Object.keys(next)) {
@@ -1866,10 +1920,7 @@ function openSettings() {
     group('Limits',
       h('div', { class: 'row-2' }, fld('Fix loops', c.maxLoops, 'Build and verify rounds before Conductor asks you.'), fld('Parallel runs', c.maxParallel, 'Runs working at the same time.')),
       fld('When Claude hits its usage limit', c.onClaudeLimit),
-      fld('When a repo has no tests or lint', c.noGates, 'Unverified runs are flagged on the board and in Linear.')),
-    group('Linear',
-      h('div', { class: 'field' }, h('label', { class: 'check' }, c.backlog, h('span', null, 'Also pick up issues from Backlog', h('span', { class: 'hint' }, 'Off by default. Conductor only starts issues in Todo, so a labelled Backlog issue does nothing.')))),
-      fld('How stages show in Linear', c.linearMode, 'Statuses creates workflow statuses on your Linear team. Preview it in setup first.')),
+      fld('When a repo has no tests or lint', c.noGates, 'Unverified runs are flagged on the board.')),
     err,
   ], [signOut, h('button', { type: 'button', class: 'btn', onclick: () => { $('#dlg').close(); navigate('#/setup'); } }, icon('folder'), h('span', null, 'Repositories and setup')),
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
@@ -1877,19 +1928,14 @@ function openSettings() {
 }
 
 /* ───────────────────────── setup wizard ───────────────────────── */
-const WIZ_STEPS = [['agents', 'Agents'], ['linear', 'Linear key'], ['team', 'Team'], ['repo', 'Repo']];
+const WIZ_STEPS = [['agents', 'Agents'], ['repo', 'Repository']];
 const STEP_HINT = {
   agents: 'Check that Claude Code and the Cursor CLI are ready',
-  linear: 'Paste a Linear personal API key',
-  team: 'Choose the team Conductor watches',
   repo: 'Pick the project folder agents will work in',
 };
 const W = {
   sig: '', inited: false, open: null,
   probe: { claude: null, cursor: null }, probing: { claude: false, cursor: false },
-  linear: null, showKeyForm: false, linearErr: '', linearBusy: false,
-  teamId: '', mode: 'labels', preview: null, previewBusy: false, previewErr: '', createBusy: false, createErr: '', createResult: null,
-  backlogBusy: false, backlogErr: '',
   repoPath: '', repoName: '', repoErr: '', repoBusy: false, lastRepo: null, removeErr: '',
 };
 const stepOk = (id) => { const s = S.state.setup.steps.find((x) => x.id === id); return !!(s && s.ok); };
@@ -1902,7 +1948,7 @@ const df = (id) => ({ focus: id });
 function renderWizard(force) {
   if (S.view !== 'wizard' || !S.state) return;
   const st = S.state;
-  const sig = JSON.stringify([st.setup, st.health, st.repos, S.route.view, st.settings && st.settings.pickupFromBacklog]);
+  const sig = JSON.stringify([st.setup, st.health, st.repos, S.route.view]);
   if (!force && sig === W.sig) return;
   W.sig = sig;
   if (!W.inited) { W.inited = true; W.open = firstOpenStep(); }
@@ -1917,15 +1963,15 @@ function renderWizard(force) {
       h('h1', { id: 'wiz-h' }, complete ? 'Setup and repositories' : 'Set up Conductor'),
       h('p', null, complete
         ? 'Everything is connected. Add another repository or re-check a step.'
-        : 'Four short steps. Conductor never pushes or merges code, and your Linear key is kept in the macOS Keychain, never in this browser.'),
+        : 'Two short steps. Conductor never pushes or merges code, and everything stays on this computer.'),
       h('div', { class: 'wiz-progress' },
-        h('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '4', 'aria-valuenow': String(done), 'aria-label': 'Setup progress' },
-          (() => { const f = h('span'); f.style.setProperty('--pct', (done / 4) * 100 + '%'); return f; })()),
-        h('span', null, `${done} of 4 done`))),
+        h('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(WIZ_STEPS.length), 'aria-valuenow': String(done), 'aria-label': 'Setup progress' },
+          (() => { const f = h('span'); f.style.setProperty('--pct', (done / WIZ_STEPS.length) * 100 + '%'); return f; })()),
+        h('span', null, `${done} of ${WIZ_STEPS.length} done`))),
     h('ol', { class: 'steps' }, WIZ_STEPS.map(([id, title], idx) => wizStep(id, title, idx))),
-    done === 4 ? h('section', { class: 'wiz-done', 'aria-labelledby': 'wiz-done-h' },
+    done === WIZ_STEPS.length ? h('section', { class: 'wiz-done', 'aria-labelledby': 'wiz-done-h' },
       h('h2', { id: 'wiz-done-h' }, 'You are set up'),
-      h('p', null, 'Create an issue in Linear in Todo with the trigger label, or press New task on the board. Conductor plans it, Cursor builds it, Claude verifies it.'),
+      h('p', null, 'Press New task on the board. Conductor plans it, Cursor builds it, Claude verifies it.'),
       h('a', { class: 'btn btn-primary', href: '#/', 'data-focus': 'go-board' }, 'Go to the board')) : null);
   view.replaceChildren(root);
   if (fid) { const el = view.querySelector('[data-focus="' + CSS.escape(fid) + '"]'); if (el) el.focus({ preventScroll: true }); }
@@ -1948,8 +1994,6 @@ function wizStep(id, title, idx) {
 }
 function wizBody(id, step) {
   if (id === 'agents') return agentsBody(step);
-  if (id === 'linear') return linearBody(step);
-  if (id === 'team') return teamBody(step);
   return repoBody(step);
 }
 function nextBtn(label, id) {
@@ -1995,161 +2039,10 @@ function agentsBody() {
     h('div', { class: 'row' },
       h('button', { type: 'button', class: 'btn btn-primary', disabled: W.probing.claude || W.probing.cursor, data: df('probe:both'), onclick: probeBoth }, 'Test both agents'),
       h('button', { type: 'button', class: 'btn', data: df('recheck'), onclick: async (e) => { setBusy(e.currentTarget, true); try { await loadState(); } catch (er) { toast('error', er.message); } rerenderWizard(); } }, icon('refresh'), h('span', null, 'Re-check')),
-      stepOk('agents') ? nextBtn('Continue to Linear key', 'linear') : null));
+      stepOk('agents') ? nextBtn('Continue to repository', 'repo') : null));
 }
 
-/* step 2: linear key */
-async function submitKey(input) {
-  const key = input.value.trim();
-  if (!key) { W.linearErr = 'Paste your Linear API key first.'; rerenderWizard(); return; }
-  input.value = ''; // clear the secret from the DOM immediately; it only lives in this local variable for the request
-  const body = { key };
-  W.linearBusy = true; W.linearErr = ''; rerenderWizard();
-  try {
-    const r = await api('POST', '/api/setup/linear-key', body);
-    W.linear = { viewer: r.viewer || null, teams: Array.isArray(r.teams) ? r.teams : [] };
-    if (!W.teamId && W.linear.teams.length) W.teamId = W.linear.teams[0].id;
-    W.showKeyForm = false; W.preview = null; W.createResult = null;
-    await loadState();
-    advanceWizard();
-  } catch (e) { W.linearErr = e.message; }
-  body.key = '';
-  W.linearBusy = false; rerenderWizard();
-  if (W.linearErr) focusWiz('key-input');
-}
-function linearBody(step) {
-  const hl = S.state.health || {};
-  if (step.ok && !W.showKeyForm) {
-    return h('div', null,
-      h('p', null, 'Connected to Linear' + (hl.linear && hl.linear.viewer ? ' as ' + hl.linear.viewer : (W.linear && W.linear.viewer ? ' as ' + (W.linear.viewer.name || W.linear.viewer.email) : '')) + '. The key is stored in the macOS Keychain.'),
-      h('div', { class: 'row' },
-        h('button', { type: 'button', class: 'btn', data: df('replace-key'), onclick: () => { W.showKeyForm = true; rerenderWizard(); } }, 'Replace key'),
-        stepOk('team') ? null : nextBtn('Continue to team', 'team')));
-  }
-  const id = uid('key');
-  const input = h('input', {
-    class: 'input mono', id, type: 'password', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
-    name: 'linear-personal-key', placeholder: 'lin_api_…', 'aria-describedby': id + '-hint', 'aria-invalid': W.linearErr ? 'true' : null,
-    data: { focus: 'key-input', lpIgnore: 'true', '1pIgnore': 'true' }, disabled: W.linearBusy,
-  });
-  const form = h('form', { novalidate: true, onsubmit: (e) => { e.preventDefault(); submitKey(input); } },
-    h('div', { class: 'field' },
-      h('label', { for: id }, 'Linear personal API key'),
-      input,
-      h('p', { class: 'hint', id: id + '-hint' }, 'Create one in Linear under Settings, Account, Security and access, then Personal API keys. It is checked once, saved to the macOS Keychain, and never shown again.'),
-      inlineErr(W.linearErr)),
-    h('div', { class: 'row' },
-      h('button', { type: 'submit', class: 'btn btn-primary' + (W.linearBusy ? ' is-busy' : ''), disabled: W.linearBusy, data: df('key-submit') }, W.linearBusy ? 'Checking…' : 'Save and check key'),
-      step.ok ? h('button', { type: 'button', class: 'btn', onclick: () => { W.showKeyForm = false; rerenderWizard(); } }, 'Keep current key') : null,
-      h('a', { class: 'btn btn-ghost', href: 'https://linear.app/settings/account/security', target: '_blank', rel: 'noopener noreferrer' }, icon('external'), h('span', null, 'Open Linear settings'))));
-  return form;
-}
-
-/* step 3: team */
-async function previewTeam() {
-  W.previewBusy = true; W.previewErr = ''; W.preview = null; W.createResult = null; W.createErr = ''; rerenderWizard();
-  try { W.preview = await api('POST', '/api/setup/team', { teamId: W.teamId, mode: W.mode, dryRun: true }); }
-  catch (e) { W.previewErr = e.message; }
-  W.previewBusy = false; rerenderWizard();
-}
-async function confirmTeam() {
-  W.createBusy = true; W.createErr = ''; rerenderWizard();
-  try {
-    const r = await api('POST', '/api/setup/team', { teamId: W.teamId, mode: W.mode, dryRun: false });
-    W.createResult = r;
-    if (!(r.manual && r.manual.length)) { W.preview = null; await loadState(); advanceWizard(); }
-  } catch (e) { W.createErr = e.message; }
-  W.createBusy = false; rerenderWizard();
-}
-async function enableBacklog() {
-  W.backlogBusy = true; W.backlogErr = ''; rerenderWizard();
-  try { await api('PUT', '/api/settings', { pickupFromBacklog: true }); await loadState(); }
-  catch (e) { W.backlogErr = e.message; }
-  W.backlogBusy = false; rerenderWizard();
-}
-function teamBody(step) {
-  if (!stepOk('linear')) {
-    return h('div', null, h('p', null, 'Add your Linear key first, then pick the team here.'), nextBtn('Go to Linear key', 'linear'));
-  }
-  if (!W.linear) {
-    return h('div', null,
-      step.ok ? h('p', null, 'Team is set up. ' + (step.detail || '')) : null,
-      h('p', null, 'To list your teams again, Conductor needs a fresh answer from Linear, which means entering the key once more. It is not kept in the browser between visits.'),
-      h('button', { type: 'button', class: 'btn', data: df('reenter'), onclick: () => { W.open = 'linear'; W.showKeyForm = true; rerenderWizard(); } }, 'Enter key again'),
-      step.ok && !stepOk('repo') ? nextBtn('Continue to repo', 'repo') : null);
-  }
-  const teams = W.linear.teams;
-  const idSel = uid('team');
-  const select = h('select', { class: 'select', id: idSel, data: df('team-select'), onchange: (e) => { W.teamId = e.target.value; W.preview = null; W.createResult = null; W.previewErr = ''; rerenderWizard(); } },
-    teams.map((t) => h('option', { value: t.id }, `${t.key} · ${t.name}`)));
-  select.value = W.teamId;
-  const modeRadio = (v, title, desc) => h('label', { class: 'check' },
-    h('input', { type: 'radio', name: 'team-mode', value: v, checked: W.mode === v, data: df('mode:' + v), onchange: () => { W.mode = v; W.preview = null; W.createResult = null; rerenderWizard(); } }),
-    h('span', null, title, h('span', { class: 'hint' }, desc)));
-  const pv = W.preview;
-  const out = h('div', null,
-    h('p', null, 'Choose the Linear team Conductor watches for new tasks, and how it shows progress. Nothing changes in Linear until you confirm the preview.'),
-    h('div', { class: 'field' }, h('label', { for: idSel }, 'Team'), select),
-    h('fieldset', null, h('legend', { class: 'legend' }, 'Show progress in Linear using'),
-      modeRadio('labels', 'Labels (recommended)', 'Adds a few labels such as conductor and conductor:building. Your workflow stays exactly as it is.'),
-      modeRadio('states', 'Workflow statuses', 'Also adds statuses like Planning and Building to this team. Visible to everyone on the team.')),
-    h('div', { class: 'row' },
-      h('button', { type: 'button', class: 'btn' + (pv ? '' : ' btn-primary') + (W.previewBusy ? ' is-busy' : ''), disabled: W.previewBusy || W.createBusy || !W.teamId, data: df('preview'), onclick: previewTeam }, W.previewBusy ? 'Checking…' : pv ? 'Preview again' : 'Preview changes')),
-    inlineErr(W.previewErr));
-  if (pv) out.appendChild(teamPreview(pv));
-  if (W.createResult) out.appendChild(teamResult(W.createResult));
-  if (step.ok && !W.createResult) out.appendChild(h('div', { class: 'row' }, stepOk('repo') ? null : nextBtn('Continue to repo', 'repo')));
-  return out;
-}
-function teamPreview(pv) {
-  const will = pv.willCreate || [];
-  const ds = pv.defaultState;
-  const backlogDefault = ds && (ds.type === 'backlog' || ds.type === 'triage');
-  const picks = S.state.settings && S.state.settings.pickupFromBacklog;
-  const box = h('div', { class: 'preview', role: 'region', 'aria-label': 'Preview of changes in Linear' },
-    h('h3', null, will.length ? 'Conductor will create in Linear' : 'Nothing to create'),
-    will.length
-      ? h('div', { class: 'chip-list' }, will.map((n) => h('span', { class: 'chip chip-mono' }, n)))
-      : h('p', { class: 'muted' }, 'Everything Conductor needs already exists.'));
-  if (ds) box.appendChild(h('p', { class: 'muted' }, h('span', null, 'New issues in this team start in '), h('b', null, ds.name), ` (${ds.type}).`,
-    (pv.unstartedStates || []).length ? [' Conductor picks up issues in: ', h('b', null, pv.unstartedStates.join(', ')), '.'] : null));
-  else if (!(pv.unstartedStates || []).length) box.appendChild(h('p', { class: 'muted' }, 'Linear did not report a default state for new issues.'));
-  for (const w of pv.warnings || []) {
-    box.appendChild(h('div', { class: 'callout' }, icon('warn'), h('div', { class: 'callout-body' }, h('div', { class: 'pre' }, w))));
-  }
-  if (backlogDefault) {
-    box.appendChild(h('div', { class: 'callout c-info' }, icon('info'), h('div', { class: 'callout-body' },
-      h('b', null, `New issues land in ${ds.name}, which Conductor ignores on purpose`),
-      h('div', { class: 'pre' }, `An issue with the label does nothing while it sits in ${ds.name}. Either create tasks in Todo (the New task button does this for you) or let Conductor pick up from ${ds.name} too.`),
-      picks
-        ? h('p', { class: 'status-line tone-good' }, icon('tick'), `Picking up from ${ds.name} is on`)
-        : h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn btn-sm' + (W.backlogBusy ? ' is-busy' : ''), disabled: W.backlogBusy, data: df('backlog'), onclick: enableBacklog }, `Also pick up from ${ds.name}`)),
-      inlineErr(W.backlogErr))));
-  }
-  box.appendChild(h('div', { class: 'row' },
-    h('button', { type: 'button', class: 'btn btn-primary' + (W.createBusy ? ' is-busy' : ''), disabled: W.createBusy, data: df('confirm-team'), onclick: confirmTeam },
-      W.createBusy ? 'Creating…' : will.length ? `Confirm and create ${will.length}` : 'Confirm'),
-    h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => { W.preview = null; rerenderWizard(); } }, 'Cancel')));
-  appendKids(box, [inlineErr(W.createErr)]);
-  return box;
-}
-function teamResult(r) {
-  const out = h('div', null);
-  if ((r.created || []).length) out.appendChild(h('div', { class: 'callout c-good' }, icon('check'), h('div', { class: 'callout-body' }, h('b', null, 'Created in Linear'),
-    h('div', { class: 'chip-list' }, r.created.map((n) => h('span', { class: 'chip chip-mono' }, n))))));
-  if ((r.manual || []).length) {
-    out.appendChild(h('div', { class: 'callout' }, icon('warn'), h('div', { class: 'callout-body' },
-      h('b', null, "Linear didn't allow Conductor to create these"),
-      h('div', { class: 'pre' }, 'Create them by hand in Linear (names must match exactly), then press Check again.'),
-      h('div', { class: 'chip-list' }, r.manual.map((n) => h('span', { class: 'chip chip-mono' }, n))),
-      h('div', { class: 'row' },
-        h('button', { type: 'button', class: 'btn btn-sm', onclick: async () => { const ok = await copyText(r.manual.join('\n')); toast(ok ? 'good' : 'warn', ok ? 'Names copied, one per line.' : "Couldn't copy."); } }, icon('copy'), h('span', null, 'Copy names')),
-        h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: async () => { W.createResult = null; await previewTeam(); } }, 'Check again')))));
-  }
-  return out;
-}
-
-/* step 4: repo */
+/* step 2: repository */
 async function addRepo() {
   const path = W.repoPath.trim(); const name = W.repoName.trim();
   if (!path) { W.repoErr = 'Paste the folder path of a git repository.'; rerenderWizard(); return; }
@@ -2160,7 +2053,7 @@ async function addRepo() {
     W.lastRepo = r.repo || null; W.repoPath = ''; W.repoName = '';
     await loadState();
     advanceWizard();
-    if (S.state.setup.complete) toast('good', 'Setup complete. Conductor is now watching Linear for tasks.');
+    if (S.state.setup.complete) toast('good', 'Setup complete. Press New task to start.');
   } catch (e) { W.repoErr = e.message; }
   W.repoBusy = false; rerenderWizard();
   if (W.repoErr) focusWiz('repo-path');

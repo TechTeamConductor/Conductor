@@ -1,6 +1,7 @@
 import { atomicWriteFile, randomToken, readJsonFile, sha256 } from '../util.ts';
 
-export const COOKIE_NAME = 'conductor_session';
+/** v2's own cookie name: cookies are host-scoped (not port-scoped), so v1 on :4317 and v2 on :4318 must not sign each other out (review K7). */
+export const COOKIE_NAME = 'conductor_v2_session';
 
 export interface AuthOptions {
   otpTtlMs?: number;

@@ -236,6 +236,26 @@ test('approve needs the plan revision: a missing or stale revision is refused, t
   demo.rt.cfgRef.current.pipeline.planApproval = 'first';
 });
 
+test('run-less cards (Backlog) are in state AND in the live feed; moving one to To do starts it and it leaves the card list; detail carries notes + park/finish flags', async () => {
+  const project = demo.board.projects()[0]!;
+  const card = demo.board.user.createItem({ projectId: project.id, title: 'Parked idea', description: 'later', lane: 'backlog' });
+  const st = JSON.parse((await raw('/api/state', { headers: authed() })).text);
+  assert.ok(st.cards.some((c: any) => c.key === card.key && c.lane === 'backlog'), 'listed as a card');
+  assert.ok(!st.runs.some((r: any) => r.key === card.key), 'no run yet');
+  // the live (SSE) feed carries the same list, so a card never shows twice while it is being claimed
+  const live = demo.rt.api.live();
+  assert.ok(live.cards.some((c) => c.key === card.key));
+  assert.equal((await raw(`/api/items/${card.key}/move`, { method: 'POST', headers: mut(), body: JSON.stringify({ lane: 'todo' }) })).status, 200);
+  await waitFor(async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs.find((r: any) => r.key === card.key));
+  const st2 = JSON.parse((await raw('/api/state', { headers: authed() })).text);
+  assert.ok(!st2.cards.some((c: any) => c.key === card.key), 'a card with a run is no longer listed as a plain card');
+  const detail = JSON.parse((await raw(`/api/runs/${card.key}`, { headers: authed() })).text);
+  assert.ok(Array.isArray(detail.notes) && detail.notes.some((n: any) => n.author === 'conductor' && /picked this up/.test(n.body)), 'Conductor narration is exposed as notes');
+  assert.equal(detail.canPark, true);
+  assert.equal(detail.canFinish, true);
+  assert.equal(detail.url, '', 'no external page');
+});
+
 test('logout revokes the session', async () => {
   const u = new URL(demo.rt.server.loginUrl());
   const r = await raw(u.pathname + u.search);
