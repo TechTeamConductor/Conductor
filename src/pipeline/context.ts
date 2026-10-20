@@ -31,6 +31,11 @@ export interface PipelineCtx {
   routeStates(): States;
   /** Refresh the zero-quota provider health first if the last reading is missing/stale (so routing never relies on a dashboard having looked). */
   freshHealth(): Promise<void>;
+  /**
+   * One slot of the engine's single cap on concurrent read-only analysis calls (task graphs; `pipeline.readOnlyParallel`), shared by every run.
+   * Resolves with a release function, or null when `signal` aborts while waiting.
+   */
+  analysisSlot(signal?: AbortSignal): Promise<(() => void) | null>;
   /** Ask the engine to run another poll/schedule pass soon. */
   tickSoon(): void;
   /** Latest provider quota/utilisation reported by an agent run (for the dashboard meter). */

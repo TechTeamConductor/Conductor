@@ -19,20 +19,24 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
-import { buildGraph, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
+import { buildGraph, graphBudgets, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
+import { GraphBuilder } from './graph-build.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
+import type { Role } from '../agents/roles.ts';
 import { route } from '../agents/routing.ts';
 import type { PipelineCtx } from './context.ts';
-import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
+import { ITEM_NOTE_SCHEMA, PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
 
 const log = logger('stages');
 const PROTECTED = '.claude/**, .cursor/**, .codex/**, .agents/**, .mcp.json, AGENTS.md, agents.override.md, CLAUDE.md, GEMINI.md, .github/**, .husky/**, .git*, .techteam/**, .conductor/**';
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
-type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop' };
+/** What a read-only call asks the run to do when it cannot continue (applied at once, or deferred so concurrent calls make ONE transition). */
+export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo };
+type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop'; hold?: Hold };
 
 /** More tasks than this in one plan always waits for a human (even with automatic approval). */
 const GRAPH_BIG_ITEMS = 8;
@@ -79,8 +83,39 @@ function readConventions(root: string): { name: string; text: string }[] {
 
 export class Stages {
   private c: PipelineCtx;
+  private graphs: GraphBuilder;
   constructor(ctx: PipelineCtx) {
     this.c = ctx;
+    this.graphs = new GraphBuilder({
+      c: ctx,
+      run: (k) => this.run(k),
+      repo: (r) => this.repo(r),
+      patch: (k, fn) => this.patch(k, fn),
+      note: (k, st, t) => this.note(k, st, t),
+      toNeedsHuman: (k, reason, origin, comment) => this.toNeedsHuman(k, reason, origin, comment),
+      pauseForLimit: (k, l) => this.pauseForLimit(k, l),
+      finishSession: (k, res) => this.finishSession(k, res),
+      refundIfLimit: (k, res) => this.refundIfLimit(k, res),
+      emitter: (k, st, loop, rev) => this.emitter(k, st, loop, rev),
+      runAllGates: (k, repo, defs) => this.runAllGates(k, repo, defs),
+      reinstallIfLockChanged: (k, st) => this.reinstallIfLockChanged(k, st),
+      hasUncommitted: (wt) => this.hasUncommitted(wt),
+      writePromptAudit: (k, name, text) => this.writePromptAudit(k, name, text),
+      runsLimit: (r) => this.runsLimit(r),
+      callAnalysis: async (k, prompt, role, label) => {
+        const called = await this.callReadOnly(k, 'plan', prompt, ITEM_NOTE_SCHEMA, this.run(k).worktree, (j) => validateSchema(ITEM_NOTE_SCHEMA, j), { role, label, defer: true });
+        return called.kind === 'ok' ? { kind: 'ok', json: called.json } : { kind: 'stop', hold: called.hold };
+      },
+      applyHold: (k, hold) => this.applyHold(k, hold),
+      analysisSlot: (k) => ctx.analysisSlot(ctx.signal(k)),
+      protectedPaths: PROTECTED,
+    });
+  }
+
+  /** The agent-run budget of a run: a task graph scales it with the amount of work (never past the hard ceiling). */
+  runsLimit(run: Run): number {
+    const base = this.c.cfg().pipeline.maxAgentRunsPerIssue;
+    return run.graph ? graphBudgets(run.graph.items.length, base).runsLimit : base;
   }
 
   // ───────────────────────── helpers ─────────────────────────
@@ -249,16 +284,21 @@ export class Stages {
     schema: Schema,
     cwd: string,
     validate: (json: unknown) => string[],
+    opts: { role?: Role; label?: string; defer?: boolean } = {},
   ): Promise<Called> {
+    const stop = async (hold?: Hold): Promise<Called> => {
+      if (opts.defer) return { kind: 'stop', hold };
+      await this.applyHold(key, hold);
+      return { kind: 'stop' };
+    };
     let corrective = '';
     let retried = false;
     let turnsFactor = 1;
     for (let attempt = 0; attempt < 4; attempt++) {
       const run = this.run(key);
-      if (this.c.signal(key).aborted) return { kind: 'stop' };
-      if (run.agentRuns >= this.c.cfg().pipeline.maxAgentRunsPerIssue) {
-        await this.toNeedsHuman(key, `This card has used its limit of ${this.c.cfg().pipeline.maxAgentRunsPerIssue} agent runs. Review the work so far, then move it back to To do to continue.`, run.next);
-        return { kind: 'stop' };
+      if (this.c.signal(key).aborted) return stop();
+      if (run.agentRuns >= this.runsLimit(run)) {
+        return stop({ type: 'human', reason: `This card has used its limit of ${this.runsLimit(run)} agent runs. Review the work so far, then move it back to To do to continue.`, origin: run.next });
       }
       this.patch(key, (r) => {
         r.agentRuns += 1;
@@ -266,7 +306,7 @@ export class Stages {
       const cfg = this.c.cfg();
       await this.c.freshHealth();
       const res = await this.c.agents.readOnly({
-        role: stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification',
+        role: opts.role ?? (stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification'),
         complexity: run.complexity,
         states: this.c.routeStates(),
         onLimit: (info) => this.recordLimitPause(info),
@@ -289,7 +329,7 @@ export class Stages {
         await this.c.effects.comment(key, `fallback:${stage}:${run.loop}:${res.agent}`, `🤖 **${providerLabel(res.agent)} did the ${stage.replace('_', ' ')} step instead of ${providerLabel(res.from)}.**${note}`);
       }
       if (res.quota) this.c.recordQuota(res.agent, res.quota);
-      this.writePromptAudit(key, `${stage}-${run.loop}-${attempt}`, prompt + corrective);
+      this.writePromptAudit(key, `${opts.label ?? stage}-${run.loop}-${attempt}`, prompt + corrective);
       if (res.ok) {
         const errs = validate(res.json);
         if (!errs.length) return { kind: 'ok', json: res.json, result: res, agent: res.agent };
@@ -299,20 +339,17 @@ export class Stages {
           this.note(key, stage, `Reply failed validation (${errs[0]}) — asking once more.`);
           continue;
         }
-        await this.toNeedsHuman(key, `The ${res.agent} reply kept failing validation: ${errs[0]}`, run.next);
-        return { kind: 'stop' };
+        return stop({ type: 'human', reason: `The ${res.agent} reply kept failing validation: ${errs[0]}`, origin: run.next });
       }
       switch (res.errorKind) {
         case 'limit':
-          await this.pauseForLimit(key, res.limit ?? { provider: res.agent, resetsAt: null, message: res.error ?? 'limit' });
-          return { kind: 'stop' };
+          return stop({ type: 'pause', limit: res.limit ?? { provider: res.agent, resetsAt: null, message: res.error ?? 'limit' } });
         case 'aborted':
-          return { kind: 'stop' };
+          return stop();
         case 'auth': // not signed in: another attempt cannot help — say how to sign in (the message carries the exact command)
         case 'isolation':
         case 'spawn':
-          await this.toNeedsHuman(key, res.error ?? 'agent could not start', run.next);
-          return { kind: 'stop' };
+          return stop({ type: 'human', reason: res.error ?? 'agent could not start', origin: run.next });
         case 'max_turns':
           if (!retried) {
             retried = true;
@@ -320,28 +357,31 @@ export class Stages {
             this.note(key, stage, 'Hit the turn cap — retrying once with a higher cap.');
             continue;
           }
-          await this.toNeedsHuman(key, 'The agent ran out of turns twice. The task may be too large — consider splitting the card.', run.next);
-          return { kind: 'stop' };
+          return stop({ type: 'human', reason: 'The agent ran out of turns twice. The task may be too large — consider splitting the card.', origin: run.next });
         case 'parse':
           if (!retried) {
             retried = true;
             corrective = '\n\n## Your previous reply was rejected\nNo JSON object could be found. Reply with ONLY the fenced ```json block.';
             continue;
           }
-          await this.toNeedsHuman(key, res.error ?? 'could not parse the agent reply', run.next);
-          return { kind: 'stop' };
+          return stop({ type: 'human', reason: res.error ?? 'could not parse the agent reply', origin: run.next });
         default: // timeouts and generic agent errors: one more attempt, then a human
           if (!retried) {
             retried = true;
             this.note(key, stage, `${res.agent} failed (${truncate(res.error ?? '', 160)}) — retrying once.`);
             continue;
           }
-          await this.toNeedsHuman(key, `${res.agent} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, run.next);
-          return { kind: 'stop' };
+          return stop({ type: 'human', reason: `${res.agent} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, origin: run.next });
       }
     }
-    await this.toNeedsHuman(key, 'The agent could not produce a valid reply.', this.run(key).next);
-    return { kind: 'stop' };
+    return stop({ type: 'human', reason: 'The agent could not produce a valid reply.', origin: this.run(key).next });
+  }
+
+  /** Apply what a read-only call asked for (nothing for an abort). */
+  async applyHold(key: string, hold: Hold | undefined): Promise<void> {
+    if (!hold) return;
+    if (hold.type === 'human') return this.toNeedsHuman(key, hold.reason, hold.origin);
+    return this.pauseForLimit(key, hold.limit);
   }
 
   private writePromptAudit(key: string, name: string, text: string): void {
@@ -402,6 +442,19 @@ export class Stages {
     return true;
   }
 
+  /** Dependencies are re-installed before gates run when the lockfile changed since the last install (a failure is a visible note, not a stop). */
+  private async reinstallIfLockChanged(key: string, stage: StageName): Promise<void> {
+    const run = this.run(key);
+    const repo = this.repo(run);
+    const cfg = this.c.cfg();
+    const lock = await W.lockfileHash(run.worktree);
+    if (run.lockfileHash && run.lockfileHash !== lock) {
+      const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
+      if (inst.ok) this.patch(key, (r) => void (r.lockfileHash = lock));
+      else this.note(key, stage, `Re-installing dependencies failed (${truncate(inst.output.slice(-200), 200)}) — gates may fail for that reason.`);
+    }
+  }
+
   private async runAllGates(key: string, repo: RepoConfig, defs: GateDef[]): Promise<GateRun> {
     const run = this.run(key);
     const o = { cwd: run.worktree, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key), secrets: this.c.secretsFor(run) };
@@ -444,6 +497,7 @@ export class Stages {
       baseSha: run.baseSha.slice(0, 12),
       branch: run.branch,
       gates: repo.gates.length ? repo.gates.map((g) => `\`${g.cmd}\``).join(', ') : '(none detected)',
+      maxItems: String(this.c.cfg().pipeline.maxItems),
       conventions: conventionsBlock(readConventions(run.worktree)),
     });
     const called = await this.callReadOnly(key, 'plan', prompt, PLAN_SCHEMA, run.worktree, (j) => {
@@ -601,6 +655,15 @@ export class Stages {
     if (!(await this.ensureWorkspace(key))) return;
     run = this.run(key);
 
+    // a task graph that is still being built is executed item by item (graph-build.ts); the whole-change fix loop after verification, and
+    // a plan without a graph, continue below exactly as before
+    if (run.graph && run.graph.rev !== run.rev) {
+      this.patch(key, (r) => void (r.graph = undefined)); // a graph that does not belong to this plan revision is never executed
+      this.note(key, 'build', 'The task graph did not belong to this plan revision — building the plan as one task.');
+      run = this.run(key);
+    }
+    if (run.graph && run.graph.final === 'pending') return this.graphs.step(key, plan);
+
     // crash window: a commit exists beyond what we recorded ⇒ the builder had finished
     const head = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
     const known = run.commitSha ?? run.baseSha;
@@ -659,8 +722,8 @@ export class Stages {
     this.patch(key, (r) => {
       r.agentRuns += 1;
     });
-    if (run.agentRuns + 1 > cfg.pipeline.maxAgentRunsPerIssue) {
-      return this.toNeedsHuman(key, `This card has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
+    if (run.agentRuns + 1 > this.runsLimit(run)) {
+      return this.toNeedsHuman(key, `This card has used its limit of ${this.runsLimit(run)} agent runs.`, 'build');
     }
     // Everything that makes a builder safe (eligibility, provider guard, no-push env, git-meta restore, guard check, commit guard,
     // branch scans) is the envelope's job; the stage only records facts and routes the outcome.
@@ -791,13 +854,54 @@ export class Stages {
     });
   }
 
+  /**
+   * Task graphs: a finding with a `file` is attributed to the task whose commit LAST touched that file, so the fix prompt can name the
+   * suspect. The `file` is model-supplied: it counts only if it is exactly a path in `git diff --name-only <base> HEAD`, it is passed after
+   * `--` with literal pathspecs, and the commit it resolves to must be 40 hex characters and one of the graph's own item commits.
+   */
+  private async attributeBugs(key: string, bugs: Bug[]): Promise<void> {
+    const run = this.run(key);
+    const g = run.graph;
+    const withFile = bugs.filter((b) => typeof b.file === 'string' && b.file);
+    if (!g || !withFile.length) return;
+    let changed: Set<string>;
+    try {
+      changed = new Set((await gitOk(run.worktree, ['diff', '--name-only', '-z', run.baseSha, 'HEAD'])).split('\0').filter(Boolean));
+    } catch {
+      return;
+    }
+    for (const b of withFile) {
+      const file = String(b.file);
+      if (!changed.has(file)) continue;
+      let sha = '';
+      try {
+        sha = (await gitOk(run.worktree, ['--literal-pathspecs', 'log', '-n1', '--format=%H', `${run.baseSha}..HEAD`, '--', file])).trim();
+      } catch {
+        continue;
+      }
+      if (!/^[0-9a-f]{40}$/.test(sha)) continue;
+      const item = g.items.find((i) => i.commitSha === sha);
+      if (!item) continue;
+      const fp = bugFingerprint(b);
+      this.patch(key, (r) => {
+        const rec = r.bugs.find((x) => x.fp === fp);
+        if (rec) rec.graphItem = item.id;
+      });
+    }
+  }
+
   private bugList(run: Run): string {
     const failOn = new Set(this.c.cfg().pipeline.failOn);
     const open = run.bugs.filter((b) => b.status === 'open' && failOn.has(b.severity));
     if (!open.length) return '(none recorded — see the verifier summary)';
     return fence(
       'verifier-findings',
-      open.map((b, i) => `${i + 1}. [${b.severity}] ${b.title}\n${b.detail}`).join('\n\n'),
+      open
+        .map((b, i) => {
+          const suspect = b.graphItem ? run.graph?.items.find((x) => x.id === b.graphItem) : undefined;
+          return `${i + 1}. [${b.severity}] ${b.title}\n${b.detail}${suspect ? `\n(Introduced by task ${suspect.id} "${sanitizeLine(suspect.title, 100)}")` : ''}`;
+        })
+        .join('\n\n'),
       24_000,
     );
   }
@@ -818,12 +922,7 @@ export class Stages {
     if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
 
     // 1) deterministic gates (ground truth), compared against the baseline by failure set
-    const lock = await W.lockfileHash(run.worktree);
-    if (run.lockfileHash && run.lockfileHash !== lock) {
-      const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
-      if (inst.ok) this.patch(key, (r) => void (r.lockfileHash = lock));
-      else this.note(key, 'verify', `Re-installing dependencies failed (${truncate(inst.output.slice(-200), 200)}) — gates may fail for that reason.`);
-    }
+    await this.reinstallIfLockChanged(key, 'verify');
     const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     let current: GateRun = { at: this.c.clock.now(), sha: run.commitSha ?? '', results: [] };
     let comparison: GateComparison = { regressions: [], preExisting: [], unverified: [], passed: [] };
@@ -955,6 +1054,8 @@ export class Stages {
       });
     }
 
+    if (run.graph) await this.attributeBugs(key, bugs);
+
     // Board: file at most N bug cards per loop / per run (most severe first); summarise the rest in the comment.
     const PER_LOOP = 5;
     const PER_RUN = 8;
@@ -1034,6 +1135,7 @@ export class Stages {
       r.status = 'ready';
       r.next = 'none';
       r.needsHuman = undefined;
+      if (r.graph) r.graph.final = 'done';
       r.history.push({ ts: this.c.clock.now(), text: `Verified — ready for your review${r.unverified ? ' (unverified by tests)' : ''}` });
       // K1: "ready" and its board effects are ONE write
       Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'ready' } }, secrets);

@@ -52,9 +52,15 @@ function scenario() {
 function nextIndex(name) {
   if (!dir) return 0;
   mkdirSync(dir, { recursive: true });
-  const f = join(dir, `counter-cursor-${key}-${name}`);
-  appendFileSync(f, 'x');
-  return statSync(f).size - 1;
+  // an atomic claim (mkdir fails with EEXIST for everyone but one), so concurrent invocations never share an index
+  for (let i = 0; ; i++) {
+    try {
+      mkdirSync(join(dir, `counter-cursor-${key}-${name}-${i}`));
+      return i;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+  }
 }
 const slot = isBuild ? 'build' : stage;
 const idx = nextIndex(slot);
@@ -107,6 +113,7 @@ if (!isBuild) {
   const payload =
     stage === 'plan' ? { ...planDefault, ...(step.json ?? {}) }
     : stage === 'plan_review' ? { decision: 'approved', summary: 'Looks right.', issues: [], ...(step.json ?? {}) }
+    : stage === 'analysis' ? { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) }
     : { verdict: step.json?.verdict ?? 'pass', summary: step.json?.summary ?? 'Verified.', acceptance: step.json?.acceptance ?? ids.map((id) => ({ id, status: (step.json?.verdict ?? 'pass') === 'pass' ? 'met' : 'not_met', evidence: 'feature.mjs:1' })), bugs: step.json?.bugs ?? [] };
   const text = `Using SoftCo Lead to analyse this.\n\`\`\`json\n${JSON.stringify(step.raw ?? payload, null, 2)}\n\`\`\``;
   out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] }, session_id: sid });

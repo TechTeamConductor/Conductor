@@ -9,18 +9,7 @@ import { normalizeConfig, defaultConfig } from '../src/config.ts';
 import { toDetail, toGraph, toSummary } from '../src/pipeline/view.ts';
 import { itemsOf } from '../src/pipeline/graph.ts';
 
-type Item = { id: string; title: string; role: string; objective: string; dependsOn: string[]; files: string[]; criteria: string[]; verification: string[] };
-const item = (id: string, over: Partial<Item> = {}): Item => ({ id, title: `Task ${id}`, role: 'implementation', objective: `Do ${id}`, dependsOn: [], files: [`${id.toLowerCase()}.mjs`], criteria: [], verification: ['npm test'], ...over });
-function graphPlan(items: Item[], over: Record<string, unknown> = {}) {
-  return {
-    acceptanceCriteria: [{ id: 'AC1', text: 'it works', verification: 'node --test' }, { id: 'AC2', text: 'it also works', verification: 'node --test' }],
-    filesToChange: items.flatMap((i) => i.files).map((path) => ({ path, action: 'create', change: 'x', reason: 'AC1' })),
-    taskGraph: { items },
-    ...over,
-  };
-}
-const two = () => graphPlan([item('T1', { criteria: ['AC1'] }), item('T2', { dependsOn: ['T1'], criteria: ['AC2'] })]);
-const manual = (c: { pipeline: { planApproval: string } }) => void (c.pipeline.planApproval = 'manual');
+import { cardsOf, graphPlan, item, manual, two } from './helpers/graphs.ts';
 
 /** Plan a graph, stop at the approval screen, approve it while the engine is paused (so nothing builds), and let the effects land. */
 async function approvedWithCards(h: Harness, plan: object): Promise<string> {
@@ -33,7 +22,6 @@ async function approvedWithCards(h: Harness, plan: object): Promise<string> {
   await h.engine.tick();
   return key;
 }
-const cardsOf = (h: Harness, key: string) => h.board.children(h.board.item(key)!.id).filter((c) => c.kind === 'subtask');
 
 test('a planned graph is shown on the approval screen but nothing exists on the board or in the run until the plan is approved', async () => {
   const h = await makeHarness({ config: manual });

@@ -102,6 +102,10 @@ export interface ItemRun {
   /** HEAD before this item's builder started, and the per-attempt nonce its commit message must carry (crash adoption). */
   startHead?: string;
   nonce?: string;
+  /** Gate-regression / hook feedback for this item's next attempt (deterministic tool output, capped). */
+  feedback?: string;
+  /** HEAD before this item's FIRST attempt: a failed item's commits are backed up and the branch is reset here, so independent items continue on good code. */
+  floor?: string;
   commitSha?: string;
   note?: string;
 }
@@ -208,6 +212,7 @@ export interface BugRec {
   itemId?: string; // the board item (kind 'bug') filed for this finding
   itemKey?: string;
   loops: number[]; // loops in which it was observed
+  graphItem?: string; // the plan item whose commit last touched `file` (task graphs only; see Stages.attributeBugs)
 }
 export interface EffectRec {
   status: 'pending' | 'done';

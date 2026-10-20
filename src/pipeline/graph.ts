@@ -1,6 +1,7 @@
 // The task graph (M3): validation of a plan's `taskGraph`, derived item readiness, blocked propagation, budgets, lane projection and the
 // crash-adoption marker. PURE — no git, no I/O, no clock — so every rule is unit-tested in isolation (test/graph.test.ts).
 import { randomBytes } from 'node:crypto';
+import type { Role } from '../agents/roles.ts';
 import type { ItemRun, Plan, PlanItem, TaskGraphRun } from '../types.ts';
 
 /** Hard v2.0 ceilings: no config can lift them (plan §2b-9, §2.5). */
@@ -216,4 +217,42 @@ export const itemMarker = (itemId: string, nonce: string): string => `Conductor-
 export function parseItemMarker(message: string): { itemId: string; nonce: string } | null {
   const m = /^Conductor-Item: (T\d{1,2}) ([0-9a-f]{16})$/m.exec(message);
   return m ? { itemId: m[1]!, nonce: m[2]! } : null;
+}
+
+const idNum = (id: string): number => Number(id.slice(1));
+
+/** Every item `id` depends on, directly or through other items (not `id` itself), in declaration order. */
+export function ancestorsOf(items: readonly ItemRun[], id: string): ItemRun[] {
+  const m = byId(items);
+  const seen = new Set<string>();
+  const stack = [...(m.get(id)?.dependsOn ?? [])];
+  while (stack.length) {
+    const d = stack.pop()!;
+    if (seen.has(d) || d === id) continue;
+    seen.add(d);
+    for (const n of m.get(d)?.dependsOn ?? []) stack.push(n);
+  }
+  return items.filter((i) => seen.has(i.id));
+}
+
+/**
+ * The next piece of work, or undefined when nothing can run: an interrupted (`running`) item first, then ready analysis items
+ * (declaration order), then the ready build item with the lowest id. Build items are strictly one at a time.
+ */
+export function pickNext(items: readonly ItemRun[]): ItemRun | undefined {
+  const running = items.find((i) => i.state === 'running');
+  if (running) return running;
+  const ready = readySet(items);
+  return ready.find((i) => ANALYSIS_ROLES.has(i.role)) ?? [...ready].filter((i) => BUILD_ROLES.has(i.role)).sort((a, b) => idNum(a.id) - idNum(b.id))[0];
+}
+
+/**
+ * The role the next build-stage step of a graph that is still being built needs (so routing/pausing looks at the right provider chain),
+ * or null when there is nothing to run. Undefined = this run has no graph under construction: the single-task rule applies.
+ */
+export function nextBuildRole(graph: TaskGraphRun | undefined): Role | null | undefined {
+  if (!graph || graph.final !== 'pending') return undefined;
+  const it = pickNext(graph.items);
+  if (!it) return null;
+  return ANALYSIS_ROLES.has(it.role) ? (it.role as Role) : it.loop > 1 ? 'debugging' : (it.role as Role);
 }

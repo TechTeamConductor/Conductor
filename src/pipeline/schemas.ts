@@ -133,3 +133,14 @@ export const VERDICT_SCHEMA: Schema = {
     },
   },
 };
+
+/** What an analysis item (requirements / architecture / context) reports. Caps are applied by code (graph-build.ts), not trusted from the model. */
+export const ITEM_NOTE_SCHEMA: Schema = {
+  type: 'object',
+  required: ['summary', 'details', 'decisions'],
+  properties: {
+    summary: { ...str, description: 'the findings in a few sentences' },
+    details: { ...str, description: 'supporting detail (markdown), citing files/symbols' },
+    decisions: { ...strArr, description: 'decisions the implementation tasks must follow, one per entry' },
+  },
+};

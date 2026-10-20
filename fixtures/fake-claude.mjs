@@ -46,9 +46,15 @@ function scenario() {
 function nextIndex() {
   if (!dir) return 0;
   mkdirSync(dir, { recursive: true });
-  const f = join(dir, `counter-${key}-${stage}`);
-  appendFileSync(f, 'x');
-  return statSync(f).size - 1;
+  // an atomic claim (mkdir fails with EEXIST for everyone but one), so concurrent invocations never share an index
+  for (let i = 0; ; i++) {
+    try {
+      mkdirSync(join(dir, `counter-${key}-${stage}-${i}`));
+      return i;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+  }
 }
 const idx = nextIndex();
 const sc = scenario();
@@ -133,6 +139,7 @@ function verdictFor() {
 let payload;
 if (stage === 'plan') payload = planFor();
 else if (stage === 'plan_review') payload = reviewFor();
+else if (stage === 'analysis') payload = { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) };
 else if (stage === 'verify') payload = verdictFor();
 else payload = { note: `fake claude does not handle stage ${stage}` };
 if (step.raw) payload = step.raw; // e.g. an invalid object to test validation

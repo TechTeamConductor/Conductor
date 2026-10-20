@@ -45,6 +45,7 @@ Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still
 | start a task | **New task** (it starts right away), or create a card in *Backlog* and press **Start** later |
 | approve a plan | usually nothing — plans run automatically. Large (`L`) plans, plans touching CI/agent config, and imported cards wait: press **Approve plan** |
 | ask a question | create the card as usual — if no code change is needed, Claude's **answer** appears as a note on the card and it finishes (no build/verify) |
+| work on a bigger change | nothing special — if the plan splits it into tasks, a **Tasks** tab shows them (one card per task under the run's card). Tasks build one at a time, each gated by your repo's tests; if one fails, the others that don't depend on it continue, and **Retry** re-runs only the failed ones. Plans with more than 8 tasks wait for your approval |
 | answer a question / retry after a failure | add a **note** on the card (your notes are read by the next plan), then press **Retry** |
 | pause a card without losing work | **Park in Backlog** (nothing runs); **Move to To do** restarts it, re-planning but keeping the work |
 | stop it | **Abort run** (or **Cancel** on a card that has not started) |

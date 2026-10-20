@@ -41,7 +41,7 @@ const AGENT_LABEL = { claude: 'Claude', cursor: 'Cursor', conductor: 'Conductor'
 const AGENT_ICON = { claude: 'claude', cursor: 'cursor', conductor: 'diamond' };
 const STAGE_LABEL = { plan: 'Plan', plan_review: 'Plan review', build: 'Build', verify: 'Verify', setup: 'Setup', engine: 'Engine' };
 const TABS = [
-  ['overview', 'Overview'], ['log', 'Live log'], ['plan', 'Plan'],
+  ['overview', 'Overview'], ['log', 'Live log'], ['plan', 'Plan'], ['tasks', 'Tasks'],
   ['verification', 'Verification'], ['sessions', 'Sessions'], ['timeline', 'Timeline'],
 ];
 const OPEN_LABEL = {
@@ -337,6 +337,10 @@ function normalizeDetail(d) {
     d.plan.testing = d.plan.testing || { commands: [], cases: [] };
   }
   for (const v of d.verdicts) { if (v.verdict) { v.verdict.acceptance = v.verdict.acceptance || []; v.verdict.bugs = v.verdict.bugs || []; } }
+  if (d.graph) {
+    d.graph.items = Array.isArray(d.graph.items) ? d.graph.items : [];
+    for (const it of d.graph.items) for (const k of ['dependsOn', 'files', 'criteria']) if (!Array.isArray(it[k])) it[k] = [];
+  } else d.graph = null;
   return d;
 }
 function applyState(data, quiet) {
@@ -987,6 +991,7 @@ function buildDrawer(key) {
       type: 'button', class: 'tab', role: 'tab', id: 'tab-' + id, 'aria-controls': 'panel-' + id,
       'aria-selected': 'false', tabindex: '-1', data: { tab: id }, onclick: () => selectTab(id, true),
     }, label, count);
+    if (id === 'tasks') D.tabBtns[id].hidden = true;
     tablist.appendChild(D.tabBtns[id]);
     D.panels[id] = h('div', {
       class: 'panel' + (id === 'log' ? ' is-log' : ''), role: 'tabpanel', id: 'panel-' + id,
@@ -1023,6 +1028,7 @@ function closeDrawerSilently() {
   if (S.detailKey) { S.detailKey = null; S.detail = null; S.detailSig = ''; L.key = null; dlg.replaceChildren(); L.queue = []; L.pending = []; }
 }
 function selectTab(id, user) {
+  if (D.tabBtns && D.tabBtns[id] && D.tabBtns[id].hidden) id = 'overview'; // the Tasks tab exists only for runs that were split into tasks
   if (!D.tabBtns || !D.tabBtns[id]) return;
   for (const [tid, b] of Object.entries(D.tabBtns)) {
     const on = tid === id;
@@ -1035,7 +1041,7 @@ function selectTab(id, user) {
   if (id === 'log') logShown();
 }
 function onTabKey(e) {
-  const ids = TABS.map((t) => t[0]);
+  const ids = TABS.map((t) => t[0]).filter((id) => !(D.tabBtns[id] && D.tabBtns[id].hidden));
   const cur = ids.indexOf(document.activeElement && document.activeElement.dataset.tab);
   if (cur < 0) return;
   let n = -1;
@@ -1127,6 +1133,17 @@ function renderDetailPanels() {
   if (!d) return;
   fillPanel('overview', renderOverview(d));
   fillPanel('plan', renderPlan(d));
+  const gr = d.graph;
+  if (D.tabBtns.tasks) {
+    toggleHidden(D.tabBtns.tasks, !gr);
+    if (D.counts.tasks) {
+      const done = gr ? gr.items.filter((i) => i.state === 'done').length : 0;
+      setText(D.counts.tasks, gr ? done + '/' + gr.items.length : '');
+      toggleHidden(D.counts.tasks, !gr);
+    }
+    if (!gr && S.route.tab === 'tasks') selectTab('overview', false);
+  }
+  fillPanel('tasks', renderTasks(d));
   fillPanel('verification', renderVerification(d));
   fillPanel('sessions', renderSessions(d));
   fillPanel('timeline', renderTimeline(d));
@@ -1696,6 +1713,48 @@ function renderPlan(d) {
       sec('Risks', (p.risks || []).length ? bulletList(p.risks) : null)].filter(Boolean));
   }
   root.appendChild(full);
+  return root;
+}
+
+/* ───────────────────────── tasks tab (runs that were split into tasks) ───────────────────────── */
+const TASK_STATE = {
+  done: ['good', 'Done', 'tick'], running: ['info', 'Working', 'code'], failed: ['bad', 'Failed', 'x-circle'],
+  blocked: ['warn', 'Blocked', 'warn'], ready: ['mute', 'Ready', 'clock'], pending: ['mute', 'Waiting', 'clock'],
+};
+const ROLE_LABEL = { implementation: 'Build', documentation: 'Docs', requirements: 'Requirements', architecture: 'Architecture', context: 'Context' };
+function renderTasks(d) {
+  const g = d.graph;
+  const root = h('div', { class: 'stack-lg' });
+  if (!g) return root;
+  const n = (s) => g.items.filter((i) => i.state === s).length;
+  const failed = n('failed');
+  root.appendChild(h('div', { class: 'card-box stack' },
+    h('div', { class: 'row' },
+      h('span', { class: 'chip' }, plural(g.items.length, 'task')),
+      h('span', { class: 'chip' }, n('done') + ' done'),
+      n('running') ? h('span', { class: 'chip' }, n('running') + ' working') : null,
+      failed ? h('span', { class: 'chip' }, failed + ' failed') : null,
+      n('blocked') ? h('span', { class: 'chip' }, n('blocked') + ' blocked') : null,
+      h('span', { class: 'chip' }, 'Plan rev ' + g.rev)),
+    h('p', { class: 'muted' }, 'The plan was split into tasks. Conductor builds them one at a time on one branch, in dependency order, and runs the quality gates after each one; the whole change is verified at the end.'),
+    d.status === 'needs_human' && (failed || n('blocked'))
+      ? h('p', null, h('b', null, 'Retry'), ' runs the failed and blocked tasks again; finished tasks and their commits are kept. Moving the card to To do starts over with a new plan.')
+      : null));
+  root.appendChild(h('ol', { class: 'task-list' }, g.items.map((it) => {
+    const st = TASK_STATE[it.state] || TASK_STATE.pending;
+    return h('li', { class: 'task card-box stack' },
+      h('div', { class: 'row' },
+        h('span', { class: 'ac-id' }, it.id), h('b', null, it.title),
+        h('span', { class: 'chip' }, ROLE_LABEL[it.role] || it.role),
+        badge(st[0], st[1], st[2]),
+        it.loop > 1 ? h('span', { class: 'chip' }, 'Attempt ' + it.loop + ' of ' + it.loopBudget) : null,
+        it.commitSha ? h('code', { class: 'chip', title: it.commitSha }, it.commitSha.slice(0, 7)) : null),
+      h('p', null, it.objective),
+      it.dependsOn.length ? h('p', { class: 'ac-sub' }, h('b', null, 'After: '), it.dependsOn.join(', ')) : null,
+      it.files.length ? h('p', { class: 'ac-sub' }, h('b', null, 'Files: '), ...it.files.flatMap((f, i) => [i ? ', ' : '', h('code', null, f)])) : null,
+      it.criteria.length ? h('p', { class: 'ac-sub' }, h('b', null, 'Covers: '), it.criteria.join(', ')) : null,
+      it.note ? h('div', { class: 'pre' }, it.note) : null);
+  })));
   return root;
 }
 

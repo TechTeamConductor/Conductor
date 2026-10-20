@@ -60,6 +60,8 @@ export interface BuildInput {
   baseSha: string;
   /** Commit subject (first line); the envelope appends the "Built by Conductor (<label>)" trailer. */
   subject: string;
+  /** Optional extra final line of the commit message (the task-graph adopt marker). Whole line, single-line text only. */
+  trailer?: string;
   rev: number;
   prompt: string;
   name: string;
@@ -139,7 +141,7 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
   }
 
   // 6 — Conductor commits (secret + scope guard), never the builder
-  const committed = await W.commitAll({ worktree: i.worktree, message: `${i.subject}\n\nBuilt by Conductor (${label}). Plan rev ${i.rev}.`, secrets: i.secrets });
+  const committed = await W.commitAll({ worktree: i.worktree, message: `${i.subject}\n\nBuilt by Conductor (${label}). Plan rev ${i.rev}.${i.trailer ? `\n${i.trailer.replace(/[\r\n]+/g, ' ')}` : ''}`, secrets: i.secrets });
   if (!committed.ok) {
     if (committed.reason === 'nothing') return { kind: 'nothing', res: res! };
     if (committed.reason === 'guard') return { kind: 'held', reason: `Conductor refused to commit: ${committed.detail}. Nothing was committed.` };

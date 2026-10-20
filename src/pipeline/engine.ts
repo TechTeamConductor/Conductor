@@ -16,7 +16,8 @@ import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
 import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
-import { projectItemLane } from './graph.ts';
+import { graphBudgets, nextBuildRole, projectItemLane } from './graph.ts';
+import { Semaphore } from './semaphore.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
 import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers/registry.ts';
@@ -87,6 +88,8 @@ export class Engine {
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
+  /** The ONE cap on concurrent read-only analysis calls across all runs (task graphs). */
+  private analysisSem = new Semaphore(() => this.d.getConfig().pipeline.readOnlyParallel);
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
   private healthRefresh: (() => Promise<void>) | null = null;
   private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>) | null = null;
@@ -125,6 +128,7 @@ export class Engine {
       },
       pausedUntil: (agent) => this.activePause(agent),
       tickSoon: () => this.tickSoon(),
+      analysisSlot: (signal) => this.analysisSem.acquire(signal),
       recordQuota: (agent, q) => {
         this.quotaMap.set(agent, { utilization7d: q.utilization7d, utilization5h: q.utilization5h, resetsAt: q.resetsAt, rejected: q.status === 'rejected' });
         this.changed();
@@ -508,6 +512,21 @@ export class Engine {
       if (retryStage) {
         r.next = retryStage;
         if (retryStage === 'verify' && r.loop >= r.loopBudget) r.loopBudget += cfg.pipeline.maxLoops;
+        if (retryStage === 'build' && r.graph?.final === 'pending') {
+          // only the tasks that failed or were blocked by a failure run again; finished tasks (and their commits) are kept
+          for (const it of r.graph.items) {
+            if (it.state !== 'failed' && it.state !== 'blocked') continue;
+            it.state = 'pending';
+            it.loop = 1;
+            it.loopBudget = cfg.pipeline.maxLoops;
+            it.feedback = undefined;
+            it.note = undefined;
+            it.floor = undefined;
+            it.startHead = undefined;
+            it.nonce = undefined;
+          }
+          r.commitNote = undefined;
+        }
         r.history.push({ ts: now, text: `Retrying ${retryStage} (requested by you)` });
       } else {
         r.rev += 1;
@@ -549,8 +568,11 @@ export class Engine {
         return 'review';
       case 'verify':
         return 'verification';
-      case 'build':
+      case 'build': {
+        const gr = nextBuildRole(run.graph);
+        if (gr !== undefined) return gr; // a task graph under construction: the role of its next task
         return run.loop > 1 || run.bugs.some((b) => b.status === 'open') ? 'debugging' : 'implementation';
+      }
       default:
         return null;
     }
@@ -618,9 +640,11 @@ export class Engine {
   }
 
   private async runJob(key: string, ac: AbortController): Promise<void> {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; ; i++) {
       const run = this.d.store.get(key);
       if (!run || ac.signal.aborted || run.status !== 'running') return;
+      // a graph-less run keeps today's 60; a task graph scales with its size, up to a hard ceiling
+      if (i >= (run.graph ? graphBudgets(run.graph.items.length, this.d.getConfig().pipeline.maxAgentRunsPerIssue).iterationCap : 60)) break;
       switch (run.next) {
         case 'plan':
           await this.stages.plan(key);

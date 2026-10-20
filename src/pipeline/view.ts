@@ -4,7 +4,7 @@ import type {
 } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { fmtDuration, isUuid, shellQuote, truncate } from '../util.ts';
-import { isReady } from './graph.ts';
+import { isReady, nextBuildRole } from './graph.ts';
 
 export function columnOf(run: Run): BoardColumn {
   switch (run.status) {
@@ -38,8 +38,11 @@ export function workingAgent(run: Run, cfg: Config): ProviderId | null {
       return cfg.roles.review.providers[0] ?? null;
     case 'verify':
       return cfg.roles.verification.providers[0] ?? null;
-    case 'build':
+    case 'build': {
+      const gr = nextBuildRole(run.graph);
+      if (gr !== undefined) return gr ? cfg.roles[gr].providers[0] ?? null : null;
       return cfg.roles[run.loop > 1 || run.bugs.some((b) => b.status === 'open') ? 'debugging' : 'implementation'].providers[0] ?? null;
+    }
     default:
       return null;
   }

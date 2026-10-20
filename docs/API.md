@@ -24,9 +24,10 @@ Every registry provider (`claude`, `cursor`, later `codex`): `state` (`ok | miss
 
 ### `GET /api/runs/:key` → `ApiRunDetail`  (`404` if unknown)
 Summary plus `notes[]` (the card's conversation: your notes and Conductor's), `plan`, `planMarkdown`, `planReview`, `verdicts[]` (per loop), `gates` (baseline + per-loop `GateRun` and `GateComparison`), `bugs[]`, `sessions[]` (each with a copyable `resumeCommand`), `timeline[]`, `diffStat`, `description`, `worktree`, `baseSha`, `commitSha`.
+`graph` is `null` for a single-task run, otherwise `{ rev, final: 'pending'|'verifying'|'done', items[] }` with, per task, `id`, `key` (its subtask card), `title`, `role`, `objective`, `dependsOn[]`, `files[]`, `criteria[]`, `state` (`pending | ready | running | done | failed | blocked` — `ready` is derived: pending with every dependency done), `loop`/`loopBudget`, `commitSha`, `note` (capped). The run summaries (`ApiState.runs[]`, and the detail) carry `taskProgress` `{ total, done, running, failed, blocked }` when a graph exists.
 
-### `GET /api/board` → `{ projects, items, milestones }` and `GET /api/items/:key` → `{ item, comments, children, decisions }`
-The raw board (newest 2000 items). Cards with a run are driven through `/api/runs/:key/*`; these are for browsing.
+### `GET /api/board` → `{ projects, items, milestones }` and `GET /api/items/:key` → `{ item, comments, children, decisions, graph }`
+The raw board (newest 2000 items). Cards with a run are driven through `/api/runs/:key/*`; these are for browsing. `graph` (same shape as in the run detail) is present on the card of a run that was split into tasks; its `children` include the Conductor-owned `subtask` cards. A move of such a card through `POST /api/items/:key/move` is refused with `409 managed` — retry or stop the work from the parent card.
 
 ### `GET /api/runs/:key/log?after=<seq>&limit=<n>` → `{ events: LogEvent[], next: number }`
 Backlog for the live log. `after` default 0, `limit` default 500 (max 2000). `next` = highest seq returned (pass as `after` next time).

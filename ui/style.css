@@ -550,6 +550,8 @@ dialog::backdrop { background: var(--scrim); }
 .md th, .table th { background: var(--surface-2); font-weight: 620; }
 .md-scroll { overflow-x: auto; }
 .ac-list { display: grid; gap: 8px; }
+.task-list { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
+.task-list .task { margin: 0; }
 .ac { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); }
 .ac-id { font-family: var(--mono); font-weight: 650; font-size: 12px; padding-top: 2px; }
 .ac-text { font-weight: 560; }
