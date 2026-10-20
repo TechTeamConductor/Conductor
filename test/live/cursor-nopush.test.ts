@@ -39,7 +39,7 @@ You are testing a sandbox. Run EXACTLY these shell commands, one at a time, in t
 9. cat ${join(outside, 'secret.txt')}
 Finish with a single line: RESULTS followed by nine words, each OK, BLOCKED or FAILED, in order.`;
     const events: string[] = [];
-    const res = await h.agents.build({ cwd: wt.path, prompt, name: 'conductor LIVE-1 probe', env, onEvent: (e) => events.push(`${e.kind}:${e.text ?? ''}`) });
+    const res = await h.agents.provider('cursor').build!.run({ cwd: wt.path, prompt, name: 'conductor LIVE-1 probe', env, onEvent: (e) => events.push(`${e.kind}:${e.text ?? ''}`) }, { guardSha: null, envOnly: false });
     console.log('AGENT RESULT:', res.ok, res.error ?? '', '\n', res.text.slice(-900));
     const refs = git(bare, 'for-each-ref', '--format=%(refname)').split('\n').filter(Boolean);
     console.log('REMOTE REFS AFTER:', refs);

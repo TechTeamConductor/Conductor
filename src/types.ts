@@ -206,8 +206,8 @@ export interface Run {
   needsHuman?: { reason: string; origin: NextStep; at: number };
   unverified: boolean; // no gates, or gates unparseable for regressions
   unverifiedWhy?: string;
-  noPushEnvOnly: boolean; // tracked .cursor/cli.json prevented writing the deny rule
-  cursorGuardSha?: string; // sha256 of .cursor/cli.json written for the build
+  guardEnvOnly: boolean; // the builder's own guard could not be written (e.g. a tracked .cursor/cli.json): protection is the git env alone
+  guardSha?: string; // sha256 of the provider's guard artefact written for the build
   /** Source text was never verified (e.g. imported from another system): the plan always waits for human approval. */
   untrusted?: boolean;
   planApproved: boolean;

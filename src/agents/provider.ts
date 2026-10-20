@@ -7,6 +7,8 @@ import { describeSchema, type Schema } from './json.ts';
 import { runClaude, type EmitEvent } from './claude.ts';
 import { runCursor } from './cursor.ts';
 import { runProcess } from './spawn.ts';
+import { createProviders } from './providers/registry.ts';
+import type { Provider, ProviderId } from './providers/types.ts';
 
 export interface ReadOnlyReq {
   stage: Extract<StageName, 'plan' | 'plan_review' | 'verify'>;
@@ -21,15 +23,6 @@ export interface ReadOnlyReq {
   agent?: AgentName;
   /** Multiply the Claude --max-turns cap (retry after error_max_turns). */
   maxTurnsFactor?: number;
-}
-export interface BuildReq {
-  cwd: string;
-  prompt: string;
-  name: string;
-  env: Record<string, string>; // git no-push env etc. (merged over cursorEnv)
-  onEvent: (ev: EmitEvent) => void;
-  signal?: AbortSignal;
-  secrets?: string[];
 }
 export type AgentOutcome = AgentResult & { agent: AgentName; fellBack?: boolean };
 
@@ -50,11 +43,18 @@ export class Agents {
   private clock: Clock;
   private versions = new Map<string, Promise<string>>();
   private extraEnv: Record<string, string>;
+  private providers: Record<ProviderId, Provider>;
 
   constructor(getConfig: () => Config, opts: { clock?: Clock; extraEnv?: Record<string, string> } = {}) {
     this.getConfig = getConfig;
     this.clock = opts.clock ?? systemClock;
     this.extraEnv = opts.extraEnv ?? {};
+    this.providers = createProviders({ getConfig, clock: this.clock, extraEnv: this.extraEnv });
+  }
+
+  /** A registry provider. Builds are started only by pipeline/envelope.ts (static test) — not through this class. */
+  provider(id: ProviderId): Provider {
+    return this.providers[id];
   }
 
   /** `<bin> --version`, cached per binary. */
@@ -113,20 +113,5 @@ export class Agents {
       return { ...second, agent: 'cursor', fellBack: true };
     }
     return { ...first, agent };
-  }
-
-  async build(req: BuildReq): Promise<AgentOutcome> {
-    const cfg = this.getConfig();
-    const bin = resolveBin(cfg.agents.cursor.bin);
-    if (!bin) {
-      return { ok: false, text: '', exitCode: null, errorKind: 'spawn', error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.`, agent: 'cursor' };
-    }
-    const r = await runCursor({
-      bin, cwd: req.cwd, prompt: req.prompt, stage: 'build', name: req.name, mode: 'build',
-      model: cfg.agents.cursor.model, env: cursorEnv({ ...this.extraEnv, ...req.env }),
-      idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin.build),
-      signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: this.clock,
-    });
-    return { ...r, agent: 'cursor' };
   }
 }

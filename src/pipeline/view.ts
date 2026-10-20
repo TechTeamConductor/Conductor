@@ -145,7 +145,7 @@ export function toDetail(store: RunStore, run: Run, cfg: Config, now: number): A
     bugs: run.bugs,
     timeline: run.history,
     diffStat: store.readArtifact<string | null>(run.key, 'diffstat.txt', null),
-    noPushEnvOnly: run.noPushEnvOnly,
+    noPushEnvOnly: run.guardEnvOnly, // API name kept (derived view of the generic guard field)
     unverifiedWhy: run.unverifiedWhy ?? null,
   };
 }

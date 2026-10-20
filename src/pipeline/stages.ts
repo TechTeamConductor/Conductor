@@ -16,15 +16,19 @@ import { safeWriteInside } from '../fsutil.ts';
 import * as G from '../git/gates.ts';
 import { gitOk } from '../git/exec.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
-import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
+import { postBuildChecks, runBuild } from './envelope.ts';
+import { providerLabel } from '../agents/providers/registry.ts';
+import type { ProviderId } from '../agents/providers/types.ts';
 import type { PipelineCtx } from './context.ts';
 import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
 
 const log = logger('stages');
+/** Until roles/routing (M2 commit 2) the implementation role is always Cursor — the only provider with a verified build isolation. */
+const BUILD_PROVIDER: ProviderId = 'cursor';
 const PROTECTED = '.claude/**, .cursor/**, .mcp.json, AGENTS.md, CLAUDE.md, GEMINI.md, .github/**, .husky/**, .git*, .techteam/**, .conductor/**';
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
@@ -574,13 +578,6 @@ export class Stages {
       this.note(key, 'build', `Discarded partial work from an interrupted build${refs.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
     }
 
-    const guard = await W.writeCursorGuard(run.worktree);
-    this.patch(key, (r) => {
-      r.cursorGuardSha = guard.sha256 ?? undefined;
-      r.noPushEnvOnly = guard.envOnly;
-    });
-    if (guard.envOnly) this.note(key, 'build', 'This repo has its own .cursor/cli.json — no-push protection is environment-only for this run.');
-
     const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
     const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open');
@@ -612,44 +609,57 @@ export class Stages {
     }
     this.writePromptAudit(key, `build-${run.loop}`, prompt);
     const secrets = this.c.secretsFor(run);
-    const env = await W.agentGitEnv(repo.path);
     this.patch(key, (r) => {
       r.agentRuns += 1;
     });
     if (run.agentRuns + 1 > cfg.pipeline.maxAgentRunsPerIssue) {
       return this.toNeedsHuman(key, `This card has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
     }
-    const metaSnap = await snapshotGitMeta(repo.path).catch(() => null);
-    const res = await this.c.agents.build({
-      cwd: run.worktree,
+    // Everything that makes a builder safe (eligibility, provider guard, no-push env, git-meta restore, guard check, commit guard,
+    // branch scans) is the envelope's job; the stage only records facts and routes the outcome.
+    const builder = this.c.agents.provider(BUILD_PROVIDER);
+    const out = await runBuild({
+      provider: builder,
+      repoPath: repo.path,
+      worktree: run.worktree,
+      baseSha: run.baseSha,
+      subject: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}`,
+      rev: run.rev,
       prompt,
       name: `conductor ${run.key} ${isFix ? 'fix' : 'build'} ${run.loop}`,
-      env,
       onEvent: this.emitter(key, 'build', run.loop, run.rev),
       signal: this.c.signal(key),
       secrets,
+      planPaths: plan.filesToChange.map((f) => f.path),
+      onPrepared: (prep) => {
+        this.patch(key, (r) => {
+          r.guardSha = prep.guardSha ?? undefined;
+          r.guardEnvOnly = prep.envOnly;
+        });
+        if (prep.note) this.note(key, 'build', prep.note);
+      },
+      onResult: (res) => {
+        this.finishSession(key, res);
+        this.refundIfLimit(key, res);
+        if (res.ok) this.patch(key, (r) => void (r.buildFails = 0));
+      },
     });
-    this.finishSession(key, res);
-    this.refundIfLimit(key, res);
-    if (metaSnap) {
-      // M8: a builder must not leave persistent code execution behind (git hooks, core.hooksPath, aliases, a pushurl …)
-      const tampered = await revertGitMeta(metaSnap).catch(() => []);
-      if (tampered.length) return this.toNeedsHuman(key, `The builder changed git settings/hooks (${tampered.slice(0, 4).join(', ')}). Conductor restored them; review the worktree before continuing.`, 'build');
-    }
-    if (!res.ok) return this.handleBuildFailure(key, res);
-    this.patch(key, (r) => void (r.buildFails = 0));
-
-    // layer-1 guard intact?
-    const chk = await W.checkCursorGuard(run.worktree, guard.sha256);
-    if (!chk.ok) return this.toNeedsHuman(key, `The builder tampered with the no-push guard (${chk.detail}). Review the worktree before continuing.`, 'build');
-
-    const committed = await W.commitAll({ worktree: run.worktree, message: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}\n\nBuilt by Conductor (Cursor). Plan rev ${run.rev}.`, secrets });
-    if (!committed.ok) {
-      if (committed.reason === 'nothing') {
+    switch (out.kind) {
+      case 'held':
+        return this.toNeedsHuman(key, out.reason, 'build');
+      case 'failed':
+        return this.handleBuildFailure(key, out.res, out.provider);
+      case 'hook':
+        // hook failure = feedback, never a hang
+        this.patch(key, (r) => {
+          r.commitNote = truncate(out.detail, 4000);
+        });
+        return this.nextLoopOrHuman(key, 'The repository commit hook rejected the build');
+      case 'nothing': {
         // the builder may have committed by itself: accept real work instead of calling it "no changes"
         const headNow = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
         if (headNow && headNow !== known && headNow !== run.baseSha) {
-          const selfProblem = await this.postBuildChecks(run, plan, secrets);
+          const selfProblem = await postBuildChecks(run.worktree, run.baseSha, plan.filesToChange.map((f) => f.path), secrets);
           if (selfProblem) return this.toNeedsHuman(key, selfProblem, 'build');
           this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
           this.patch(key, (r) => {
@@ -660,7 +670,7 @@ export class Stages {
           return;
         }
         if (run.loop === 1 && !isFix) {
-          const answerText = redact(String(res.text ?? ''), secrets).trim();
+          const answerText = redact(String(out.res.text ?? ''), secrets).trim();
           if (plan.filesToChange.length === 0 && answerText.length >= 40) {
             // the plan itself changed nothing (a question): the builder's reply is the deliverable — finish as "answered"
             await this.deliverAnswer(key, run.rev, answerText);
@@ -670,41 +680,15 @@ export class Stages {
         }
         return this.toNeedsHuman(key, 'The builder made no changes in response to the reported problems.', 'build');
       }
-      if (committed.reason === 'guard') {
-        return this.toNeedsHuman(key, `Conductor refused to commit: ${committed.detail}. Nothing was committed.`, 'build');
-      }
-      if (committed.reason === 'hook') {
-        // hook failure = feedback, never a hang
+      case 'committed':
         this.patch(key, (r) => {
-          r.commitNote = truncate(committed.detail, 4000);
+          r.commitSha = out.sha;
+          r.commitNote = undefined;
+          r.next = 'verify';
+          r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${out.files.length} file(s) committed (${out.sha.slice(0, 7)})` });
         });
-        return this.nextLoopOrHuman(key, 'The repository commit hook rejected the build');
-      }
-      return this.toNeedsHuman(key, `Could not commit the build: ${committed.detail}`, 'build');
+        return;
     }
-    const buildProblem = await this.postBuildChecks(run, plan, secrets);
-    if (buildProblem) return this.toNeedsHuman(key, buildProblem, 'build');
-    this.patch(key, (r) => {
-      r.commitSha = committed.sha;
-      r.commitNote = undefined;
-      r.next = 'verify';
-      r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${committed.files.length} file(s) committed (${committed.sha.slice(0, 7)})` });
-    });
-  }
-
-  /** Everything the BRANCH now contains (incl. commits the agent made itself) must pass the scope and secret checks. */
-  private async postBuildChecks(run: Run, plan: Plan, secrets: string[]): Promise<string | null> {
-    const diff = await W.diffAgainst(run.worktree, run.baseSha);
-    const paths = diff.files.flatMap((f) => [f.path, ...(f.from ? [f.from] : [])]); // a rename's SOURCE counts too (M6)
-    const violations = W.diffScopeViolations(paths, plan.filesToChange.map((f) => f.path));
-    if (violations.length) {
-      return `The builder changed protected files that the plan did not list: ${violations.slice(0, 6).join(', ')}. Review them (they are committed on the branch) before continuing.`;
-    }
-    const leaks = await scanBranchForSecrets(run.worktree, run.baseSha, secrets);
-    if (leaks.length) {
-      return `The branch contains what looks like a secret (${leaks.slice(0, 4).join('; ')}). Nothing was pushed. Remove it from the branch history before continuing.`;
-    }
-    return null;
   }
 
   private async hasUncommitted(wt: string): Promise<boolean> {
@@ -715,11 +699,12 @@ export class Stages {
     }
   }
 
-  private async handleBuildFailure(key: string, res: AgentResult): Promise<void> {
+  private async handleBuildFailure(key: string, res: AgentResult, provider: ProviderId): Promise<void> {
+    const label = providerLabel(provider);
     const run = this.run(key);
     switch (res.errorKind) {
       case 'limit':
-        return this.pauseForLimit(key, res.limit ?? { provider: 'cursor', resetsAt: null, message: res.error ?? 'limit' });
+        return this.pauseForLimit(key, res.limit ?? { provider, resetsAt: null, message: res.error ?? 'limit' });
       case 'aborted':
         return;
       case 'spawn':
@@ -731,10 +716,10 @@ export class Stages {
           r.history.push({ ts: this.c.clock.now(), text: `Build attempt failed: ${truncate(res.error ?? 'error', 120)}` });
         });
         if (tries < 1) {
-          this.note(key, 'build', `Cursor failed (${truncate(res.error ?? '', 160)}) — retrying once.`);
+          this.note(key, 'build', `${label} failed (${truncate(res.error ?? '', 160)}) — retrying once.`);
           return; // run.next stays 'build'; the job loop calls build again
         }
-        return this.toNeedsHuman(key, `Cursor failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, 'build');
+        return this.toNeedsHuman(key, `${label} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, 'build');
       }
     }
   }

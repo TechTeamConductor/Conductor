@@ -116,8 +116,8 @@ test('E7: guard bookkeeping — a normal repo records the guard hash and is NOT 
   try {
     const key = a.issue('Normal repo');
     await a.settle();
-    assert.equal(a.run(key).noPushEnvOnly, false);
-    assert.match(a.run(key).cursorGuardSha ?? '', /^[0-9a-f]{64}$/);
+    assert.equal(a.run(key).guardEnvOnly, false);
+    assert.match(a.run(key).guardSha ?? '', /^[0-9a-f]{64}$/);
   } finally {
     await a.cleanup();
   }
@@ -125,8 +125,8 @@ test('E7: guard bookkeeping — a normal repo records the guard hash and is NOT 
   try {
     const key = b.issue('Repo with its own cli.json');
     await b.settle();
-    assert.equal(b.run(key).noPushEnvOnly, true);
-    assert.equal(b.run(key).cursorGuardSha, undefined);
+    assert.equal(b.run(key).guardEnvOnly, true);
+    assert.equal(b.run(key).guardSha, undefined);
     assert.ok(b.run(key).history.length > 0);
   } finally {
     await b.cleanup();
@@ -201,11 +201,10 @@ test('E11: canceling a card while its builder is running ends it as canceled wit
 test('E12: the provider throwing (a bug, not a result) never produces a commit or a pass', async () => {
   const h = await makeHarness();
   try {
-    const real = h.agents.build.bind(h.agents);
+    const cap = h.agents.provider('cursor').build!;
     let thrown = 0;
-    h.agents.build = async (req) => {
+    cap.run = async () => {
       thrown++;
-      void real;
       throw new Error('provider crashed');
     };
     const key = h.issue('Thrown builder');
@@ -220,13 +219,14 @@ test('E12: the provider throwing (a bug, not a result) never produces a commit o
 });
 
 // Condition 1e: today the meta restore is not in a `finally`, so a provider that throws AFTER the builder planted a hook
-// leaves the hook behind. The extraction fixes this on purpose (commit 1b removes `todo` — the assertion is already the target behaviour).
-test('E13: the provider throwing AFTER the builder planted a hook/config still restores them', { todo: 'fixed by the finally{} in M2 commit 1b (Security 1e)' }, async () => {
+// leaves the hook behind. The envelope extraction fixes this on purpose; it was a `todo` in the characterization commit.
+test('E13: the provider throwing AFTER the builder planted a hook/config still restores them (Security 1e — the one intentional behaviour difference of the extraction)', async () => {
   const h = await makeHarness();
   try {
-    const real = h.agents.build.bind(h.agents);
-    h.agents.build = async (req) => {
-      await real(req);
+    const cap = h.agents.provider('cursor').build!;
+    const real = cap.run.bind(cap);
+    cap.run = async (req, prep) => {
+      await real(req, prep);
       throw new Error('provider crashed after the builder ran');
     };
     h.scenario({ cursor: { '*': { build: [{ tamperGit: true, tamperPushUrl: true }] } } });
@@ -235,6 +235,166 @@ test('E13: the provider throwing AFTER the builder planted a hook/config still r
     assert.equal(existsSync(join(h.repoDir, '.git', 'hooks', 'post-commit')), false, 'the planted hook is gone');
     assert.doesNotMatch(readFileSync(join(h.repoDir, '.git', 'config'), 'utf8'), /hookspath|alias|pushurl|evil/i);
     assert.ok(key);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ───────────── contract cases that only exist with the provider seam (M2 commit 1) ─────────────
+import { readdirSync, readFileSync as readF, statSync } from 'node:fs';
+import { relative } from 'node:path';
+import { buildEligibility, sanitizePrepEnv } from '../src/pipeline/envelope.ts';
+import { capabilitiesOf, providerLabel } from '../src/agents/providers/registry.ts';
+import { isBuildIsolationVerified } from '../src/agents/providers/verification.ts';
+import { migrateRunV2ToV3 } from '../src/schema/run-migrations.ts';
+
+type Cap = NonNullable<ReturnType<Harness['agents']['provider']>['build']>;
+const cursorCap = (h: Harness): Cap => h.agents.provider('cursor').build!;
+
+test('E14: verifyGuard THROWING fails closed — the run is held, nothing is committed', async () => {
+  const h = await makeHarness();
+  try {
+    cursorCap(h).verifyGuard = async () => {
+      throw new Error('hash check blew up');
+    };
+    const key = h.issue('Guard check throws');
+    await h.settle();
+    assert.equal(h.run(key).status, 'needs_human');
+    assert.match(fail(h, key), /guard/i);
+    assert.match(fail(h, key), /guard check itself failed/);
+    assert.equal(h.run(key).commitSha, undefined);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('E15: prepare THROWING (or rejecting) fails closed with ZERO builder spawns', async () => {
+  for (const mode of ['throw', 'reject'] as const) {
+    const h = await makeHarness();
+    try {
+      cursorCap(h).prepare = mode === 'throw' ? () => { throw new Error('cannot write the guard'); } : () => Promise.reject(new Error('cannot write the guard'));
+      const key = h.issue('Prepare fails');
+      await h.settle();
+      assert.equal(h.run(key).status, 'needs_human', mode);
+      assert.match(fail(h, key), /guard could not be established/, mode);
+      assert.equal(cursorCalls(h).length, 0, `${mode}: the builder was never started`);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test('E16: a provider that declares a guard but lacks prepare OR verifyGuard is refused (zero spawns)', async () => {
+  for (const missing of ['prepare', 'verifyGuard'] as const) {
+    const h = await makeHarness();
+    try {
+      (cursorCap(h) as any)[missing] = undefined;
+      const key = h.issue('Half a guard');
+      await h.settle();
+      assert.equal(h.run(key).status, 'needs_human', missing);
+      assert.match(fail(h, key), /does not provide both prepare and verify/, missing);
+      assert.equal(cursorCalls(h).length, 0, missing);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test('E17: a provider WITHOUT a guard of its own still builds inside the envelope; the run records env-only protection', async () => {
+  const h = await makeHarness();
+  try {
+    const cap = cursorCap(h);
+    cap.guard = false;
+    cap.prepare = undefined;
+    cap.verifyGuard = undefined;
+    const key = h.issue('No provider guard');
+    await h.settle();
+    assert.equal(h.run(key).guardEnvOnly, true);
+    assert.equal(h.run(key).guardSha, undefined);
+    assert.ok(h.run(key).commitSha, 'the build still happened and was committed by Conductor');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('E18: `prepare` cannot override the git no-push env or HOME/PATH/CODEX_HOME — and harmless keys pass through', async () => {
+  const h = await makeHarness();
+  try {
+    const cap = cursorCap(h);
+    const real = cap.prepare!.bind(cap);
+    cap.prepare = async (ctx) => ({ ...(await real(ctx)), env: { GIT_CONFIG_GLOBAL: '/tmp/evil-gitconfig', GIT_ASKPASS: '/tmp/evil', CURSOR_PROBE_OK: '1', HOME: '/tmp/evil-home', PATH: '/tmp/evil-bin', CODEX_HOME: '/tmp/evil-codex' } });
+    const key = h.issue('Env override');
+    await h.settle();
+    const call = cursorCalls(h)[0];
+    assert.ok(call);
+    assert.equal(call.env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(call.env.GIT_ASKPASS, '/usr/bin/false');
+    assert.equal(call.env.CURSOR_PROBE_OK, '1', 'a harmless key from prepare is honoured');
+    assert.ok(key);
+  } finally {
+    await h.cleanup();
+  }
+  assert.deepEqual(sanitizePrepEnv({ GIT_DIR: 'x', git_work_tree: 'x', HOME: 'x', Path: 'x', CODEX_HOME: 'x', CODEX_API_KEY: 'x', XDG_CONFIG_HOME: 'x', LD_PRELOAD: 'x', DYLD_INSERT_LIBRARIES: 'x', NODE_OPTIONS: 'x', FINE: 'ok' }), { FINE: 'ok' });
+});
+
+test('E19: eligibility is derived and re-asserted inside the envelope — no build function, or unverified isolation ⇒ held with zero spawns', async () => {
+  // derived from code, never from config
+  assert.equal(capabilitiesOf({ id: 'claude', label: 'Claude' }).build, false);
+  assert.equal(isBuildIsolationVerified('claude'), false);
+  assert.equal(isBuildIsolationVerified('cursor'), true);
+  assert.equal(buildEligibility({ id: 'claude', label: 'Claude' }).ok, false);
+  assert.equal(buildEligibility({ id: 'claude', label: 'Claude', build: { guard: false, run: async () => ({ ok: true, text: '', exitCode: 0 }) } }).ok, false, 'a build function alone is not enough: isolation must be verified');
+  const h = await makeHarness();
+  try {
+    const cap = cursorCap(h);
+    h.agents.provider('cursor').build = undefined; // "the build capability disappears"
+    const key = h.issue('Ineligible');
+    await h.settle();
+    assert.equal(h.run(key).status, 'needs_human');
+    assert.match(fail(h, key), /no build capability/);
+    assert.equal(cursorCalls(h).length, 0);
+    assert.ok(cap);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('E20: static — only the Cursor adapter starts a Cursor run, and only the envelope calls a provider\'s build.run', () => {
+  const ROOT = join(import.meta.dirname, '..', 'src');
+  const files: string[] = [];
+  const walk = (d: string) => {
+    for (const n of readdirSync(d)) {
+      const p = join(d, n);
+      if (statSync(p).isDirectory()) walk(p);
+      else if (/\.ts$/.test(n)) files.push(p);
+    }
+  };
+  walk(ROOT);
+  const runCursorUsers = files.filter((f) => /\brunCursor\(/.test(readF(f, 'utf8'))).map((f) => relative(ROOT, f)).sort();
+  assert.deepEqual(runCursorUsers, ['agents/cursor.ts', 'agents/provider.ts', 'agents/providers/cursor.ts', 'doctor.ts'], 'runCursor( may appear only in its definition, the two read-only (ask-mode) callers and the Cursor adapter');
+  for (const f of ['agents/provider.ts', 'doctor.ts']) assert.doesNotMatch(readF(join(ROOT, f), 'utf8'), /mode:\s*'build'/, `${f} must never start a Cursor build`);
+  const buildRunUsers = files.filter((f) => /\bb\.run\(|\.build(\?|!)?\.run\(/.test(readF(f, 'utf8'))).map((f) => relative(ROOT, f)).sort();
+  assert.deepEqual(buildRunUsers, ['pipeline/envelope.ts'], 'build.run is called by the envelope only');
+  assert.equal(providerLabel('cursor'), 'Cursor');
+  assert.equal(providerLabel('nope'), 'The agent');
+});
+
+test('E21: run.json v2 → v3 carries cursorGuardSha/noPushEnvOnly; with neither, guardEnvOnly defaults to TRUE (fail-safe)', () => {
+  assert.deepEqual(migrateRunV2ToV3({ key: 'A-1', schemaVersion: 2, cursorGuardSha: 'abc', noPushEnvOnly: false }), { key: 'A-1', schemaVersion: 3, guardSha: 'abc', guardEnvOnly: false });
+  assert.deepEqual(migrateRunV2ToV3({ key: 'A-1', schemaVersion: 2, noPushEnvOnly: true }), { key: 'A-1', schemaVersion: 3, guardEnvOnly: true });
+  assert.deepEqual(migrateRunV2ToV3({ key: 'A-1', schemaVersion: 2 }), { key: 'A-1', schemaVersion: 3, guardEnvOnly: true }, 'neither field ⇒ assume env-only');
+  assert.deepEqual(migrateRunV2ToV3({ key: 'A-1', schemaVersion: 3, guardSha: 'new', guardEnvOnly: false }), { key: 'A-1', schemaVersion: 3, guardSha: 'new', guardEnvOnly: false }, 'already-new fields are never overwritten');
+});
+
+test('E22: the API keeps `noPushEnvOnly` as a derived view of guardEnvOnly', async () => {
+  const h = await makeHarness({ repoFiles: { '.cursor/cli.json': '{"permissions":{"allow":[],"deny":[]}}\n' } });
+  try {
+    const key = h.issue('Derived view');
+    await h.settle();
+    const { toDetail } = await import('../src/pipeline/view.ts');
+    const d = toDetail(h.store, h.run(key), h.cfg, Date.now());
+    assert.equal(d.noPushEnvOnly, true);
+    assert.equal((d as any).guardEnvOnly, undefined, 'the generic name is not leaked into the API yet');
   } finally {
     await h.cleanup();
   }

@@ -28,3 +28,17 @@ export function migrateRunV1ToV2(raw: any): any {
     schemaVersion: 2,
   };
 }
+
+/**
+ * run.json v2 → v3 (M2). The builder guard fields stop being Cursor-named:
+ *   cursorGuardSha → guardSha, noPushEnvOnly → guardEnvOnly.
+ * Old values are carried verbatim. When NEITHER field exists (a hand-edited or damaged record) `guardEnvOnly` defaults to TRUE —
+ * the fail-safe reading: "assume only the git env protected this run".
+ */
+export function migrateRunV2ToV3(raw: any): any {
+  const { cursorGuardSha, noPushEnvOnly, ...rest } = raw ?? {};
+  const out: any = { ...rest, schemaVersion: 3 };
+  if (rest.guardSha === undefined && typeof cursorGuardSha === 'string') out.guardSha = cursorGuardSha;
+  if (typeof rest.guardEnvOnly !== 'boolean') out.guardEnvOnly = typeof noPushEnvOnly === 'boolean' ? noPushEnvOnly : true;
+  return out;
+}

@@ -14,11 +14,11 @@ import { paths } from './paths.ts';
 import { atomicWriteFile, deepClone } from './util.ts';
 import { NewerVersionError } from './schema/errors.ts';
 import { assertNotNewer, quarantine, type VersionSpec } from './schema/version.ts';
-import { migrateRunV1ToV2 } from './schema/run-migrations.ts';
+import { migrateRunV1ToV2, migrateRunV2ToV3 } from './schema/run-migrations.ts';
 import { logger } from './log.ts';
 
 /** Version of the run.json shape this build reads and writes. (Shape-changing migrations are registered with the code that consumes them — M1b.) */
-export const RUN_SCHEMA_VERSION = 2;
+export const RUN_SCHEMA_VERSION = 3;
 const RUN_SPEC: VersionSpec = { kind: 'run record', field: 'schemaVersion', current: RUN_SCHEMA_VERSION, assumeWhenMissing: 1 };
 const log = logger('store');
 
@@ -126,7 +126,10 @@ export class RunStore {
     }
     const v = typeof raw.schemaVersion === 'number' ? raw.schemaVersion : 1;
     if (v > RUN_SCHEMA_VERSION) throw new NewerVersionError('run record', f, v, RUN_SCHEMA_VERSION);
-    return (v < 2 ? migrateRunV1ToV2(raw) : raw) as Run;
+    let m = raw;
+    if (v < 2) m = migrateRunV1ToV2(m);
+    if (v < 3) m = migrateRunV2ToV3(m);
+    return m as Run;
   }
 
   has(key: string): boolean {
@@ -299,7 +302,7 @@ export function newRun(seed: Pick<Run, 'key' | 'itemId' | 'title' | 'description
     createdAt: now,
     updatedAt: now,
     unverified: false,
-    noPushEnvOnly: false,
+    guardEnvOnly: false,
     planApproved: false,
     planReviewDone: false,
     planReviewRounds: 0,
