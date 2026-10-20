@@ -70,6 +70,7 @@ export function buildCodexArgs(o: CodexArgvOpts): string[] {
 const own = (o: unknown, k: string): unknown => (o && typeof o === 'object' && Object.hasOwn(o as object, k) ? (o as Record<string, unknown>)[k] : undefined);
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 const MAX_ERR = 500;
+const MAX_ERRORS = 5;
 
 export interface CodexFold {
   sessionId?: string;
@@ -143,13 +144,13 @@ export function normalizeCodexEvent(obj: unknown, ctx: { stage: StageName; secre
     }
     case 'turn.failed': {
       const m = str(own(own(obj, 'error'), 'message')) ?? str(own(obj, 'message')) ?? 'the turn failed';
-      fold.errors.push(truncate(m, MAX_ERR));
+      if (fold.errors.length < MAX_ERRORS) fold.errors.push(truncate(m, MAX_ERR));
       out.push({ ...base, kind: 'error', text: R(m, 300), sessionId: fold.sessionId });
       break;
     }
     case 'error': {
       const m = str(own(obj, 'message')) ?? 'error';
-      fold.errors.push(truncate(m, MAX_ERR));
+      if (fold.errors.length < MAX_ERRORS) fold.errors.push(truncate(m, MAX_ERR));
       out.push({ ...base, kind: 'error', text: R(m, 300), sessionId: fold.sessionId });
       break;
     }
@@ -233,7 +234,7 @@ export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
   const secrets = call.secrets ?? [];
   return withCodexHomeLock(async () => {
     const home = codexHomePath();
-    const check = prepareCodexHome(home);
+    const check = prepareCodexHome(home, { purge: true });
     if (!check.ok) return { ok: false, text: '', exitCode: null, errorKind: 'isolation', error: `Codex was not started: ${check.problem}.` } as AgentResult;
     const scratchHome = makeScratchHome();
     const tmp = scratchTmp();
@@ -318,18 +319,18 @@ export async function detectCodex(bin: string, extraEnv: Record<string, string> 
 export async function codexAuth(bin: string, extraEnv: Record<string, string> = {}): Promise<'ok' | 'not-logged-in' | 'unknown'> {
   const path = resolveBin(bin);
   if (!path) return 'unknown';
-  return withCodexHomeLock(async () => {
-    const check = prepareCodexHome();
-    if (!check.ok) return 'unknown';
-    const home = makeScratchHome();
-    try {
-      const r = await runProcess({ bin: path, args: ['login', 'status'], cwd: home.dir, env: codexEnv({ codexHome: codexHomePath(), home: home.dir }, extraEnv), idleMs: 20_000, hardMs: 20_000 });
-      if (r.spawnError || r.timedOut) return 'unknown';
-      return r.code === 0 ? 'ok' : r.code === 1 ? 'not-logged-in' : 'unknown';
-    } finally {
-      home.dispose();
-    }
-  });
+  // `login status` only READS the credential: it must NOT wait for the per-home lock (a plan stage can hold it for 20 minutes, which hung
+  // the dashboard's health refresh — security review F-2). It also never purges (a run may be using the home).
+  const check = prepareCodexHome(undefined, { purge: false });
+  if (!check.ok) return 'unknown';
+  const home = makeScratchHome();
+  try {
+    const r = await runProcess({ bin: path, args: ['login', 'status'], cwd: home.dir, env: codexEnv({ codexHome: codexHomePath(), home: home.dir }, extraEnv), idleMs: 20_000, hardMs: 20_000 });
+    if (r.spawnError || r.timedOut) return 'unknown';
+    return r.code === 0 ? 'ok' : r.code === 1 ? 'not-logged-in' : 'unknown';
+  } finally {
+    home.dispose();
+  }
 }
 
 const minutes = (n: number) => n * 60_000;

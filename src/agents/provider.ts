@@ -31,7 +31,7 @@ export interface ReadOnlyReq {
   /** Called when a candidate hits a usage limit — even when the chain advances — so the engine records the pause. */
   onLimit?: (info: LimitInfo) => void;
 }
-export type AgentOutcome = AgentResult & { agent: ProviderId; fellBack?: boolean };
+export type AgentOutcome = AgentResult & { agent: ProviderId; fellBack?: boolean; /** the chain head this stage should have run on, when `fellBack` */ from?: ProviderId };
 
 /** Appended to read-only prompts: works for every provider, and is the Claude fallback when structured_output is absent. */
 export function jsonInstruction(schema: Schema): string {
@@ -112,7 +112,7 @@ export class Agents {
       }
       const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor });
       const last = i === r.candidates.length - 1;
-      if (res.ok || last || !advances(res.errorKind)) return { ...res, agent: cand.id, fellBack: i > 0 || cand.id !== head };
+      if (res.ok || last || !advances(res.errorKind)) return { ...res, agent: cand.id, fellBack: i > 0 || cand.id !== head, from: i > 0 || cand.id !== head ? head : undefined };
       if (res.errorKind === 'limit') req.onLimit?.(res.limit ?? { provider: cand.id, resetsAt: null, message: res.error ?? 'limit' });
       const next = this.providers[r.candidates[i + 1]!.id];
       const what = res.errorKind === 'limit' ? 'usage limit reached' : res.errorKind === 'auth' ? 'is not signed in' : 'could not start';

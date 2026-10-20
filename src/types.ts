@@ -344,7 +344,7 @@ export interface ApiProvider {
   /** What backs the build isolation (display only): the code baseline or a re-verification record, and whether it matches the installed version. */
   buildVerification?: { source: 'baseline' | 'live-suite'; verifiedOn: string; grandfathered: boolean; current: boolean | null };
   /** Result of the last Codex isolation check, bound to the installed version (display only). */
-  isolationCheck?: { verdict: 'pass' | 'blocked' | 'inconclusive'; at: number; current: boolean };
+  isolationCheck?: { verdict: 'pass' | 'blocked' | 'inconclusive'; at: number; current: boolean; /** false until the canary's matchers have been validated against a real Codex transcript: a pass is then shown but does not lift the tier */ trusted: boolean };
   /** The provider appears in at least one role chain. */
   inUse: boolean;
   /** Paused by a usage limit until this time (epoch ms). */

@@ -21,7 +21,7 @@ export interface DemoHandle {
 const gitEnv = { GIT_AUTHOR_NAME: 'Demo', GIT_AUTHOR_EMAIL: 'demo@example.com', GIT_COMMITTER_NAME: 'Demo', GIT_COMMITTER_EMAIL: 'demo@example.com' };
 
 /** Full pipeline on scripted agents + a throw-away board: no keys, no quota, nothing leaves the machine. */
-export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?: number } = {}): Promise<DemoHandle> {
+export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?: number; canary?: () => Promise<import('./agents/providers/canary.ts').CanaryReport> } = {}): Promise<DemoHandle> {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'conductor-demo-')));
   process.env.CONDUCTOR_HOME = join(home, '.conductor');
   process.env.CONDUCTOR_NO_KEYCHAIN = '1';
@@ -96,7 +96,7 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
       codex: { found: false, ok: false, state: 'missing', detail: 'Codex is not part of the demo.' },
     }),
     probe: async (t: 'claude' | 'cursor') => ({ ok: true, detail: `${t} (demo) answered`, durationMs: 120 }),
-    canary: async () => ({ verdict: 'inconclusive' as const, items: [{ id: 'setup', outcome: 'inconclusive' as const, detail: 'Codex is not part of the demo.' }], binding: null, ranAt: Date.now() }),
+    canary: opts.canary ?? (async () => ({ verdict: 'inconclusive' as const, items: [{ id: 'setup', outcome: 'inconclusive' as const, detail: 'Codex is not part of the demo.' }], binding: null, ranAt: Date.now() })),
     openExec: async () => undefined,
     notify: () => undefined,
   });

@@ -125,7 +125,8 @@ async function canaryMode() {
     const kind = /^echo rule-probe/.test(command) ? 'rules' : /conductor-write-probe/.test(command) ? 'write' : /127\.0\.0\.1/.test(command) ? 'network' : /^env/.test(command) ? 'env' : /^cat /.test(command) ? 'cred' : 'plain';
     if (skip.has(kind)) continue;
     const id = `c${++n}`;
-    out({ type: 'item.started', item: { id, type: 'command_execution', command, status: 'in_progress' } });
+    const shown = cfg.wrapCommands ? `/bin/zsh -lc ${JSON.stringify(command)}` : command;
+    out({ type: 'item.started', item: { id, type: 'command_execution', command: shown, status: 'in_progress' } });
     if (first) { for (const h of hooks) spawnSync('sh', ['-c', h]); first = false; }
     let output = '';
     let code = 0;
@@ -139,13 +140,13 @@ async function canaryMode() {
     } else if (kind === 'network') {
       const port = Number(/127\.0\.0\.1:(\d+)/.exec(command)[1]);
       if (cfg.networkReaches) await new Promise((r) => { const sock = net.connect(port, '127.0.0.1', () => { sock.end('GET / HTTP/1.0\r\n\r\n'); r(); }); sock.on('error', r); sock.on('close', r); });
-      else code = 7;
+      else code = cfg.networkExit ?? 7;
     } else if (kind === 'env') {
       output = Object.entries(process.env).filter(([k]) => cfg.leakEnv || CORE.test(k)).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
     } else if (kind === 'cred') {
       try { output = readFileSync(command.slice(4).trim(), 'utf8'); } catch { code = 1; output = 'No such file\n'; }
     } else output = 'hello\n';
-    out({ type: 'item.completed', item: { id, type: 'command_execution', command, aggregated_output: output, exit_code: code, status: code === 0 ? 'completed' : 'failed' } });
+    out({ type: 'item.completed', item: { id, type: 'command_execution', command: shown, aggregated_output: output, exit_code: code, status: code === 0 ? 'completed' : 'failed' } });
   }
   out({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'DONE' } });
   out({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2 } });

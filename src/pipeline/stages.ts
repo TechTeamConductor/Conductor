@@ -260,6 +260,12 @@ export class Stages {
       });
       this.finishSession(key, res);
       this.refundIfLimit(key, res);
+      if (res.fellBack && res.from && res.from !== res.agent) {
+        // a visible, durable trace on the card when a read-only step ran on a different (possibly weaker-isolation) provider than configured
+        const tier = this.c.routeStates()[res.agent]?.tier;
+        const note = tier === 'partial' ? " It ran in ask mode, which has weaker isolation than Claude's fail-closed tool lock-down." : tier === 'unverified' ? " Its isolation has not been verified on this machine." : '';
+        await this.c.effects.comment(key, `fallback:${stage}:${run.loop}:${res.agent}`, `🤖 **${providerLabel(res.agent)} did the ${stage.replace('_', ' ')} step instead of ${providerLabel(res.from)}.**${note}`);
+      }
       if (res.quota) this.c.recordQuota(res.agent, res.quota);
       this.writePromptAudit(key, `${stage}-${run.loop}-${attempt}`, prompt + corrective);
       if (res.ok) {

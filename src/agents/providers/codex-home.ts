@@ -35,7 +35,10 @@ export interface HomeCheck {
 const uid = (): number | null => (typeof process.getuid === 'function' ? process.getuid() : null);
 
 /** Create (0700) / verify the private home and rewrite its config. Never follows a symlink; never trusts an unexpected entry. */
-export function prepareCodexHome(home: string = codexHomePath()): HomeCheck {
+/** Regenerable entries Codex recreates itself; they can only carry stale or planted text, so they are removed before each run (under the home lock). */
+const REGENERABLE = ['models_cache.json', 'shell_snapshots', 'cache', 'tmp', '.tmp'];
+
+export function prepareCodexHome(home: string = codexHomePath(), opts: { purge?: boolean } = {}): HomeCheck {
   try {
     const parent = join(home, '..');
     mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -47,6 +50,7 @@ export function prepareCodexHome(home: string = codexHomePath()): HomeCheck {
     if ((st.mode & 0o077) !== 0) chmodSync(home, 0o700);
     if ((lstatSync(home).mode & 0o077) !== 0) return { ok: false, problem: `${home} is accessible to other users and could not be tightened` };
 
+    if (opts.purge) for (const n of REGENERABLE) rmSync(join(home, n), { recursive: true, force: true });
     const names = readdirSync(home);
     const stray = names.filter((n) => !CODEX_HOME_ALLOWED.has(n) && !CODEX_HOME_EMPTY_ONLY.has(n));
     if (stray.length) return { ok: false, problem: `the private Codex home holds entries Conductor did not put there (${stray.slice(0, 5).map((n) => JSON.stringify(n.slice(0, 40))).join(', ')}); move them out of ${home} to continue` };

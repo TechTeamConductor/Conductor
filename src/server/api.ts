@@ -13,7 +13,7 @@ import { PROVIDER_IDS, isProviderId, providerLabel } from '../agents/providers/r
 import { COMPLEXITIES, ROLES, ROLE_NEEDS, isComplexity, isRole, type RoleConfig, type Roles } from '../agents/roles.ts';
 import { validatePairing, type ProviderState } from '../agents/routing.ts';
 import { redact } from '../redact.ts';
-import { addRecord, buildVerificationInfo, loadRecords } from '../agents/providers/verification.ts';
+import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toSummary } from '../pipeline/view.ts';
 import { detectGates } from '../git/gates.ts';
@@ -220,7 +220,7 @@ export class Api {
     if (id !== 'codex') return undefined;
     const last = loadRecords(id).filter((r) => r.kind === 'readOnly' && r.source === 'canary').pop();
     if (!last) return undefined;
-    return { verdict: last.verdict, at: last.at, current: last.verdict === 'blocked' || tier === 'partial' };
+    return { verdict: last.verdict, at: last.at, current: last.verdict === 'blocked' || tier === 'partial', trusted: canaryValidated() };
   }
 
   roles(): ApiRoles {
@@ -449,17 +449,16 @@ export class Api {
       if (Date.now() - last < CANARY_COOLDOWN_MS) throw new ApiFail(429, 'cooldown', 'That check just ran. Wait a minute before running it again.');
       if (this.d.engine.status().running > 0) throw new ApiFail(409, 'busy', 'Stages are running; run this check when the board is idle.');
       this.canaryBusy.add(id);
+      this.canaryLast.set(id, Date.now()); // the cool-down starts BEFORE the run: a canary that throws cannot be re-triggered at once
       try {
         if (id === 'codex') {
           const rep = await this.d.canary!('codex');
-          this.canaryLast.set(id, Date.now());
           if (rep.binding) addRecord({ provider: 'codex', kind: 'readOnly', verdict: rep.verdict, source: 'canary', binding: rep.binding, at: rep.ranAt, items: rep.items.map((i) => ({ id: i.id, outcome: i.outcome })) });
           this.healthCache = null;
           this.d.engine.invalidate();
           return { json: { ok: rep.verdict === 'pass', level, verdict: rep.verdict, items: rep.items.map((i) => ({ id: i.id, outcome: i.outcome, detail: truncate(redact(i.detail, []), 300) })) } };
         }
         const r = await this.d.probe(id as 'claude' | 'cursor');
-        this.canaryLast.set(id, Date.now());
         return { json: { ok: r.ok, level, detail: truncate(redact(r.detail, []), 300), durationMs: r.durationMs } };
       } finally {
         this.canaryBusy.delete(id);

@@ -197,3 +197,30 @@ test('POST /api/providers/:id/test: the id is checked against the registry befor
   assert.equal(again.status, 429, 'cool-down');
   assert.equal(again.json.error.code, 'cooldown');
 });
+
+test('F-6: the canary cool-down starts BEFORE the run — a canary that throws cannot be re-triggered at once', async () => {
+  const d2 = await startDemo({ port: 0, pollMs: 150, delayMs: 15, canary: async () => { throw new Error('canary blew up'); } });
+  try {
+    const p2 = d2.rt.server.listeningPort;
+    const u = new URL(d2.rt.server.loginUrl());
+    const r0 = await new Promise<http.IncomingMessage>((res, rej) => http.get({ host: '127.0.0.1', port: p2, path: u.pathname + u.search }, res).on('error', rej));
+    const ck = String(r0.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
+    const call = (path: string, method: string, body?: unknown, hdr: Record<string, string> = {}) => new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: p2, path, method, headers: { cookie: ck, ...hdr } }, (res) => { let t = ''; res.on('data', (c) => (t += c)); res.on('end', () => resolve({ status: res.statusCode ?? 0, text: t })); });
+      req.on('error', reject);
+      if (body !== undefined) req.write(JSON.stringify(body));
+      req.end();
+    });
+    const st = JSON.parse((await call('/api/state', 'GET')).text);
+    const h = { 'content-type': 'application/json', 'x-conductor-csrf': st.csrf, 'sec-fetch-site': 'same-origin' };
+    const t0 = Date.now();
+    while (JSON.parse((await call('/api/state', 'GET')).text).engine.running > 0 && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 150));
+    const first = await call('/api/providers/codex/test', 'POST', { level: 'canary', confirm: true }, h);
+    assert.ok(first.status >= 500, `the throwing canary surfaced as an error (${first.status})`);
+    const second = await call('/api/providers/codex/test', 'POST', { level: 'canary', confirm: true }, h);
+    assert.equal(second.status, 429, 'cool-down applies although the first run threw');
+  } finally {
+    await d2.close();
+    rmSync(d2.home, { recursive: true, force: true });
+  }
+});

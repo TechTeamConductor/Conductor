@@ -11,7 +11,10 @@ const REGISTERED = new WeakSet<object>();
 export const isRegisteredProvider = (p: unknown): p is Provider => !!p && typeof p === 'object' && REGISTERED.has(p);
 
 function seal(p: Provider): Provider {
-  if (p.build) Object.freeze(p.build);
+  if (p.build) {
+    Object.freeze(p.build.envAllow); // an adapter's env allow-list is frozen too: `envAllow.push('GH_*')` must not work (security review F-3)
+    Object.freeze(p.build);
+  }
   Object.freeze(p);
   REGISTERED.add(p);
   return p;

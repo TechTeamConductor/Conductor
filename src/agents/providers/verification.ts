@@ -109,13 +109,26 @@ export function addRecord(rec: VerificationRecord): void {
  *  - a `pass` counts ONLY while the install still matches what was tested (CLI version, binary hash when known, argv, private config, canary version);
  *    when the current install is unknown, a pass does not count.
  */
+/**
+ * The canary's matchers (which command the agent ran, what exit codes mean, how a real CLI words events) were written from documentation and tested
+ * against a scripted stand-in. Until a transcript captured from a REAL Codex has been used to validate them, a PASS is recorded and shown but does
+ * NOT lift the tier (Security M2 review F-1): Codex stays `unverified`. Flip this only together with that evidence.
+ */
+let canaryValidatedAgainstRealCli = false;
+export const canaryValidated = (): boolean => canaryValidatedAgainstRealCli;
+/** TEST SEAM (throws outside a test run). */
+export function _setCanaryValidatedForTests(v: boolean): void {
+  if (!process.env.NODE_TEST_CONTEXT) throw new Error('only inside a test run');
+  canaryValidatedAgainstRealCli = v;
+}
+
 export function effectiveReadOnlyTier(id: ProviderId, current: VerificationBinding | null): ReadOnlyTier {
   const base = readOnlyTier(id);
   const recs = loadRecords(id).filter((r) => r.kind === 'readOnly' && r.source === 'canary' && r.verdict !== 'inconclusive');
   const last = recs[recs.length - 1];
   if (!last) return base;
   if (last.verdict === 'blocked') return 'blocked';
-  if (!current) return base;
+  if (!current || !canaryValidatedAgainstRealCli) return base;
   const b = last.binding;
   const same = b.cliVersion === current.cliVersion && (b.binSha256 === null || current.binSha256 === null || b.binSha256 === current.binSha256) && b.argvDigest === current.argvDigest && b.privateConfigSha === current.privateConfigSha && b.canaryVersion === current.canaryVersion;
   return same && (base === 'unverified' || base === 'partial') ? 'partial' : base;
