@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
-  AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, NextStep, Plan,
+  AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, ItemRun, LimitInfo, NextStep, Plan,
   PlanReview, RepoConfig, Run, SessionRec, StageName, Verdict,
 } from '../types.ts';
 import type { EmitEvent } from '../agents/claude.ts';
@@ -19,7 +19,7 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
-import { validateTaskGraph } from './graph.ts';
+import { buildGraph, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
@@ -33,6 +33,26 @@ const PROTECTED = '.claude/**, .cursor/**, .codex/**, .agents/**, .mcp.json, AGE
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
 type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop' };
+
+/** More tasks than this in one plan always waits for a human (even with automatic approval). */
+const GRAPH_BIG_ITEMS = 8;
+
+/** The text of a subtask card: what the task is, never anything a builder would take as an instruction (the card is for people). */
+function describeItem(it: ItemRun): string {
+  const code = (s: string) => `\`${s.replace(/`/g, "'")}\``;
+  const lines = [
+    `**${it.id}** · ${it.role}`,
+    '',
+    sanitizeLine(it.objective, 1_200),
+    '',
+    it.dependsOn.length ? `**Depends on:** ${it.dependsOn.join(', ')}` : '',
+    it.files.length ? `**Files:** ${it.files.slice(0, 12).map((f) => code(sanitizeLine(f, 120))).join(', ')}${it.files.length > 12 ? ` … (+${it.files.length - 12})` : ''}` : '',
+    it.criteria.length ? `**Acceptance criteria:** ${it.criteria.join(', ')}` : '',
+    '',
+    '_This card is managed by Conductor from the plan — it follows the work; moving it by hand has no effect. Use the parent card to retry or stop._',
+  ];
+  return lines.filter((l, i) => l !== '' || lines[i - 1] !== '').join('\n').trim();
+}
 
 export function normalizeTitle(s: string): string {
   return s.toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim();
@@ -433,7 +453,7 @@ export class Stages {
       if (!errs.length && p.deliverable === 'answer' && !String(p.answer ?? '').trim()) errs.push('$.answer: required when deliverable is "answer"');
       if (!errs.length && p.deliverable !== 'answer' && !(p.filesToChange?.length > 0)) errs.push('$.deliverable: this plan changes no files — if the task is a question or analysis, set "deliverable" to "answer" and put the full answer in "answer"; otherwise list the files to change');
       if (!errs.length && p.deliverable !== 'answer' && !(p.acceptanceCriteria?.length > 0)) errs.push('$.acceptanceCriteria: needs at least 1 item for a code change');
-      if (!errs.length) errs.push(...validateTaskGraph(p)); // a malformed decomposition goes back to the planner once (corrective re-ask), then to a human
+      if (!errs.length) errs.push(...validateTaskGraph(p, { maxItems: this.c.cfg().pipeline.maxItems })); // a malformed decomposition goes back to the planner once (corrective re-ask), then to a human
       return errs;
     });
     if (called.kind === 'stop') return;
@@ -441,6 +461,12 @@ export class Stages {
     const secretsForRun = this.c.secretsFor(run);
     plan.summary = redact(plan.summary, secretsForRun);
     if (plan.answer) plan.answer = redact(plan.answer, secretsForRun);
+    for (const it of itemsOf(plan)) {
+      // agent-derived strings of the decomposition are redacted once, here, before they reach any artifact, card or prompt
+      it.title = redact(String(it.title ?? ''), secretsForRun);
+      it.objective = redact(String(it.objective ?? ''), secretsForRun);
+      if (Array.isArray(it.verification)) it.verification = it.verification.map((v) => redact(String(v), secretsForRun));
+    }
     this.c.store.writeArtifact(key, `plan-${run.rev}.json`, plan);
     const md = redact(planToMarkdown(plan), secretsForRun);
     this.c.store.writeArtifact(key, `plan-${run.rev}.md`, md);
@@ -530,16 +556,21 @@ export class Stages {
     const cfg = this.c.cfg();
     const approved = this.c.persistent.load().repos[run.repo]?.approvedPlans ?? 0;
     const touchesProtected = W.diffScopeViolations(plan.filesToChange.map((f) => f.path), []).length > 0;
-    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected || run.untrusted === true;
+    // a big decomposition is a big change of plan: more than 8 items always waits for a person (the union of the items' files is the plan's
+    // file list, so the protected-path rule above already covers every item)
+    const bigGraph = itemsOf(plan).length > GRAPH_BIG_ITEMS;
+    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected || run.untrusted === true || bigGraph;
     if (!required) {
       this.patch(key, (r) => {
         r.planApproved = true;
         r.approvedBy = 'auto';
         r.next = 'build';
+        this.attachGraph(r, plan);
       });
+      await this.c.effects.flush(key);
       return;
     }
-    const why = touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : run.untrusted ? ' (the task text came from an unverified source)' : approved === 0 ? ' (first plan for this repo)' : '';
+    const why = bigGraph ? ` (${itemsOf(plan).length} tasks — more than ${GRAPH_BIG_ITEMS})` : touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : run.untrusted ? ' (the task text came from an unverified source)' : approved === 0 ? ' (first plan for this repo)' : '';
     const secrets = this.c.secretsFor(run);
     this.patch(key, (r) => {
       r.status = 'awaiting_approval';
@@ -1021,13 +1052,37 @@ export class Stages {
     const st = this.c.persistent.load();
     st.repos[run.repo] = { approvedPlans: (st.repos[run.repo]?.approvedPlans ?? 0) + 1 };
     this.c.persistent.save(st);
+    const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
     this.patch(key, (r) => {
       r.planApproved = true;
       r.approvedBy = by;
       r.status = 'queued';
       r.next = 'build';
       r.history.push({ ts: this.c.clock.now(), text: `Plan approved (${by})` });
+      this.attachGraph(r, plan);
     });
+  }
+
+  /**
+   * Turn an approved plan's decomposition into the run's task graph and queue one board card per item (plan M3 §2b). Called INSIDE the
+   * `store.update` that records the approval, so a crash can never leave an approved plan with half a graph: the graph and its pending card
+   * effects are written together, and the card effects (keyed by plan revision + item) are idempotent. A plan without a real graph
+   * (fewer than 2 items) leaves the run exactly as the single-task pipeline expects it.
+   */
+  private attachGraph(r: Run, plan: Plan | null): void {
+    if (!plan || !isGraphPlan(plan)) {
+      r.graph = undefined;
+      return;
+    }
+    if (r.graph && r.graph.rev === r.rev) return; // already attached for this revision
+    const graph = buildGraph(plan, r.rev, this.c.clock.now(), r.loopBudget);
+    r.graph = graph;
+    const secrets = this.c.secretsFor(r);
+    for (const id of topoOrder(graph.items) ?? []) {
+      const it = graph.items.find((x) => x.id === id)!;
+      Effects.enqueue(r, `subtask:${r.rev}:${id}`, { kind: 'subtask', payload: { rev: r.rev, itemId: id, title: it.title, description: describeItem(it), dependsOn: it.dependsOn } }, secrets);
+    }
+    r.history.push({ ts: this.c.clock.now(), text: `Task graph attached: ${graph.items.length} tasks (plan rev ${r.rev})` });
   }
 
   /** Short hash used to detect description edits. */

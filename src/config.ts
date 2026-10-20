@@ -62,6 +62,9 @@ export function defaultConfig(): Config {
       planReview: 'auto',
       failOn: ['blocker', 'major'],
       noGates: 'warn',
+      maxItems: 12,
+      readOnlyParallel: 2,
+      verifyEachItem: false,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
   };
@@ -126,6 +129,9 @@ export function normalizeConfig(input: unknown): Config {
         ? (pl.failOn.filter((s: unknown) => ['blocker', 'major', 'minor', 'nit'].includes(String(s))) as Config['pipeline']['failOn'])
         : d.pipeline.failOn,
       noGates: oneOf(pl.noGates, ['warn', 'block'] as const, d.pipeline.noGates),
+      maxItems: clamp(pl.maxItems, 1, 12, d.pipeline.maxItems), // 12 is the hard v2.0 ceiling (src/pipeline/graph.ts) — config can only lower it
+      readOnlyParallel: clamp(pl.readOnlyParallel, 1, 4, d.pipeline.readOnlyParallel),
+      verifyEachItem: pl.verifyEachItem === true,
       timeoutsMin: {
         plan: clamp(to.plan, 1, 240, d.pipeline.timeoutsMin.plan),
         review: clamp(to.review, 1, 120, d.pipeline.timeoutsMin.review),

@@ -1,9 +1,10 @@
 import { providerLabel } from '../agents/providers/registry.ts';
 import type {
-  ProviderId, ApiRunDetail, ApiRunSummary, ApiSession, BoardColumn, Config, GateComparison, GateRun, Plan, PlanReview, Run, SessionRec, Verdict,
+  ApiGraph, ApiGraphProgress, ProviderId, ApiRunDetail, ApiRunSummary, ApiSession, BoardColumn, Config, GateComparison, GateRun, Plan, PlanReview, Run, SessionRec, Verdict,
 } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { fmtDuration, isUuid, shellQuote, truncate } from '../util.ts';
+import { isReady } from './graph.ts';
 
 export function columnOf(run: Run): BoardColumn {
   switch (run.status) {
@@ -75,6 +76,37 @@ export function activityOf(run: Run, cfg: Config, now: number): string {
   }
 }
 
+export function graphProgress(run: Run): ApiGraphProgress | undefined {
+  const items = run.graph?.items;
+  if (!items?.length) return undefined;
+  const n = (s: string) => items.filter((i) => i.state === s).length;
+  return { total: items.length, done: n('done'), running: n('running'), failed: n('failed'), blocked: n('blocked') };
+}
+
+export function toGraph(run: Run): ApiGraph | null {
+  const g = run.graph;
+  if (!g) return null;
+  return {
+    rev: g.rev,
+    final: g.final,
+    items: g.items.map((i) => ({
+      id: i.id,
+      key: i.key,
+      title: i.title,
+      role: i.role,
+      objective: i.objective,
+      dependsOn: [...i.dependsOn],
+      files: [...i.files],
+      criteria: [...i.criteria],
+      state: isReady(i, g.items) ? 'ready' : i.state,
+      loop: i.loop,
+      loopBudget: i.loopBudget,
+      commitSha: i.commitSha ?? null,
+      note: i.note ? truncate(i.note, 600) : null,
+    })),
+  };
+}
+
 export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
   const st = run.status;
   return {
@@ -107,6 +139,7 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
     canCleanup: ['ready', 'finished', 'aborted'].includes(st) && !!run.worktree,
     canPark: !['finished', 'aborted', 'parked'].includes(st),
     canFinish: !['finished', 'aborted'].includes(st),
+    ...(run.graph ? { taskProgress: graphProgress(run) } : {}),
   };
 }
 
@@ -149,5 +182,6 @@ export function toDetail(store: RunStore, run: Run, cfg: Config, now: number): A
     diffStat: store.readArtifact<string | null>(run.key, 'diffstat.txt', null),
     noPushEnvOnly: run.guardEnvOnly, // API name kept (derived view of the generic guard field)
     unverifiedWhy: run.unverifiedWhy ?? null,
+    graph: toGraph(run),
   };
 }

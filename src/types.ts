@@ -212,7 +212,7 @@ export interface BugRec {
 export interface EffectRec {
   status: 'pending' | 'done';
   refId?: string; // id of the board entity the effect produced (comment / bug item)
-  kind: 'comment' | 'subissue' | 'state' | 'close';
+  kind: 'comment' | 'subissue' | 'state' | 'close' | 'subtask' | 'subtask-cancel';
   payload?: unknown; // everything needed to (re)apply the effect idempotently (already redacted)
   attempts: number; // failures so far (reporting + back-off only; a local write cannot half-fail)
   lastError?: string;
@@ -325,6 +325,10 @@ export interface Config {
     planReview: 'off' | 'auto' | 'always'; // 'auto' = only complexity M/L
     failOn: Severity[];
     noGates: 'warn' | 'block';
+    /** Task graph (M3): item ceiling (1–12; 12 is a hard v2.0 limit), concurrent analysis-item calls (1–4) and an optional AI check per item. */
+    maxItems: number;
+    readOnlyParallel: number;
+    verifyEachItem: boolean;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
   };
   worktreeRoot?: string;
@@ -402,6 +406,34 @@ export interface ApiRoles {
   choices: Record<string, Record<string, { ok: boolean; reason?: string; needsAck?: boolean }>>;
   needs: Record<string, { build?: true; research?: true }>;
 }
+/** One task of a run's graph, as the dashboard shows it (strings were redacted when the plan was stored). */
+export interface ApiGraphItem {
+  id: string;
+  key: string | null;
+  title: string;
+  role: string;
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[];
+  state: ItemState | 'ready';
+  loop: number;
+  loopBudget: number;
+  commitSha: string | null;
+  note: string | null;
+}
+export interface ApiGraph {
+  rev: number;
+  final: TaskGraphRun['final'];
+  items: ApiGraphItem[];
+}
+export interface ApiGraphProgress {
+  total: number;
+  done: number;
+  running: number;
+  failed: number;
+  blocked: number;
+}
 export interface ApiRunSummary {
   key: string;
   title: string;
@@ -433,6 +465,8 @@ export interface ApiRunSummary {
   canCleanup: boolean;
   canPark: boolean; // move the card to Backlog
   canFinish: boolean; // mark it done
+  /** Progress of the task graph, when the run has one. */
+  taskProgress?: ApiGraphProgress;
 }
 export interface ApiSession extends SessionRec {
   resumeCommand: string; // e.g. `cd '/path' && claude --resume <id>`
@@ -476,6 +510,8 @@ export interface ApiRunDetail extends ApiRunSummary {
   diffStat: string | null;
   noPushEnvOnly: boolean;
   unverifiedWhy: string | null;
+  /** The task graph (items, states, dependencies, commits), or null for a single-task run. */
+  graph: ApiGraph | null;
 }
 export interface ApiQuota {
   claude?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean };

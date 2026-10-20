@@ -15,7 +15,7 @@ import { validatePairing, type ProviderState } from '../agents/routing.ts';
 import { redact } from '../redact.ts';
 import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
-import { toDetail, toSummary } from '../pipeline/view.ts';
+import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
 import { errMsg, truncate } from '../util.ts';
@@ -323,7 +323,14 @@ export class Api {
     if (!KEY_RE.test(key)) throw new ApiFail(404, 'not_found', 'Unknown card.');
     const item = this.d.board.item(key);
     if (!item) throw new ApiFail(404, 'not_found', 'Unknown card.');
-    return { item, comments: this.d.board.comments(item.id), children: this.d.board.children(item.id), decisions: this.d.board.decisions(item.projectId).filter((d) => !d.itemId || d.itemId === item.id) };
+    const run = this.d.store.get(item.key);
+    return {
+      item,
+      comments: this.d.board.comments(item.id),
+      children: this.d.board.children(item.id),
+      decisions: this.d.board.decisions(item.projectId).filter((d) => !d.itemId || d.itemId === item.id),
+      graph: run ? toGraph(run) : null,
+    };
   }
 
   runLog(key: string, after: number, limit: number): { events: LogEvent[]; next: number } {

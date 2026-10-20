@@ -20,11 +20,16 @@ function neutralise(s: string): string {
 }
 
 type SubIssuePayload = { fp: string; title: string; description: string };
+/** One subtask card per task-graph item (M3). `dependsOn` are the SIBLING ITEM ids (T1, T2, …) — mapped to board ids at apply time. */
+type SubtaskPayload = { rev: number; itemId: string; title: string; description: string; dependsOn: string[] };
 export type EffectInput =
   | { kind: 'comment'; payload: { body: string; itemId?: string } }
   | { kind: 'state'; payload: { stage?: string } }
   | { kind: 'subissue'; payload: SubIssuePayload }
-  | { kind: 'close'; payload: { itemId: string; lane: 'done' | 'todo' } };
+  | { kind: 'close'; payload: { itemId: string; lane: 'done' | 'todo' } }
+  | { kind: 'subtask'; payload: SubtaskPayload }
+  /** A superseded graph's card (the plan was replaced): canceled, with a note. The target is a board id that Conductor itself created. */
+  | { kind: 'subtask-cancel'; payload: { itemId: string; rev: number } };
 
 export interface EffectsDeps {
   store: RunStore;
@@ -86,6 +91,15 @@ export class Effects {
     } else if (input.kind === 'subissue') {
       const p = input.payload;
       payload = { fp: p.fp, title: truncate(redact(p.title, secrets), 200), description: truncate(redact(p.description, secrets), 20_000) };
+    } else if (input.kind === 'subtask') {
+      const p = input.payload;
+      payload = {
+        rev: p.rev,
+        itemId: p.itemId,
+        title: truncate(redact(p.title, secrets), 160),
+        description: neutralise(truncate(redact(p.description, secrets), 4_000)),
+        dependsOn: p.dependsOn.slice(0, 12),
+      };
     }
     run.effects[effKey] = { ...cur, kind: input.kind, status: 'pending', payload, attempts: alwaysRepend ? 0 : cur?.attempts ?? 0 } as EffectRec;
   }
@@ -118,6 +132,14 @@ export class Effects {
     this.enqueueAndApply(key, effKey, { kind: 'subissue', payload });
     const after = this.deps.store.get(key)?.effects[effKey];
     return after?.refId ? { id: after.refId, key: this.deps.board.item(after.refId)?.key } : null;
+  }
+  /** Create (once) the subtask card for one task-graph item. */
+  async subtask(key: string, effKey: string, payload: SubtaskPayload): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'subtask', payload });
+  }
+  /** Cancel a superseded graph's card. */
+  async subtaskCancel(key: string, effKey: string, itemId: string, rev: number): Promise<void> {
+    this.enqueueAndApply(key, effKey, { kind: 'subtask-cancel', payload: { itemId, rev } });
   }
   /** Move a bug child (close = done, reopen = todo). */
   async close(key: string, effKey: string, itemId: string, lane: 'done' | 'todo' = 'done'): Promise<void> {
@@ -187,6 +209,37 @@ export class Effects {
         const p = rec.payload as { itemId: string; lane: 'done' | 'todo' };
         this.assertOwnChild(run, p.itemId);
         board.setLane(p.itemId, p.lane, 'conductor');
+      } else if (rec.kind === 'subtask') {
+        const p = rec.payload as SubtaskPayload;
+        const parent = board.item(run.itemId);
+        if (!parent) throw new BoardError('not_found', 'The parent card no longer exists.');
+        // sibling cards that already exist (created by an earlier effect of the same graph): item id → board id. A sibling that was deleted
+        // by a human simply has no mapping — the dependency edge is dropped (the graph itself, in run.json, remains the source of truth).
+        const g = run.graph;
+        const siblings = new Map<string, string>();
+        for (const it of g && g.rev === p.rev ? g.items : []) if (it.key) {
+          const card = board.item(it.key);
+          if (card && card.parentId === run.itemId) siblings.set(it.id, card.id);
+        }
+        // cards are created in dependency order; if a prerequisite's card is merely not written YET, wait (transient) rather than drop the edge
+        for (const d of p.dependsOn) {
+          if (!siblings.has(d) && run.effects[`subtask:${p.rev}:${d}`]?.status === 'pending') throw new Error(`waiting for the card of ${d}`);
+        }
+        const deps = p.dependsOn.map((d) => siblings.get(d)).filter((d): d is string => !!d);
+        const created = board.createItem(
+          { projectId: parent.projectId, title: `${p.itemId} · ${p.title}`, description: p.description, kind: 'subtask', parentId: parent.id, dependsOn: deps, lane: 'todo', autoStart: false, idemKey: mk },
+          'conductor',
+        );
+        refId = created.id;
+        this.deps.store.update(key, (r) => {
+          const it = r.graph && r.graph.rev === p.rev ? r.graph.items.find((x) => x.id === p.itemId) : undefined;
+          if (it) it.key = created.key;
+        });
+      } else if (rec.kind === 'subtask-cancel') {
+        const p = rec.payload as { itemId: string; rev: number };
+        this.assertOwnChild(run, p.itemId);
+        board.setLane(p.itemId, 'canceled', 'conductor');
+        board.addComment(p.itemId, `Superseded — the plan was replaced (revision ${p.rev + 1} or later). This task is no longer part of the work.`, 'conductor', { idemKey: mk });
       }
       this.nextTry.delete(`${key}|${effKey}`);
       this.failedSince.delete(`${key}|${effKey}`);

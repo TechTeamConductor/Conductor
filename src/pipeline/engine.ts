@@ -16,6 +16,7 @@ import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
 import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
+import { projectItemLane } from './graph.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
 import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers/registry.ts';
@@ -348,6 +349,28 @@ export class Engine {
     }
     if (this.effects.hasPending(run)) return;
     if (item.lane !== laneForRun(run)) await this.effects.state(run.key, 'state', { stage: run.expected.stage });
+    this.projectSubtasks(run);
+  }
+
+  /**
+   * The task graph's cards follow the run, never the other way round: each keyed subtask card's lane converges to its item's state
+   * (a card a person moved is moved back; a card that no longer exists is left alone — never recreated, never an error).
+   */
+  private projectSubtasks(run: Run): void {
+    const g = run.graph;
+    if (!g) return;
+    for (const it of g.items) {
+      if (!it.key) continue;
+      const card = this.board.item(it.key);
+      if (!card || card.parentId !== run.itemId) continue;
+      const want = run.status === 'aborted' && it.state !== 'done' ? 'canceled' : projectItemLane(it);
+      if (card.lane === want) continue;
+      try {
+        this.board.setLane(card.id, want, 'conductor');
+      } catch (e) {
+        log.warn(`${run.key}: could not move the card of ${it.id}: ${errMsg(e)}`);
+      }
+    }
   }
 
   private async maybeClaim(item: WorkItem): Promise<void> {
@@ -455,6 +478,13 @@ export class Engine {
     }
     const repo = run0.repo ? null : this.resolveRepo(item ? this.board.project(item.projectId) : undefined);
     const obsolete = retryStage ? [] : run0.bugs.filter((b) => b.status === 'open' && b.itemId);
+    // a re-plan replaces the task graph: its subtask cards are superseded (card ids resolved now — the keys are all the run records)
+    const superseded = retryStage || !run0.graph
+      ? []
+      : run0.graph.items.flatMap((it) => {
+          const card = it.key ? this.board.item(it.key) : undefined;
+          return card && card.parentId === run0.itemId ? [{ effKey: `subtask-cancel:${run0.graph!.rev}:${it.id}`, id: card.id, rev: run0.graph!.rev }] : [];
+        });
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
       r.restartTimes = [...recent, nowT];
@@ -492,9 +522,12 @@ export class Engine {
         r.feedback = undefined;
         r.verdict = null;
         for (const b of r.bugs) if (b.status === 'open') b.status = 'closed';
+        r.graph = undefined;
+        for (const c of superseded) Effects.enqueue(r, c.effKey, { kind: 'subtask-cancel', payload: { itemId: c.id, rev: c.rev } });
         r.history.push({ ts: now, text: `Re-planning from scratch (rev ${r.rev}) — requested by you` });
       }
     });
+    if (superseded.length) await this.effects.flush(key);
     if (obsolete.length) {
       const rev = this.d.store.get(key)?.rev ?? run0.rev + 1;
       for (const b of obsolete) await this.effects.close(key, `bugclose:${b.fp}:rerun${rev}`, b.itemId!, 'done');
@@ -639,6 +672,9 @@ export class Engine {
     if (!run) {
       const item = asked;
       if (!item) throw new EngineError('missing', 'Unknown card.');
+      if (item.kind === 'subtask' && item.createdBy === 'conductor' && item.parentId && this.d.store.list().some((r) => r.itemId === item.parentId && r.graph)) {
+        throw new EngineError('managed', 'This task follows its plan and is moved by Conductor. Use the parent card to retry or stop the work.');
+      }
       try {
         this.board.user.moveLane(item.id, lane);
       } catch (e) {
