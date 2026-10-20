@@ -314,12 +314,12 @@ test('m6: a builder that commits by itself is accepted (not reported as "no chan
 // ───────────── config migration ─────────────
 test('config: an old v1 config gets the hands-off defaults once; explicit v2 choices are kept', () => {
   const old = normalizeConfig({ version: 1, pipeline: { planApproval: 'first', onClaudeLimit: 'wait', timeoutsMin: { idle: 10 } } });
-  assert.equal(old.version, 2);
+  assert.equal(old.version, 3);
   assert.equal(old.pipeline.planApproval, 'auto');
   assert.equal(old.pipeline.onClaudeLimit, 'cursor');
   assert.equal(old.pipeline.timeoutsMin.idle, 15);
   const chosen = normalizeConfig({ version: 2, pipeline: { planApproval: 'first', onClaudeLimit: 'wait' } });
   assert.equal(chosen.pipeline.planApproval, 'first', 'a v2 choice is respected');
   assert.equal(chosen.pipeline.onClaudeLimit, 'wait');
-  assert.equal(normalizeConfig(defaultConfig()).version, 2);
+  assert.equal(normalizeConfig(defaultConfig()).version, 3);
 });

@@ -11,20 +11,18 @@ import { logger } from './log.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
-export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 2, assumeWhenMissing: 1 };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'linear', 'repos', 'agents', 'stages', 'pipeline', 'worktreeRoot', 'extra']);
+/** v1 → v2 (defaults upgrade) happens inside normalizeConfig; v2 → v3 moves the Linear block aside (config v3, M1c). */
+export function migrateConfigV2ToV3(raw: any): any {
+  const { linear, ...rest } = raw ?? {};
+  return linear === undefined ? rest : { ...rest, legacy: { ...(rest.legacy ?? {}), linear } };
+}
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 3, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3 } };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'pipeline', 'worktreeRoot', 'extra', 'legacy']);
 
 export function defaultConfig(): Config {
   return {
-    version: 2,
+    version: 3,
     ui: { port: 4317, openBrowser: true },
-    linear: {
-      mode: 'labels',
-      triggerLabel: 'conductor',
-      pollSeconds: 30,
-      pickupFromBacklog: false,
-      allowAssignedToMe: false,
-    },
     repos: [],
     agents: {
       claude: { bin: 'claude', isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } },
@@ -58,7 +56,6 @@ const oneOf = <T extends string>(v: unknown, allowed: readonly T[], d: T): T =>
 export function normalizeConfig(input: unknown): Config {
   const d = defaultConfig();
   const i = (input && typeof input === 'object' ? input : {}) as Partial<Config> & Record<string, any>;
-  const lin = (i.linear ?? {}) as Partial<Config['linear']>;
   const ag = (i.agents ?? {}) as any;
   const pl = (i.pipeline ?? {}) as any;
   const st = (i.stages ?? {}) as any;
@@ -69,20 +66,10 @@ export function normalizeConfig(input: unknown): Config {
   if (v1 && pl.onClaudeLimit === 'wait') pl.onClaudeLimit = 'cursor';
   if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 2,
+    version: 3,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
-    },
-    linear: {
-      teamId: typeof lin.teamId === 'string' ? lin.teamId : undefined,
-      teamKey: typeof lin.teamKey === 'string' ? lin.teamKey : undefined,
-      mode: oneOf(lin.mode, ['labels', 'states'] as const, d.linear.mode),
-      triggerLabel: typeof lin.triggerLabel === 'string' && lin.triggerLabel.trim() ? lin.triggerLabel.trim() : d.linear.triggerLabel,
-      pollSeconds: clamp(lin.pollSeconds, 15, 600, d.linear.pollSeconds),
-      pickupFromBacklog: lin.pickupFromBacklog === true,
-      allowAssignedToMe: lin.allowAssignedToMe === true,
-      viewerId: typeof lin.viewerId === 'string' ? lin.viewerId : undefined,
     },
     repos: Array.isArray(i.repos) ? (i.repos as RepoConfig[]).filter(validRepo).map(normRepo) : [],
     agents: {
@@ -134,6 +121,11 @@ export function normalizeConfig(input: unknown): Config {
   if (i.extra && typeof i.extra === 'object' && !Array.isArray(i.extra)) for (const [k, v] of Object.entries(i.extra as Record<string, unknown>)) if (!BAD.has(k)) extra[k] = v;
   for (const [k, v] of Object.entries(i)) if (!KNOWN_CONFIG_KEYS.has(k) && !BAD.has(k)) extra[k] = v;
   if (Object.keys(extra).length) cfg.extra = { ...extra };
+  // the old `linear` block (a config that skipped the migration) and any `legacy` content are carried verbatim, never interpreted
+  const legacy: Record<string, unknown> = Object.create(null);
+  if (i.legacy && typeof i.legacy === 'object' && !Array.isArray(i.legacy)) for (const [k, v] of Object.entries(i.legacy as Record<string, unknown>)) if (!BAD.has(k)) legacy[k] = v;
+  if ((i as any).linear !== undefined && legacy.linear === undefined) legacy.linear = (i as any).linear;
+  if (Object.keys(legacy).length) cfg.legacy = { ...legacy };
   if (!cfg.pipeline.failOn.length) cfg.pipeline.failOn = d.pipeline.failOn;
   return cfg;
 }

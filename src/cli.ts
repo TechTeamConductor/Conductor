@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { rmSync } from 'node:fs';
@@ -6,6 +8,7 @@ import type { AgentHealth } from './types.ts';
 import { loadConfig } from './config.ts';
 import { ensureHome, paths } from './paths.ts';
 import { acquireLock, LockHeldError, readLock } from './lock.ts';
+import { migrate, MigrateError } from './migrate.ts';
 import { configureLog, logger, pruneLogs } from './log.ts';
 import { createRuntime, VERSION } from './runtime.ts';
 import { isolationProbe, probe, runChecks } from './doctor.ts';
@@ -33,6 +36,7 @@ Usage: conductor <command>
   service install    keep Conductor running in the background (launchd)   [--dry-run]
   service uninstall  remove the background service
   service status
+  migrate            import a Conductor v1 data folder into a NEW v2 folder, side by side   [--from <dir>] [--to <dir>] [--apply]
   uninstall          remove the background service   [--purge removes the data folder]
   version
 
@@ -84,11 +88,34 @@ async function main(): Promise<void> {
       return doctor();
     case 'service':
       return service();
+    case 'migrate':
+      return migrateCmd();
     case 'uninstall':
       return uninstall();
     default:
       console.error(`Unknown command "${cmd}".\n\n${HELP}`);
       process.exit(2);
+  }
+}
+
+async function migrateCmd(): Promise<void> {
+  const from = opt('--from') ?? join(homedir(), '.conductor');
+  const to = opt('--to') ?? paths.home();
+  try {
+    const r = await migrate({ from, to, apply: flag('--apply') });
+    console.log(`${r.dryRun ? 'DRY RUN — nothing was written anywhere.' : r.published ? 'Imported.' : 'Not published.'}\n  from  ${r.from}  (read-only; never modified)\n  to    ${r.to}\n`);
+    for (const p of r.projects) console.log(`  project ${p.key}${p.repo ? ` → repository "${p.repo}"` : ' (no repository set yet)'}: ${p.cards} card(s)`);
+    for (const x of r.runs) console.log(`  ${x.oldKey}${x.oldKey === x.newKey ? '' : ` → ${x.newKey}`}  ${x.status} → lane ${x.lane}${x.note ? `\n      ${x.note}` : ''}`);
+    for (const w of r.warnings) console.log(` ! ${w}`);
+    if (r.backupDir) console.log(`\nBackup copy of what was read: ${r.backupDir}`);
+    if (r.dryRun) console.log('\nLooks right? Run the same command with --apply to create the v2 folder.');
+    else if (r.published) console.log(`\nDone. Start v2 with:  CONDUCTOR_HOME=${to} npm start   (or just  npm start  when ${to} is the default).\nYour v1 folder is untouched and keeps working. Nothing was written to Linear; the old Linear API key is still in your macOS Keychain (service "techteam-conductor", account "linear-api-key") — v2 never reads it; delete it yourself when you are sure you no longer need v1.`);
+  } catch (e) {
+    if (e instanceof MigrateError) {
+      console.error(`migrate: ${e.message}`);
+      process.exit(e.code === 'target_exists' || e.code === 'changed_during_import' ? 3 : 2);
+    }
+    throw e;
   }
 }
 

@@ -22,15 +22,14 @@ const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHas
 
 test('config: defaults are safe; hostile/garbage input is clamped, never trusted', () => {
   const d = defaultConfig();
-  assert.equal(d.linear.mode, 'labels');
-  assert.equal(d.linear.pickupFromBacklog, false);
-  assert.equal(d.linear.allowAssignedToMe, false);
+  assert.equal((d as any).linear, undefined, 'config v3 has no Linear section');
+  assert.equal(d.version, 3);
   assert.equal(d.pipeline.planApproval, 'auto', 'hands-off by default');
   assert.equal(d.pipeline.onClaudeLimit, 'cursor', 'a rate-limited Claude must not stall the pipeline');
   const n = normalizeConfig({ ui: { port: 3 }, linear: { pollSeconds: 1, mode: 'weird' }, pipeline: { maxParallel: 999, maxLoops: -4, planApproval: 'sometimes', failOn: ['nope'] }, repos: [{ name: '../evil', path: 'relative' }, { name: 'ok', path: '/abs' }], stages: { plan: 'gpt' } });
   assert.equal(n.ui.port, 1024);
-  assert.equal(n.linear.pollSeconds, 15);
-  assert.equal(n.linear.mode, 'labels');
+  assert.equal((n as any).linear, undefined);
+  assert.deepEqual(n.legacy, { linear: { pollSeconds: 1, mode: 'weird' } }, 'an un-migrated Linear block is carried verbatim under legacy, never interpreted');
   assert.equal(n.pipeline.maxParallel, 6);
   assert.equal(n.pipeline.maxLoops, 1);
   assert.equal(n.pipeline.planApproval, 'auto');
@@ -44,8 +43,7 @@ test('config: applySettings only touches whitelisted settings', () => {
   const next = applySettings(c, { maxLoops: 5, planApproval: 'manual', pickupFromBacklog: true, linearMode: 'states', ['agents' as any]: { claude: { bin: '/evil' } }, ['worktreeRoot' as any]: '/etc' } as any);
   assert.equal(next.pipeline.maxLoops, 5);
   assert.equal(next.pipeline.planApproval, 'manual');
-  assert.equal(next.linear.pickupFromBacklog, false, 'Linear settings are gone from the settings surface (ignored)');
-  assert.equal(next.linear.mode, 'labels');
+  assert.equal((next as any).linear, undefined, 'Linear settings are gone from the settings surface (ignored)');
   assert.equal('pickupFromBacklog' in toSettings(next), false);
   assert.equal(next.agents.claude.bin, 'claude', 'agent binary cannot be changed through the settings API');
   assert.equal(next.worktreeRoot, undefined);

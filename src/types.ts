@@ -253,16 +253,8 @@ export interface Config {
   /** Unknown top-level keys found on disk (e.g. written by a newer build) — preserved verbatim on save, never interpreted. */
   extra?: Record<string, unknown>;
   ui: { port: number; openBrowser: boolean };
-  linear: {
-    teamId?: string;
-    teamKey?: string;
-    mode: 'labels' | 'states';
-    triggerLabel: string; // default "conductor"
-    pollSeconds: number; // >= 15, default 30
-    pickupFromBacklog: boolean; // C4, default false
-    allowAssignedToMe: boolean; // default false
-    viewerId?: string;
-  };
+  /** Carried over from older configs (e.g. the v1 `linear` block), kept verbatim and never interpreted. */
+  legacy?: Record<string, unknown>;
   repos: RepoConfig[];
   agents: {
     claude: {
