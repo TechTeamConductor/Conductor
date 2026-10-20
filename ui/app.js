@@ -592,6 +592,9 @@ function computeBanners(wizard) {
   if (hidden.length) {
     out.push({ id: 'ignored', cls: 'b-error', icon: 'warn', title: hidden.length === 1 ? 'One card is being ignored' : `${hidden.length} cards are being ignored`, text: '', lines: hidden.slice(0, 8).map((i) => `${i.key}: ${i.reason}`), list: true });
   }
+  if (eng.offline) {
+    out.push({ id: 'offline', cls: 'b-limit', icon: 'clock', title: 'Offline', text: ' — no network.', lines: ['Still working offline: the board, notes, history, project context and quality gates. Planning, review, verification and builds wait for the network and resume by themselves.'] });
+  }
   if (eng.storageProblem || eng.lastPollError) {
     out.push({ id: 'storage', cls: 'b-error', icon: 'warn', title: 'The board cannot be saved right now', text: ' ' + (eng.storageProblem || eng.lastPollError), lines: ['Check free disk space and permissions on the data folder. Conductor keeps retrying; running stages are not affected.'] });
   }

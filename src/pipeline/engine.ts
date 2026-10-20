@@ -18,6 +18,7 @@ import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
 import { graphBudgets, nextBuildRole, projectItemLane } from './graph.ts';
 import { Semaphore } from './semaphore.ts';
+import { OfflineProbe, backoffFor, type Fetcher } from '../net/offline.ts';
 import { ContextService, type ContextLike } from '../context/service.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
@@ -50,6 +51,8 @@ export interface EngineDeps {
   secrets?: () => string[];
   /** The project context engine; the real one is created when omitted (tests may pass a stub). */
   context?: ContextLike;
+  /** Connectivity probe fetcher: omitted/null = the probe is off (always `unknown`); the runtime passes the real `fetch`. */
+  offlineFetcher?: Fetcher | null;
 }
 
 type Job = { ac: AbortController; promise: Promise<void> };
@@ -94,6 +97,7 @@ export class Engine {
   /** The ONE cap on concurrent read-only analysis calls across all runs (task graphs). */
   private analysisSem = new Semaphore(() => this.d.getConfig().pipeline.readOnlyParallel);
   private context!: ContextLike;
+  readonly probe: OfflineProbe;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
   private healthRefresh: (() => Promise<void>) | null = null;
   private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>) | null = null;
@@ -105,6 +109,7 @@ export class Engine {
     this.clock = deps.clock ?? systemClock;
     this.persistentDeps = deps.persistent ?? { load: loadState, save: saveState };
     this.effects = new Effects({ store: deps.store, board: deps.board, secrets: (r) => this.secretsFor(r), now: () => this.clock.now() });
+    this.probe = new OfflineProbe({ fetcher: deps.offlineFetcher ?? null, now: () => this.clock.now() });
     this.context = deps.context ?? new ContextService({ board: deps.board, getConfig: deps.getConfig, now: () => this.clock.now() });
     this.stages = new Stages(this.makeCtx());
   }
@@ -313,6 +318,17 @@ export class Engine {
         log.warn(`${run.key}: projection failed: ${errMsg(e)}`);
       }
       await this.digestRun(run);
+    }
+    // 2b. a run paused because the network was down resumes only once the probe says it is back (`unknown` counts as back)
+    const dueOffline = this.d.store.list().filter((r) => r.status === 'paused' && r.pauseReason === 'offline' && (r.pausedUntil ?? 0) <= this.clock.now());
+    if (dueOffline.length && (await this.probe.check()) === 'offline') {
+      for (const r of dueOffline) {
+        this.d.store.update(r.key, (x) => {
+          const streak = (x.offline?.streak ?? 1) + 1;
+          x.pausedUntil = this.clock.now() + backoffFor(streak);
+          if (x.offline) x.offline = { ...x.offline, streak, totalMs: x.offline.totalMs + backoffFor(streak) };
+        });
+      }
     }
     // 3. claims
     const runKeys = new Set(this.d.store.list().map((r) => r.key));
@@ -902,6 +918,7 @@ export class Engine {
       running: this.jobs.size,
       maxParallel: this.d.getConfig().pipeline.maxParallel,
       lastPollAt: this.lastPollAt,
+      offline: this.probe.last()?.state === 'offline',
       lastPollError: storageProblem,
       storageProblem,
       pollSeconds: TICK_MS / 1000,

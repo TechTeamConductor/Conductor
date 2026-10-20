@@ -116,9 +116,9 @@ When a run reaches `finished`/`ready`/`needs_human`/`aborted`, one line is appen
 ## 4. Implementation TODO
 
 - [ ] Reviewer approval (**before any edit**).
-- [ ] **Commit 1 — store + scanner + incremental + status** (pure modules, fixtures, no engine change).
-- [ ] **Commit 2 — packs + history + prompt blocks + engine insertion** (facts-only for builders; read-only fencing; refresh-before-plan; failure never blocks).
-- [ ] **Commit 3 — offline classification + pause/resume + probe + labels + API/UI.**
+- [x] **Commit 1 — store + scanner + incremental + status** (pure modules, fixtures, no engine change).
+- [x] **Commit 2 — packs + history + prompt blocks + engine insertion** (facts-only for builders; read-only fencing; refresh-before-plan; failure never blocks).
+- [x] **Commit 3 — offline classification + pause/resume + probe + labels + API/UI.**
 - [ ] **Commit 4 — `src/limits/budget.ts` (first consumer: the context-run budget; final semantics per §2b-8) + opt-in LLM summaries + docs.**
 - [ ] Reviewer code review + Security review; checkpoint commit.
 

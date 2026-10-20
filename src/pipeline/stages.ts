@@ -26,6 +26,7 @@ import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
 import type { Role } from '../agents/roles.ts';
 import type { Consumer } from '../context/pack.ts';
+import { OFFLINE_EPISODE_CAP, OFFLINE_RUN_CEILING_MS, backoffFor } from '../net/offline.ts';
 import { route } from '../agents/routing.ts';
 import type { PipelineCtx } from './context.ts';
 import { ITEM_NOTE_SCHEMA, PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
@@ -36,7 +37,7 @@ const PROTECTED = '.claude/**, .cursor/**, .codex/**, .agents/**, .mcp.json, AGE
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
 /** What a read-only call asks the run to do when it cannot continue (applied at once, or deferred so concurrent calls make ONE transition). */
-export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo };
+export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo } | { type: 'offline'; message: string };
 type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop'; hold?: Hold };
 
 /** More tasks than this in one plan always waits for a human (even with automatic approval). */
@@ -247,6 +248,35 @@ export class Stages {
     }
   }
 
+  /**
+   * The network is unreachable: pause (never fail), refund the attempt (done by the caller), back off 30 s → 5 min, and resume by itself when
+   * the engine's probe says the network is back. One comment and one notification per episode; a cumulative 24 h ceiling and an episode cap
+   * keep a CLI that keeps reporting network errors from pausing and resuming forever.
+   */
+  async pauseForOffline(key: string, message: string): Promise<void> {
+    const now = this.c.clock.now();
+    const before = this.run(key);
+    const o = before.offline ?? { episodes: 0, streak: 0, totalMs: 0 };
+    const streak = o.streak + 1;
+    const episodes = streak === 1 ? o.episodes + 1 : o.episodes;
+    if (episodes > OFFLINE_EPISODE_CAP || o.totalMs >= OFFLINE_RUN_CEILING_MS) {
+      return this.toNeedsHuman(key, `This task could not reach the network ${episodes > OFFLINE_EPISODE_CAP ? 'repeatedly' : 'for 24 hours in total'}. Check your connection, then move it to To do to retry.`, before.next);
+    }
+    const wait = backoffFor(streak);
+    this.patch(key, (r) => {
+      r.status = 'paused';
+      r.pausedUntil = now + wait;
+      r.pauseReason = 'offline';
+      r.offline = { episodes, streak, totalMs: o.totalMs + wait, pausedAt: now };
+      if (streak === 1) r.history.push({ ts: now, text: 'Paused: no network — resuming automatically when it is back' });
+    });
+    this.c.emit(key, { agent: 'conductor', stage: this.run(key).stage ?? 'engine', kind: 'error', text: `No network — ${truncate(redact(message, this.c.secretsFor(this.run(key))), 200)}` });
+    if (streak === 1) {
+      await this.c.effects.comment(key, `offline:ep${episodes}`, '🤖 **Paused — no network.** Conductor resumes automatically when the connection is back. Board, notes, history, project context and gates keep working offline.');
+      this.c.notify('Offline', `${key} is waiting for the network`);
+    }
+  }
+
   private recordSession(key: string, rec: Omit<SessionRec, 'status'> & { status?: SessionRec['status'] }): void {
     this.patch(key, (r) => {
       if (!r.sessions.some((s) => s.id === rec.id)) r.sessions.push({ status: 'running', ...rec });
@@ -265,12 +295,15 @@ export class Stages {
         s.cliVersion = res.cliVersion ?? s.cliVersion;
       }
       if (typeof res.costUsd === 'number') r.costUsd += res.costUsd;
-      if (res.ok) r.limitStreak = 0;
+      if (res.ok) {
+        r.limitStreak = 0;
+        if (r.offline) r.offline.streak = 0;
+      }
     });
   }
   /** A limit-rejected attempt did no work: it must not eat the per-card run budget. */
   private refundIfLimit(key: string, res: AgentResult): void {
-    if (!res.ok && res.errorKind === 'limit') this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
+    if (!res.ok && (res.errorKind === 'limit' || res.errorKind === 'network')) this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
   }
   private emitter(key: string, stage: StageName, loop: number, rev: number): (ev: EmitEvent) => void {
     return (ev) => {
@@ -368,6 +401,8 @@ export class Stages {
           return stop({ type: 'pause', limit: res.limit ?? { provider: res.agent, resetsAt: null, message: res.error ?? 'limit' } });
         case 'aborted':
           return stop();
+        case 'network':
+          return stop({ type: 'offline', message: res.error ?? 'network unreachable' });
         case 'auth': // not signed in: another attempt cannot help — say how to sign in (the message carries the exact command)
         case 'isolation':
         case 'spawn':
@@ -403,6 +438,7 @@ export class Stages {
   async applyHold(key: string, hold: Hold | undefined): Promise<void> {
     if (!hold) return;
     if (hold.type === 'human') return this.toNeedsHuman(key, hold.reason, hold.origin);
+    if (hold.type === 'offline') return this.pauseForOffline(key, hold.message);
     return this.pauseForLimit(key, hold.limit);
   }
 
@@ -853,6 +889,8 @@ export class Stages {
         return this.pauseForLimit(key, res.limit ?? { provider, resetsAt: null, message: res.error ?? 'limit' });
       case 'aborted':
         return;
+      case 'network':
+        return this.pauseForOffline(key, res.error ?? 'network unreachable');
       case 'spawn':
         return this.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
       default: {

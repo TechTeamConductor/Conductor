@@ -3,7 +3,7 @@ import { redact } from '../redact.ts';
 import { truncate, type Clock } from '../util.ts';
 import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
-import { BROKEN_RE } from './providers/probe.ts';
+import { BROKEN_RE, NETWORK_RE } from './providers/probe.ts';
 
 export type EmitEvent = Omit<LogEvent, 'seq' | 'ts'>;
 
@@ -241,6 +241,7 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
   if (!r) {
     // a launcher that cannot start its program prints a shim error and no events: a START failure (the chain may advance), not an agent failure
     if (proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, errorKind: 'spawn', error: `claude is installed but does not start: ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
+    if (proc.code !== 0 && NETWORK_RE.test(proc.stderrTail)) return { ...base, errorKind: 'network', error: `claude could not reach the network: ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 300)}` };
     return { ...base, errorKind: 'agent', error: `claude exited without a result (code ${proc.code}). ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
   }
   if (r.is_error) return { ...base, errorKind: 'agent', error: truncate(String(r.result ?? 'claude reported an error'), 500) };

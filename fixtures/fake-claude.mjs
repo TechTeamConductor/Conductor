@@ -87,6 +87,10 @@ if (step.limit) {
   out({ type: 'result', subtype: 'success', is_error: true, api_error_status: 429, api_error: 'usage_limit_reached', result: "You've hit your weekly limit · resets Oct 21 at 2pm (Europe/London)", session_id: sid, total_cost_usd: 0, num_turns: 1 });
   process.exit(1);
 }
+if (step.network) {
+  process.stderr.write(String(step.error ?? 'getaddrinfo ENOTFOUND api.anthropic.com') + '\n');
+  process.exit(1);
+}
 if (step.error) {
   out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: String(step.error), session_id: sid, total_cost_usd: 0, num_turns: 1 });
   process.exit(1);

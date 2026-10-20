@@ -429,6 +429,7 @@ export class GraphBuilder {
           x.nonce = undefined;
         });
         if (res.errorKind === 'limit') return h.pauseForLimit(key, res.limit ?? { provider: out.provider, resetsAt: null, message: res.error ?? 'limit' });
+        if (res.errorKind === 'network') return h.applyHold(key, { type: 'offline', message: res.error ?? 'network unreachable' });
         if (res.errorKind === 'spawn') return h.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
         const tries = h.run(key).buildFails ?? 0;
         h.patch(key, (r) => {

@@ -11,6 +11,9 @@ export async function cliOut(bin: string, args: string[], env: Record<string, st
 /** The launcher exists but the program does not run (a missing native binary, a missing module …). */
 export const BROKEN_RE = /cannot find module|native binary|enoent|vendor|no such file|not found|missing optional dependency/i;
 
+/** Network failures as a CLI itself reports them on stderr (structural failures only — never model prose, never a completed turn). */
+export const NETWORK_RE = /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|network error|unable to connect|socket hang up/i;
+
 /** `--version` outcome → DetectResult (common to every adapter). */
 export function detectFromVersion(r: { code: number | null; out: string; spawnError?: string }): DetectResult {
   if (r.spawnError || r.code !== 0) return { state: 'broken-install', detail: r.spawnError ?? (r.out || `exited with code ${r.code}`) };

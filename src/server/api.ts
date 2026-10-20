@@ -16,6 +16,7 @@ import { redact } from '../redact.ts';
 import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
+import { OFFLINE_OPERATIONS } from '../net/offline.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
 import { errMsg, truncate } from '../util.ts';
@@ -359,6 +360,7 @@ export class Api {
       if (path === '/api/board') return { json: this.boardView() };
       if (path === '/api/providers') return { json: { providers: this.providers(await this.cachedHealth()) } };
       if (path === '/api/roles') return { json: this.roles() };
+      if (path === '/api/offline') return { json: { online: (await this.d.engine.probe.check()) !== 'offline', checkedAt: this.d.engine.probe.last()?.at ?? null, operations: OFFLINE_OPERATIONS } };
       if ((m = /^\/api\/items\/([^/]+)$/.exec(path))) return { json: this.itemView(safeDecode(m[1]!)) };
       if ((m = /^\/api\/runs\/([^/]+)\/log$/.exec(path))) {
         return { json: this.runLog(safeDecode(m[1]!), Number(q.get('after') ?? 0), Number(q.get('limit') ?? 500)) };

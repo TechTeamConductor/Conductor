@@ -4,7 +4,7 @@ import { truncate } from '../util.ts';
 import type { AgentCallBase, EmitEvent } from './claude.ts';
 import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
-import { BROKEN_RE } from './providers/probe.ts';
+import { BROKEN_RE, NETWORK_RE } from './providers/probe.ts';
 
 export interface CursorCall extends AgentCallBase {
   /** build = writes files (`--force`); ask/plan = read-only modes. */
@@ -164,6 +164,7 @@ export async function runCursor(call: CursorCall): Promise<AgentResult> {
         limit: { provider: 'cursor', resetsAt: null, kind: 'unknown', message: truncate(redact(probe.trim(), secrets), 300) },
       };
     }
+    if (!result && NETWORK_RE.test(proc.stderrTail)) return { ...base, errorKind: 'network', error: `cursor could not reach the network: ${truncate(redact(proc.stderrTail, secrets).trim(), 300)}` };
     return {
       ...base,
       errorKind: 'agent',

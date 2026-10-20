@@ -289,6 +289,8 @@ export interface Run {
   graph?: TaskGraphRun;
   /** `status:rev:loop` of the last outcome digest written to the project's history (M4) — makes the digest idempotent. */
   digestMark?: string;
+  /** Offline bookkeeping (M4): pause episodes and the cumulative time spent offline. */
+  offline?: { episodes: number; streak: number; totalMs: number; pausedAt?: number };
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
   restartTimes?: number[];
 }
@@ -386,7 +388,7 @@ export interface AgentResult {
   turns?: number;
   exitCode: number | null;
   error?: string;
-  errorKind?: 'limit' | 'auth' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse';
+  errorKind?: 'limit' | 'auth' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse' | 'network';
   limit?: LimitInfo;
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
 }
@@ -543,6 +545,8 @@ export interface ApiEngine {
   ignored?: { key: string; reason: string }[];
   /** Set when the board cannot be written (disk full, journal refused): effects stop retrying every tick until it recovers. */
   storageProblem?: string | null;
+  /** The connectivity probe's last verdict is "offline" (M4). */
+  offline?: boolean;
   paused: boolean;
   pauseReason?: string;
   providerPause: Partial<Record<ProviderId, { until: number; reason: string }>>;

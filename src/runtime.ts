@@ -70,7 +70,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     (opts.notify ?? osNotify)(t, m);
     serverRef?.toast('info', `${t}: ${m}`);
   };
-  const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [] });
+  const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [], offlineFetcher: globalThis.fetch as any });
   // The last CLI health the dashboard computed (the router reads it: a provider that is not installed / not signed in is skipped, visibly).
   // Older than 5 minutes it counts as unknown — a stale "not logged in" must never keep a provider out after the user signed in.
   let lastHealth: { at: number; value: { claude: any; cursor: any; codex: any } } | null = null;

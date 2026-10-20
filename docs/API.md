@@ -29,6 +29,9 @@ Summary plus `notes[]` (the card's conversation: your notes and Conductor's), `p
 ### `GET /api/board` → `{ projects, items, milestones }` and `GET /api/items/:key` → `{ item, comments, children, decisions, graph }`
 The raw board (newest 2000 items). Cards with a run are driven through `/api/runs/:key/*`; these are for browsing. `graph` (same shape as in the run detail) is present on the card of a run that was split into tasks; its `children` include the Conductor-owned `subtask` cards. A move of such a card through `POST /api/items/:key/move` is refused with `409 managed` — retry or stop the work from the parent card.
 
+### `GET /api/offline` → `{ online, checkedAt, operations[] }`
+The connectivity probe's verdict (outbound HEAD to the providers' own hosts; a configured proxy or an undecidable probe counts as online) and which operations work offline (`offline-ok`: board, notes, history, project context, gates, settings) or need the network (`needs-network`, with the provider). A provider call that fails for network reasons pauses the run (`pauseReason: "offline"`, attempt refunded, backoff 30 s → 5 min, 24 h cumulative / 20-episode ceilings) and resumes when the probe says the network is back.
+
 ### `GET /api/runs/:key/log?after=<seq>&limit=<n>` → `{ events: LogEvent[], next: number }`
 Backlog for the live log. `after` default 0, `limit` default 500 (max 2000). `next` = highest seq returned (pass as `after` next time).
 
