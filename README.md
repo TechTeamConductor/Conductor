@@ -4,7 +4,7 @@
 
 You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer, in separate git worktrees. **It never pushes, opens PRs, or merges.** There is no external tracker: the board is built in and stored locally.
 
-> **Status.** This is the v2 line (see `.techteam/plans/workspace-v2*.md` for the roadmap). Done so far: the native board (Linear removed), versioned data with backups, side-by-side import of v1 data. Planned next: more providers (Codex), per-role tool assignment, task decomposition, a project-context engine, Quick Ask / Deep Research modes, onboarding for three CLIs, desktop installers (Windows `.exe`, Linux `.deb`). Nothing in that second list exists yet.
+> **Status.** This is the v2 line (see `.techteam/plans/workspace-v2*.md` for the roadmap). Done so far: the native board (Linear removed), versioned data with backups, side-by-side import of v1 data, **roles and providers** (Claude, Cursor and an opt-in, read-only, *unverified* Codex — see below). Planned next: Codex as an implementer (needs its own isolation proof), task decomposition, task decomposition, a project-context engine, Quick Ask / Deep Research modes, onboarding for three CLIs, desktop installers (Windows `.exe`, Linux `.deb`). Nothing in that second list exists yet.
 
 ```
 Task card (To do)
@@ -50,6 +50,14 @@ Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still
 | stop it | **Abort run** (or **Cancel** on a card that has not started) |
 | finish it | review the branch in the worktree, merge it yourself, then **Mark done** |
 
+## Providers and roles
+
+Every job has a **role** (planning, review, verification, implementation, debugging, documentation, requirements, context, architecture, research) and each role has an **ordered list of providers**. The defaults are exactly what v1 did: Claude plans, reviews and verifies (Cursor takes over those read-only stages if Claude is at its usage limit, or not installed / signed in), Cursor builds. The Settings panel still shows the simple choices; behind it `GET/PUT /api/roles` (see `docs/API.md`) assign providers per role.
+
+- **Who may hold which role is decided by code, not by a setting.** A role that writes code (implementation, debugging, documentation) accepts only a provider whose no-push isolation has been *proven* — today only Cursor (proven by the live adversarial suite). Everything else is refused with the reason.
+- **Codex is optional and read-only.** It is in no default chain. It runs in Conductor's **own private Codex home** (`~/.conductor-v2/providers/codex-home`), never your `~/.codex` — so your hooks, MCP servers and rules are not in play. Sign in yourself, once: `CODEX_HOME=~/.conductor-v2/providers/codex-home codex login` (Conductor never runs a login or an install for you). Until `conductor doctor --isolation codex --yes` has passed on a working install it is labelled **unverified**; assigning it needs an explicit acknowledgement. A failed check marks it **blocked** for every role. *This machine's Codex install is broken (its native binary is missing), so the Codex check has never run against a real binary — everything above is tested against a scripted stand-in.*
+- **A provider that is missing, not signed in, or at a usage limit is skipped, visibly** (a note on the card). Only usage-limit / start / sign-in errors move a stage to the next provider; an isolation failure never falls back to a weaker one.
+
 ## Seeing the agents work
 
 | Where | What you see |
@@ -76,6 +84,8 @@ npm start                  run + open the dashboard
 npm run open               open a fresh signed-in tab while it's running
 npm run demo               scripted demo (no keys / quota)
 npm run doctor             check the setup   (--isolation proves Claude is locked down, --probe)
+node bin/conductor.mjs doctor --isolation codex --yes     the Codex isolation check (uses quota; marks Codex partial or blocked)
+node bin/conductor.mjs doctor --verify-build cursor --yes re-run the live no-push suite on the installed Cursor and record it (uses quota)
 node bin/conductor.mjs migrate [--from <dir>] [--to <dir>] [--apply]   import a v1 folder side by side
 node bin/conductor.mjs service install|uninstall|status                keep it running in the background (v2's own launchd label)
 node bin/conductor.mjs uninstall [--purge]                             remove the service (--purge also deletes a v2 data folder)

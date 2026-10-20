@@ -1,11 +1,14 @@
 import http from 'node:http';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { AgentHealth } from './types.ts';
-import { loadConfig } from './config.ts';
+import { loadConfig, resolveBin } from './config.ts';
+import { runCodexCanary } from './agents/providers/canary.ts';
+import { addRecord } from './agents/providers/verification.ts';
+import { CURSOR_GUARD_JSON } from './git/worktree.ts';
 import { ensureHome, paths } from './paths.ts';
 import { acquireLock, LockHeldError, readLock } from './lock.ts';
 import { migrate, MigrateError } from './migrate.ts';
@@ -14,9 +17,10 @@ import { createRuntime, VERSION } from './runtime.ts';
 import { isolationProbe, probe, runChecks } from './doctor.ts';
 import { installService, serviceStatus, uninstallService, plistPath } from './service.ts';
 import { startDemo } from './demo.ts';
-import { errMsg } from './util.ts';
+import { errMsg, sha256 } from './util.ts';
 
 const log = logger('cli');
+const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
 const cmd = argv[0] && !argv[0].startsWith('-') ? argv[0] : 'start';
 const flag = (n: string) => argv.includes(n);
@@ -32,7 +36,7 @@ Usage: conductor <command>
   start              run Conductor and open the dashboard (default)
   open               open a fresh signed-in dashboard tab (when it is already running)
   demo               try everything with scripted agents — no keys, no quota
-  doctor             check your setup   [--isolation] [--probe]
+  doctor             check your setup   [--isolation [claude|codex]] [--probe] [--verify-build cursor] [--yes]
   service install    keep Conductor running in the background (launchd)   [--dry-run]
   service uninstall  remove the background service
   service status
@@ -216,12 +220,47 @@ async function doctor(): Promise<void> {
   console.log(`Conductor ${VERSION} — setup check\n`);
   for (const c of checks) console.log(` ${mark(c.level)} ${c.label.padEnd(28)} ${c.detail}`);
   let failed = checks.some((c) => c.level === 'fail');
-  if (flag('--isolation')) {
+  if (flag('--isolation') && opt('--isolation') === 'codex') {
+    // the Codex isolation canary: a model must run shell commands, so it spends quota — never without --yes
+    if (!flag('--yes')) {
+      console.log('\nThe Codex isolation check calls the model and uses your plan\'s quota. Re-run with --yes to run it.');
+      process.exit(2);
+    }
+    console.log('\nCodex isolation check (two short model runs in scratch folders; nothing in your repositories is touched)…');
+    const rep = await runCodexCanary({ bin: cfg.agents.codex.bin });
+    for (const i of rep.items) console.log(` ${i.outcome === 'pass' ? '✓' : i.outcome === 'fail' ? '✗' : i.outcome === 'info' ? 'i' : '?'} ${i.id.padEnd(16)} ${i.detail}`);
+    if (rep.binding) addRecord({ provider: 'codex', kind: 'readOnly', verdict: rep.verdict, source: 'canary', binding: rep.binding, at: rep.ranAt, items: rep.items.map((i) => ({ id: i.id, outcome: i.outcome })) });
+    console.log(`\nResult: ${rep.verdict.toUpperCase()} — ${rep.verdict === 'pass' ? 'Codex may be used for read-only roles (tier: partial, like Cursor).' : rep.verdict === 'blocked' ? 'Codex is BLOCKED for every role until a later check passes.' : 'nothing was proven; Codex stays "unverified".'}`);
+    if (rep.verdict === 'blocked') failed = true;
+  } else if (flag('--isolation')) {
     console.log('\nIsolation probe (one tiny Claude call in a canary repo)…');
     const r = await isolationProbe(cfg);
     console.log(` ${r.ok ? '✓' : '✗'} ${r.note}`);
     console.log(`   init predicate: ${r.initOk ? 'ok' : `FAILED — ${r.initReason}`} · project CLAUDE.md loaded: ${r.projectClaudeMdLoaded} · ancestor file loaded: ${r.ancestorLoaded} · your user rules loaded: ${r.userRulesLoaded}${r.limited ? `\n   (account is at its usage limit: ${r.limited}; the transcript check still ran)` : ''}`);
     if (!r.ok) failed = true;
+  }
+  if (opt('--verify-build')) {
+    const who = opt('--verify-build');
+    if (who !== 'cursor') {
+      console.log(`\nOnly Cursor can be re-verified for building (the repo's live suite): "${who}" is not a builder.`);
+      process.exit(2);
+    }
+    if (!flag('--yes')) {
+      console.log('\nRe-verifying Cursor runs the live no-push attack suite against the real CLI and uses your plan\'s quota. Re-run with --yes to run it.');
+      process.exit(2);
+    }
+    const suite = join(ROOT_DIR, 'test', 'live', 'cursor-nopush.test.ts');
+    console.log('\nRunning the live no-push suite (test/live/cursor-nopush.test.ts)…');
+    const r = spawnSync(process.execPath, ['--test', '--import', join(ROOT_DIR, 'test', 'preload.ts'), suite], { env: { ...process.env, LIVE: '1' }, stdio: 'inherit', cwd: ROOT_DIR });
+    if (r.status === 0) {
+      const v = spawnSync(resolveBin(cfg.agents.cursor.bin) ?? cfg.agents.cursor.bin, ['--version'], { encoding: 'utf8' });
+      const ver = /(\d+(?:\.\d+)+)/.exec(String(v.stdout))?.[1] ?? 'unknown';
+      addRecord({ provider: 'cursor', kind: 'build', verdict: 'pass', source: 'live-suite', suite: 'cursor-nopush', suiteDigest: sha256(readFileSync(suite)), binding: { cliVersion: ver, binSha256: null, argvDigest: sha256('cursor-build-v1'), privateConfigSha: sha256(CURSOR_GUARD_JSON), canaryVersion: 1 }, at: Date.now() });
+      console.log(`\n✓ Cursor ${ver}: the live suite passed and was recorded.`);
+    } else {
+      console.log('\n✗ The live suite did not pass — nothing was recorded.');
+      failed = true;
+    }
   }
   if (flag('--probe')) {
     console.log('\nProbes (may use a tiny amount of quota)…');

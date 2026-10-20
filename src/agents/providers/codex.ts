@@ -6,16 +6,17 @@
 //  - limit/auth are classified ONLY after a structural failure, from CLI-reported error events/stderr, never from model prose;
 //  - an unverified/blocked tier is a label, not a bypass: the router decides who may run what.
 import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import type { VerificationBinding } from './verification.ts';
 import { join } from 'node:path';
 import type { AgentResult, StageName } from '../../types.ts';
 import { CODEX_MODEL_RE, resolveBin } from '../../config.ts';
 import { redact } from '../../redact.ts';
-import { truncate } from '../../util.ts';
+import { sha256, truncate } from '../../util.ts';
 import { codexEnv } from '../env.ts';
 import { extractJson, type Schema } from '../json.ts';
-import { runProcess } from '../spawn.ts';
+import { runProcess, type SpawnResult } from '../spawn.ts';
 import type { EmitEvent } from '../claude.ts';
-import { makeScratchHome, prepareCodexHome, scratchTmp, withCodexHomeLock, codexHomePath } from './codex-home.ts';
+import { CODEX_CONFIG_TOML, makeScratchHome, prepareCodexHome, scratchTmp, withCodexHomeLock, codexHomePath } from './codex-home.ts';
 import { PROVIDER_LABEL, type Provider, type ProviderDeps, type ReadOnlyRunReq } from './types.ts';
 
 /** The oldest Codex CLI this adapter was written against (the version the author's machine has). Older ⇒ the adapter reports `unverified` and the canary refuses. */
@@ -78,9 +79,12 @@ export interface CodexFold {
   completed: boolean;
   /** Messages the CLI itself reported through `turn.failed` / `error` events (structured; capped). */
   errors: string[];
+  /** Shell commands the agent ran (capped): what it TRIED and what came of it — the canary's evidence. */
+  commands: { command: string; exitCode: number | null; status: string; output: string }[];
+  fileChanges: { status: string }[];
   usage?: { input?: number; cached?: number; output?: number };
 }
-export const newCodexFold = (): CodexFold => ({ finalText: '', completed: false, errors: [] });
+export const newCodexFold = (): CodexFold => ({ finalText: '', completed: false, errors: [], commands: [], fileChanges: [] });
 
 export function normalizeCodexEvent(obj: unknown, ctx: { stage: StageName; secrets?: string[] }, fold: CodexFold): EmitEvent[] {
   const out: EmitEvent[] = [];
@@ -113,9 +117,11 @@ export function normalizeCodexEvent(obj: unknown, ctx: { stage: StageName; secre
         if (!done) out.push({ ...base, kind: 'tool', tool: 'shell', text: R(str(own(item, 'command')) ?? '', 300), sessionId: fold.sessionId });
         else {
           const code = own(item, 'exit_code');
+          if (fold.commands.length < 50) fold.commands.push({ command: truncate(str(own(item, 'command')) ?? '', 500), exitCode: typeof code === 'number' ? code : null, status: str(own(item, 'status')) ?? '', output: truncate(str(own(item, 'aggregated_output')) ?? '', 20_000) });
           out.push({ ...base, kind: 'tool_result', tool: 'shell', ok: code === 0, text: R(`exit ${typeof code === 'number' ? code : '?'}`, 240), sessionId: fold.sessionId });
         }
       } else if (itype === 'file_change' && done) {
+        if (fold.fileChanges.length < 50) fold.fileChanges.push({ status: str(own(item, 'status')) ?? '' });
         out.push({ ...base, kind: 'tool_result', tool: 'file_change', ok: str(own(item, 'status')) !== 'failed', text: 'The agent tried to change files (blocked: read-only)', sessionId: fold.sessionId });
       } else if (itype === 'mcp_tool_call') {
         out.push({ ...base, kind: done ? 'tool_result' : 'tool', tool: 'mcp', text: R(`${str(own(item, 'server')) ?? '?'}/${str(own(item, 'tool')) ?? '?'}`, 200), sessionId: fold.sessionId });
@@ -190,6 +196,39 @@ export interface CodexCall {
   clock?: ProviderDeps['clock'];
 }
 
+export interface CodexSpawn {
+  bin: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  prompt: string;
+  stage: StageName;
+  idleMs: number;
+  hardMs: number;
+  signal?: AbortSignal;
+  clock?: ProviderDeps['clock'];
+  onEvent?: (ev: EmitEvent) => void;
+  secrets?: string[];
+}
+/** One `codex` process with its JSONL folded into evidence. Shared by the read-only run and the isolation canary (which brings its own args/env). */
+export async function spawnCodex(c: CodexSpawn): Promise<{ proc: SpawnResult; fold: CodexFold }> {
+  const fold = newCodexFold();
+  const proc = await runProcess({
+    bin: c.bin, args: c.args, cwd: c.cwd, env: c.env, stdin: c.prompt, idleMs: c.idleMs, hardMs: c.hardMs, signal: c.signal, clock: c.clock,
+    onLine: (line, stream) => {
+      if (stream !== 'stdout') return;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        return;
+      }
+      for (const ev of normalizeCodexEvent(obj, { stage: c.stage, secrets: c.secrets }, fold)) c.onEvent?.(ev);
+    },
+  });
+  return { proc, fold };
+}
+
 export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
   const secrets = call.secrets ?? [];
   return withCodexHomeLock(async () => {
@@ -205,27 +244,19 @@ export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
         schemaFile = join(tmp.dir, 'schema.json');
         writeFileSync(schemaFile, JSON.stringify(call.schema), { mode: 0o600 });
       }
-      const fold = newCodexFold();
-      const proc = await runProcess({
+      const { proc, fold } = await spawnCodex({
         bin: call.bin,
         args: buildCodexArgs({ model: call.model, schemaFile, outFile }),
         cwd: call.cwd,
         env: codexEnv({ codexHome: home, home: scratchHome.dir }, call.extraEnv),
-        stdin: call.prompt,
+        prompt: call.prompt,
+        stage: call.stage,
         idleMs: call.idleMs,
         hardMs: call.hardMs,
         signal: call.signal,
         clock: call.clock,
-        onLine: (line, stream) => {
-          if (stream !== 'stdout') return;
-          let obj: unknown;
-          try {
-            obj = JSON.parse(line);
-          } catch {
-            return;
-          }
-          for (const ev of normalizeCodexEvent(obj, { stage: call.stage, secrets }, fold)) call.onEvent(ev);
-        },
+        onEvent: call.onEvent,
+        secrets,
       });
       let lastMessage = '';
       try {
@@ -320,4 +351,30 @@ export function codexProvider(d: ProviderDeps): Provider {
     },
     // no `build`: Codex cannot write code in M2 — by construction, not by flag
   };
+}
+
+// ───────────── what the install looks like NOW (for validating stored canary results) ─────────────
+const shaCache = new Map<string, { sig: string; sha: string | null }>();
+export const CODEX_ARGV_DIGEST = (): string => sha256(JSON.stringify(buildCodexArgs({ outFile: '<out>' })));
+export function binarySha(bin: string): string | null {
+  const path = resolveBin(bin);
+  if (!path) return null;
+  try {
+    const st = statSync(path);
+    const sig = `${st.size}:${st.mtimeMs}`;
+    const hit = shaCache.get(path);
+    if (hit && hit.sig === sig) return hit.sha;
+    const sha = st.size < 200 * 1024 * 1024 ? sha256(readFileSync(path)) : null;
+    shaCache.set(path, { sig, sha });
+    return sha;
+  } catch {
+    return null;
+  }
+}
+/** null when the installed version is not known (no recent health): a stored pass then does not count. */
+export function currentCodexBinding(bin: string, cliVersion: string | undefined, canaryVersion: number): VerificationBinding | null {
+  if (!cliVersion) return null;
+  const v = /(\d+\.\d+\.\d+)/.exec(cliVersion)?.[1];
+  if (!v) return null;
+  return { cliVersion: v, binSha256: binarySha(bin), argvDigest: CODEX_ARGV_DIGEST(), privateConfigSha: sha256(CODEX_CONFIG_TOML), canaryVersion };
 }

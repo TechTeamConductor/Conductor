@@ -5,6 +5,8 @@
 // Scenario: $FAKE_DIR/codex.json = { version, login, exec: [ {mode, ...}, … ] } — `exec` entries are used by call index.
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import net from 'node:net';
 
 const argv = process.argv.slice(2);
 const dir = process.env.FAKE_DIR || '';
@@ -77,6 +79,80 @@ const planDefault = {
 const payload = step.json ?? (stage === 'plan' ? planDefault : stage === 'plan_review' ? { decision: 'approved', summary: 'Looks right.', issues: [] } : { verdict: 'pass', summary: 'Verified.', acceptance: [{ id: 'AC1', status: 'met', evidence: 'feature.mjs:1' }], bugs: [] });
 const text = step.text ?? JSON.stringify(payload);
 
+
+// ───────── isolation-canary simulation ─────────
+// step.canary = { honour: ['project-hook', 'user-mcp', …], sandboxWrite, networkReaches, leakEnv, skip: ['write','network','env','cred','rules'], controlBroken: ['hook','mcp','rule'] }
+// This simulates a CLI that honours (or not) the layers it is told to; it is a test double for Conductor's EVIDENCE HANDLING, not a model of the real CLI.
+async function canaryMode() {
+  const cfg = step.canary ?? {};
+  const honour = new Set(cfg.honour ?? []);
+  const skip = new Set(cfg.skip ?? []);
+  const broken = new Set(cfg.controlBroken ?? []);
+  const isProd = argv.includes('--ignore-user-config');
+  const layers = [];
+  if (!isProd) layers.push({ dir: process.env.CODEX_HOME, tag: 'control', all: true });
+  else {
+    layers.push({ dir: join(process.env.HOME ?? '', '.codex'), tag: 'user' });
+    layers.push({ dir: join(process.cwd(), '.codex'), tag: 'project' });
+  }
+  const loaded = (l, what) => (l.all ? !broken.has(what) : honour.has(`${l.tag}-${what}`));
+  const hooks = [];
+  const mcps = [];
+  const forbidden = [];
+  for (const l of layers) {
+    try {
+      if (loaded(l, 'hook')) for (const e of JSON.parse(readFileSync(join(l.dir, 'hooks.json'), 'utf8')).hooks?.PreToolUse ?? []) for (const h of e.hooks ?? []) hooks.push(h.command);
+    } catch {}
+    try {
+      const t = readFileSync(join(l.dir, 'config.toml'), 'utf8');
+      const m = /command = "([^"]+)"\nargs = \["([^"]+)"\]/.exec(t.replace(/\\\//g, '/'));
+      if (m && loaded(l, 'mcp')) mcps.push([m[1], JSON.parse(`"${m[2]}"`)]);
+    } catch {}
+    try {
+      if (loaded(l, 'rule') && !skip.has('rules')) for (const m of readFileSync(join(l.dir, 'rules', 'canary.rules'), 'utf8').matchAll(/pattern=\["echo", "([^"]+)"\], decision="forbidden"/g)) forbidden.push(m[1]);
+    } catch {}
+  }
+  for (const [cmd, arg] of mcps) {
+    const c = spawn(cmd, [arg], { stdio: 'ignore', detached: true });
+    await new Promise((r) => setTimeout(r, 400));
+    try { process.kill(-c.pid, 'SIGKILL'); } catch {}
+  }
+  const cmds = [...prompt.matchAll(/^\d+\. (.*)$/gm)].map((m) => m[1]);
+  const CORE = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|TERM|TMPDIR)$/;
+  let first = true;
+  let n = 0;
+  for (const command of cmds) {
+    const kind = /^echo rule-probe/.test(command) ? 'rules' : /conductor-write-probe/.test(command) ? 'write' : /127\.0\.0\.1/.test(command) ? 'network' : /^env/.test(command) ? 'env' : /^cat /.test(command) ? 'cred' : 'plain';
+    if (skip.has(kind)) continue;
+    const id = `c${++n}`;
+    out({ type: 'item.started', item: { id, type: 'command_execution', command, status: 'in_progress' } });
+    if (first) { for (const h of hooks) spawnSync('sh', ['-c', h]); first = false; }
+    let output = '';
+    let code = 0;
+    if (kind === 'rules') {
+      const probe = /rule-probe-[0-9a-f]+-[a-z]+/.exec(command)[0];
+      if (forbidden.includes(probe)) { code = 1; output = ''; } else output = probe + '\n';
+    } else if (kind === 'write') {
+      const f = /conductor-write-probe-[0-9a-f]+\.txt/.exec(command)[0];
+      if (cfg.sandboxWrite) writeFileSync(join(process.cwd(), f), 'x');
+      else { code = 1; output = 'sh: ' + f + ': Read-only file system\n'; }
+    } else if (kind === 'network') {
+      const port = Number(/127\.0\.0\.1:(\d+)/.exec(command)[1]);
+      if (cfg.networkReaches) await new Promise((r) => { const sock = net.connect(port, '127.0.0.1', () => { sock.end('GET / HTTP/1.0\r\n\r\n'); r(); }); sock.on('error', r); sock.on('close', r); });
+      else code = 7;
+    } else if (kind === 'env') {
+      output = Object.entries(process.env).filter(([k]) => cfg.leakEnv || CORE.test(k)).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+    } else if (kind === 'cred') {
+      try { output = readFileSync(command.slice(4).trim(), 'utf8'); } catch { code = 1; output = 'No such file\n'; }
+    } else output = 'hello\n';
+    out({ type: 'item.completed', item: { id, type: 'command_execution', command, aggregated_output: output, exit_code: code, status: code === 0 ? 'completed' : 'failed' } });
+  }
+  out({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'DONE' } });
+  out({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2 } });
+  process.exit(0);
+}
+
+if (/You are testing a sandbox/.test(prompt)) await canaryMode();
 // two Codex processes must never run against one private home: an O_EXCL marker proves it
 let holding = false;
 if (dir) {

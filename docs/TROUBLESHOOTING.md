@@ -10,6 +10,12 @@
 
 **"…contains data from Conductor v1 … run conductor migrate".** v2 never uses a v1 folder in place. Use `node bin/conductor.mjs migrate` (dry run first, then `--apply`) to import it into a new folder, or point `CONDUCTOR_HOME` at an empty folder.
 
+**"Codex is installed but does not start" / Codex shows as broken.** The `codex` command exists but its native program is missing (a shim whose platform package did not install — `…/@openai/codex-darwin-arm64/vendor/…/codex ENOENT`). Conductor only reports it; it never installs or repairs anything. Reinstall it yourself (`npm i -g @openai/codex`), then sign in to Conductor's private home: `CODEX_HOME=~/.conductor-v2/providers/codex-home codex login`. A broken Codex is skipped by the router (the next provider in the chain does the stage).
+
+**"Codex was not started: the private Codex home holds entries Conductor did not put there".** Something other than Codex's own files is in `~/.conductor-v2/providers/codex-home` (hooks, rules, skills, memories, `AGENTS.md`, a symbolic link …). Conductor refuses to run Codex with instructions or code it did not write. Move the named entries out of that folder; `config.toml` is rewritten by Conductor every run, and `memories/` and `rules/` are only accepted while empty.
+
+**Codex shows "blocked".** The isolation check (`conductor doctor --isolation codex --yes`) saw a project hook / MCP server / rule fire, a write succeed, the network reached, or a decoy secret in the agent's shell. Codex is unusable for every role until a later check passes — typically after a Codex update or a change on your side; run the check again then.
+
 **Backups pile up.** Every data upgrade and every `migrate --apply` copies what it read into `~/.conductor-backups/<timestamp>-<label>/` (mode 0700; prompt-audit and gate-output files are not copied by the importer). Nothing prunes them: delete old folders yourself when you no longer need them — they hold your run records and plan/verdict text.
 
 **"…was written by a newer Conductor".** A file in the data folder has a data version this build does not understand. Nothing was changed. Upgrade Conductor, or restore a backup from `~/.conductor-backups`.

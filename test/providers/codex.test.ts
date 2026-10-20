@@ -157,9 +157,18 @@ test('hygiene pre-flight: anything planted in the private home refuses the run (
     const d = fakeDir({ exec: [{ mode: 'ok' }] });
     const { res } = await run(d);
     assert.equal(res.errorKind, 'isolation', planted);
-    assert.match(res.error!, new RegExp(`entries Conductor did not put there.*${planted.replace('.', '\\.')}`), planted);
+    if (planted === 'rules' || planted === 'memories') assert.match(res.error!, /must be an empty directory/, planted);
+    else assert.match(res.error!, new RegExp(`entries Conductor did not put there.*${planted.replace('.', '\\.')}`), planted);
     assert.equal(execCalls(d).length, 0, `${planted}: Codex never started`);
     rmSync(join(home, planted), { force: true });
+  }
+  // directories Codex creates for itself (seen on a real install) are fine while EMPTY, refused once they hold anything
+  for (const dname of ['memories', 'rules']) {
+    mkdirSync(join(home, dname));
+    assert.equal(prepareCodexHome(home).ok, true, `${dname}/ empty is allowed`);
+    writeFileSync(join(home, dname, 'x'), 'x');
+    assert.equal(prepareCodexHome(home).ok, false, `${dname}/ with a file is refused`);
+    rmSync(join(home, dname), { recursive: true, force: true });
   }
   // a symlink inside the home (even to an allowed name)
   symlinkSync('/tmp', join(home, 'sessions'));

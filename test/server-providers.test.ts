@@ -160,9 +160,14 @@ test('PUT /api/roles: an unverified provider (Codex) needs an explicit acknowled
   assert.equal((await send('PUT', '/api/roles', { roles: { review: { providers: ['claude', 'codex'] } } })).status, 200);
   const back = await send('PUT', '/api/roles', { roles: { review: { providers: ['claude', 'cursor'] } } });
   assert.equal(back.status, 200);
-  // the Codex canary is not available in this build: confirmed or not it never runs a model call
+  // the demo's Codex canary is scripted: confirmed it answers 'inconclusive' (nothing recorded, no tier change)
+  const t0 = Date.now();
+  while ((await get('/api/state')).json.engine.running > 0 && Date.now() - t0 < 20_000) await new Promise((r) => setTimeout(r, 150));
   const c = await send('POST', '/api/providers/codex/test', { level: 'canary', confirm: true });
-  assert.equal(c.status, 501);
+  assert.equal(c.status, 200, JSON.stringify(c.json));
+  assert.equal(c.json.verdict, 'inconclusive');
+  assert.equal(c.json.ok, false);
+  assert.equal((await get('/api/providers')).json.providers.find((p: any) => p.id === 'codex').tier, 'unverified');
 });
 
 test('POST /api/providers/:id/test: the id is checked against the registry before anything else; bodies are strict; a canary needs confirm:true EVERY time, runs one at a time, with a cool-down', async () => {

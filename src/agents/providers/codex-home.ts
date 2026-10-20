@@ -21,8 +21,11 @@ const CONFIG_SHA = sha256(CODEX_CONFIG_TOML);
  * AGENTS.md / agents.override.md, mcp* — is treated as planted and refused (fail closed; the message names it and how to clear it).
  */
 export const CODEX_HOME_ALLOWED: ReadonlySet<string> = new Set([
-  'auth.json', 'config.toml', 'history.jsonl', 'log', 'logs', 'sessions', 'archived_sessions', 'version.json', 'installation_id', 'cache', 'tmp', 'models_cache.json', 'shell_snapshots',
+  'auth.json', 'config.toml', 'history.jsonl', 'log', 'logs', 'sessions', 'archived_sessions', 'version.json', 'installation_id', 'cache', 'tmp', '.tmp', 'models_cache.json', 'shell_snapshots',
+  '.personality_migration', 'logs_2.sqlite', 'logs_2.sqlite-shm', 'logs_2.sqlite-wal',
 ]);
+/** Directories Codex creates for itself (seen on a real install) that CAN carry instructions or rules: allowed only while EMPTY. */
+export const CODEX_HOME_EMPTY_ONLY: ReadonlySet<string> = new Set(['memories', 'rules']);
 
 export interface HomeCheck {
   ok: boolean;
@@ -45,10 +48,15 @@ export function prepareCodexHome(home: string = codexHomePath()): HomeCheck {
     if ((lstatSync(home).mode & 0o077) !== 0) return { ok: false, problem: `${home} is accessible to other users and could not be tightened` };
 
     const names = readdirSync(home);
-    const stray = names.filter((n) => !CODEX_HOME_ALLOWED.has(n));
+    const stray = names.filter((n) => !CODEX_HOME_ALLOWED.has(n) && !CODEX_HOME_EMPTY_ONLY.has(n));
     if (stray.length) return { ok: false, problem: `the private Codex home holds entries Conductor did not put there (${stray.slice(0, 5).map((n) => JSON.stringify(n.slice(0, 40))).join(', ')}); move them out of ${home} to continue` };
     for (const n of names) {
       if (lstatSync(join(home, n)).isSymbolicLink()) return { ok: false, problem: `${join(home, n)} is a symbolic link` };
+    }
+    for (const n of names) {
+      if (!CODEX_HOME_EMPTY_ONLY.has(n)) continue;
+      const st2 = lstatSync(join(home, n));
+      if (!st2.isDirectory() || readdirSync(join(home, n)).length > 0) return { ok: false, problem: `${join(home, n)} must be an empty directory (it can carry instructions or rules Conductor did not write); move its contents out to continue` };
     }
     const auth = join(home, 'auth.json');
     if (existsSync(auth)) {

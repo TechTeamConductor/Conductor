@@ -6,6 +6,7 @@ import { ensureHome, paths } from './paths.ts';
 import { RunStore } from './store.ts';
 import { Board } from './board/index.ts';
 import { Agents } from './agents/provider.ts';
+import { runCodexCanary } from './agents/providers/canary.ts';
 import { Engine } from './pipeline/engine.ts';
 import { Api } from './server/api.ts';
 import { Auth } from './server/auth.ts';
@@ -30,6 +31,8 @@ export interface RuntimeOptions {
   /** Replace real CLI health checks (demo/tests). */
   health?: () => Promise<{ claude: any; cursor: any; codex?: any }>;
   probe?: (t: 'claude' | 'cursor') => Promise<{ ok: boolean; detail: string; durationMs: number }>;
+  /** Replace the real Codex isolation canary (demo/tests). */
+  canary?: (id: 'codex') => Promise<import('./agents/providers/canary.ts').CanaryReport>;
   openExec?: ExecFn;
   notify?: (title: string, message: string) => void;
   uiDir?: string;
@@ -93,6 +96,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     persistent: () => persistent.load(),
     health,
     probe: opts.probe ?? ((t) => doProbe(getConfig(), t)),
+    canary: opts.canary ?? (() => runCodexCanary({ bin: getConfig().agents.codex.bin })),
     openExec: opts.openExec,
   });
   const server = new DashboardServer({ api: apiRef, auth, store, engine, uiDir: opts.uiDir ?? join(ROOT, 'ui') });

@@ -13,6 +13,8 @@ import { PROVIDER_IDS, isProviderId, providerLabel } from '../agents/providers/r
 import { COMPLEXITIES, ROLES, ROLE_NEEDS, isComplexity, isRole, type RoleConfig, type Roles } from '../agents/roles.ts';
 import { validatePairing, type ProviderState } from '../agents/routing.ts';
 import { redact } from '../redact.ts';
+import { addRecord, buildVerificationInfo, loadRecords } from '../agents/providers/verification.ts';
+import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toSummary } from '../pipeline/view.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
@@ -49,6 +51,8 @@ export interface ApiDeps {
   persistent(): PersistentState;
   health(): Promise<ApiState['health']>;
   probe(target: 'claude' | 'cursor'): Promise<{ ok: boolean; detail: string; durationMs: number }>;
+  /** The Codex isolation canary (spends quota). Absent ⇒ the endpoint answers 501. */
+  canary?(id: 'codex'): Promise<CanaryReport>;
   openExec?: ExecFn;
 }
 
@@ -203,11 +207,20 @@ export class Api {
         detail: h?.detail ? truncate(redact(h.detail, []), 300) : undefined,
         hint: PROVIDER_HINT[id],
         capabilities: { ...s.caps },
+        buildVerification: s.caps.build ? buildVerificationInfo(id, h?.version) ?? undefined : undefined,
+        isolationCheck: this.isolationCheck(id, s.tier),
         tier: s.tier,
         inUse: used.has(id),
         pausedUntil: s.pausedUntil,
       };
     });
+  }
+
+  private isolationCheck(id: ProviderId, tier: ProviderState['tier']): ApiProvider['isolationCheck'] {
+    if (id !== 'codex') return undefined;
+    const last = loadRecords(id).filter((r) => r.kind === 'readOnly' && r.source === 'canary').pop();
+    if (!last) return undefined;
+    return { verdict: last.verdict, at: last.at, current: last.verdict === 'blocked' || tier === 'partial' };
   }
 
   roles(): ApiRoles {
@@ -430,13 +443,21 @@ export class Api {
       }
       // canary: spends quota — explicit confirmation on EVERY call, one at a time per provider, with a cool-down
       if (body.confirm !== true) throw new ApiFail(400, 'confirm_required', 'This check calls the model and uses your plan\'s quota. Send "confirm": true to run it.');
-      if (id === 'codex') throw new ApiFail(501, 'not_available', 'The Codex isolation check is not available in this build yet; Codex stays labelled "unverified" until it has run on a working install.');
+      if (id === 'codex' && !this.d.canary) throw new ApiFail(501, 'not_available', 'The Codex isolation check is not available in this build.');
       if (this.canaryBusy.has(id)) throw new ApiFail(409, 'busy', 'A check for this provider is already running.');
       const last = this.canaryLast.get(id) ?? 0;
       if (Date.now() - last < CANARY_COOLDOWN_MS) throw new ApiFail(429, 'cooldown', 'That check just ran. Wait a minute before running it again.');
       if (this.d.engine.status().running > 0) throw new ApiFail(409, 'busy', 'Stages are running; run this check when the board is idle.');
       this.canaryBusy.add(id);
       try {
+        if (id === 'codex') {
+          const rep = await this.d.canary!('codex');
+          this.canaryLast.set(id, Date.now());
+          if (rep.binding) addRecord({ provider: 'codex', kind: 'readOnly', verdict: rep.verdict, source: 'canary', binding: rep.binding, at: rep.ranAt, items: rep.items.map((i) => ({ id: i.id, outcome: i.outcome })) });
+          this.healthCache = null;
+          this.d.engine.invalidate();
+          return { json: { ok: rep.verdict === 'pass', level, verdict: rep.verdict, items: rep.items.map((i) => ({ id: i.id, outcome: i.outcome, detail: truncate(redact(i.detail, []), 300) })) } };
+        }
         const r = await this.d.probe(id as 'claude' | 'cursor');
         this.canaryLast.set(id, Date.now());
         return { json: { ok: r.ok, level, detail: truncate(redact(r.detail, []), 300), durationMs: r.durationMs } };

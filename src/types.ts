@@ -341,6 +341,10 @@ export interface ApiProvider {
   capabilities: { readOnly: boolean; build: boolean; buildIsolationVerified: boolean };
   /** Read-only isolation tier: how much to trust it for read-only roles. */
   tier: 'verified' | 'partial' | 'unverified' | 'blocked';
+  /** What backs the build isolation (display only): the code baseline or a re-verification record, and whether it matches the installed version. */
+  buildVerification?: { source: 'baseline' | 'live-suite'; verifiedOn: string; grandfathered: boolean; current: boolean | null };
+  /** Result of the last Codex isolation check, bound to the installed version (display only). */
+  isolationCheck?: { verdict: 'pass' | 'blocked' | 'inconclusive'; at: number; current: boolean };
   /** The provider appears in at least one role chain. */
   inUse: boolean;
   /** Paused by a usage limit until this time (epoch ms). */

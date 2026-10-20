@@ -19,7 +19,9 @@ import { Effects } from './effects.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
 import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers/registry.ts';
-import { readOnlyTier } from '../agents/providers/verification.ts';
+import { effectiveReadOnlyTier, readOnlyTier } from '../agents/providers/verification.ts';
+import { currentCodexBinding } from '../agents/providers/codex.ts';
+import { CANARY_VERSION } from '../agents/providers/canary.ts';
 import { route, type ProviderState, type States } from '../agents/routing.ts';
 import { resolveBin } from '../config.ts';
 import type { Role } from '../agents/roles.ts';
@@ -85,7 +87,7 @@ export class Engine {
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
-  private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean }> | null | undefined>) | null = null;
+  private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>) | null = null;
 
   constructor(deps: EngineDeps) {
     this.d = deps;
@@ -134,7 +136,7 @@ export class Engine {
   }
 
   /** Last known CLI health (the dashboard's cache). Without it every provider is assumed installed and auth unknown; spawn errors still name the real problem. */
-  setHealthSource(fn: () => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean }> | null | undefined>): void {
+  setHealthSource(fn: () => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>): void {
     this.healthSource = fn;
   }
 
@@ -148,7 +150,8 @@ export class Engine {
       const h = Object.hasOwn(health, id) ? health[id] : undefined;
       out[id] = {
         caps: capabilitiesOf(this.d.agents.provider(id)),
-        tier: readOnlyTier(id),
+        // code constant, adjusted by the add-only canary records (a pass counts only while the install still matches what was tested)
+        tier: id === 'codex' ? effectiveReadOnlyTier('codex', currentCodexBinding(cfg.agents.codex.bin, h?.version, CANARY_VERSION)) : readOnlyTier(id),
         installed: (bin ? resolveBin(bin) !== null : true) && h?.found !== false,
         auth: h?.loggedIn === false ? 'not-logged-in' : h?.loggedIn === true ? 'ok' : 'unknown',
         pausedUntil: this.activePause(id)?.until ?? null,
