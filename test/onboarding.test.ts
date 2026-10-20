@@ -47,7 +47,7 @@ test('create project: refuses bad names, bad identities, existing targets, links
   bad(() => createProject({ parent: 'relative/path', name: 'x' }), /full path/);
   bad(() => createProject({ parent: join(parent, 'nope'), name: 'x' }), /does not exist/);
   mkdirSync(process.env.CONDUCTOR_HOME!, { recursive: true });
-  bad(() => createProject({ parent: process.env.CONDUCTOR_HOME!, name: 'x' }), /Conductor data folder|system folder|inside a git|home folder/);
+  bad(() => createProject({ parent: realpathSync(process.env.CONDUCTOR_HOME!), name: 'x' }), /Conductor data folder|system folder|inside a git|home folder/);
   const repo = tmp();
   g(repo, 'init', '-q');
   bad(() => createProject({ parent: repo, name: 'x' }), /inside a git repository/);
