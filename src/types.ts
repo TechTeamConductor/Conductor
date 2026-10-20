@@ -67,6 +67,50 @@ export interface Plan {
   /** 'answer' = the task is a question/analysis that needs no code change: `answer` is the deliverable. Default 'code'. */
   deliverable?: 'code' | 'answer';
   answer?: string;
+  /** Optional decomposition (M3). A graph of fewer than 2 items is treated as no graph. */
+  taskGraph?: { items: PlanItem[] };
+}
+/** One planned unit of work. `files` are advisory for scope (build-class items only; ⊆ plan.filesToChange). */
+export interface PlanItem {
+  id: string; // T1, T2 …
+  title: string;
+  role: string; // implementation | documentation (build-class) · requirements | architecture | context (analysis-class); validated semantically
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[]; // acceptance-criterion ids this item satisfies
+  verification: string[];
+  parallelGroup?: string; // recorded for later parallel work; never used to schedule builds in v2.0
+}
+/** Stored item states. `ready` is DERIVED (pending with every dependency done), never stored. */
+export type ItemState = 'pending' | 'running' | 'done' | 'failed' | 'blocked';
+export interface ItemRun {
+  id: string;
+  /** Board key of this item's subtask card (null until the `subtasks` effect has created it). */
+  key: string | null;
+  title: string;
+  role: string;
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[];
+  verification: string[];
+  state: ItemState;
+  loop: number;
+  loopBudget: number;
+  agentRuns: number; // informational: Run.agentRuns governs budgets
+  /** HEAD before this item's builder started, and the per-attempt nonce its commit message must carry (crash adoption). */
+  startHead?: string;
+  nonce?: string;
+  commitSha?: string;
+  note?: string;
+}
+export interface TaskGraphRun {
+  items: ItemRun[];
+  /** Plan revision this graph belongs to (a re-plan discards it). */
+  rev: number;
+  startedAt: number;
+  final: 'pending' | 'verifying' | 'done';
 }
 export interface PlanReview {
   decision: 'approved' | 'changes_requested';
@@ -236,6 +280,8 @@ export interface Run {
   lastEventSeq: number;
   /** Conversation comments already consumed into prompts (board comment ids). */
   commentsSeen: string[];
+  /** Task-graph execution state (M3); absent for a plan without a graph. */
+  graph?: TaskGraphRun;
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
   restartTimes?: number[];
 }

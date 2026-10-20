@@ -57,6 +57,8 @@ export function conventionsBlock(files: { name: string; text: string }[]): strin
   return files.map((f) => fence(`repo-file:${f.name}`, f.text, 16_000)).join('\n\n');
 }
 
+import { isGraphPlan, itemsOf, sanitizeLine } from './graph.ts';
+
 export function planToMarkdown(p: Plan): string {
   const L: string[] = [];
   L.push(`### Summary`, p.summary, '');
@@ -66,6 +68,12 @@ export function planToMarkdown(p: Plan): string {
   if (p.filesToChange.length) {
     L.push('### Files to change', '| File | Action | Change | Reason |', '| --- | --- | --- | --- |');
     for (const f of p.filesToChange) L.push(`| \`${f.path}\` | ${f.action} | ${esc(f.change)} | ${esc(f.reason)} |`);
+    L.push('');
+  }
+  if (isGraphPlan(p)) {
+    // the decomposition is part of what a human approves: items, order, files and the criteria each one owns
+    L.push('### Tasks', '| Id | Role | Task | Depends on | Files | Criteria |', '| --- | --- | --- | --- | --- | --- |');
+    for (const it of itemsOf(p)) L.push(`| ${esc(it.id)} | ${esc(it.role)} | ${esc(sanitizeLine(it.title, 160))} — ${esc(sanitizeLine(it.objective, 300))} | ${esc(it.dependsOn.join(', ') || '—')} | ${esc(it.files.map((f) => `\`${f}\``).join(', ') || '—')} | ${esc(it.criteria.join(', ') || '—')} |`);
     L.push('');
   }
   if (p.steps.length) L.push('### Steps', ...p.steps.map((s, i) => `${i + 1}. ${s}`), '');

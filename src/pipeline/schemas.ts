@@ -53,6 +53,31 @@ export const PLAN_SCHEMA: Schema = {
       },
     },
     complexity: { type: 'string', enum: ['S', 'M', 'L'] },
+    taskGraph: {
+      type: 'object',
+      description: 'OPTIONAL decomposition. Omit it for a small, single-purpose change. Use it only when the work has several separable parts that depend on each other (medium: 2–6 items, large: up to 12).',
+      required: ['items'],
+      properties: {
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['id', 'title', 'role', 'objective', 'dependsOn', 'files', 'criteria', 'verification'],
+            properties: {
+              id: { ...str, description: 'T1, T2, …' },
+              title: str,
+              role: { ...str, description: "'implementation' or 'documentation' (they change files) · 'requirements', 'architecture' or 'context' (read-only analysis, no files)" },
+              objective: { ...str, description: 'what this item must achieve, in the planner\'s words' },
+              dependsOn: { ...strArr, description: 'ids of items that must be done first' },
+              files: { ...strArr, description: 'repo-relative paths this item changes — a subset of filesToChange; empty for analysis items' },
+              criteria: { ...strArr, description: 'acceptance-criterion ids (AC1 …) this item satisfies; every criterion must belong to at least one item' },
+              verification: strArr,
+              parallelGroup: str,
+            },
+          },
+        },
+      },
+    },
     deliverable: { type: 'string', enum: ['code', 'answer'], description: "'answer' when the task is a question/analysis that needs no code change" },
     answer: { ...str, description: 'REQUIRED when deliverable is "answer": the complete answer in markdown, citing files' },
   },

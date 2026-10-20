@@ -19,6 +19,7 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
+import { validateTaskGraph } from './graph.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
@@ -432,6 +433,7 @@ export class Stages {
       if (!errs.length && p.deliverable === 'answer' && !String(p.answer ?? '').trim()) errs.push('$.answer: required when deliverable is "answer"');
       if (!errs.length && p.deliverable !== 'answer' && !(p.filesToChange?.length > 0)) errs.push('$.deliverable: this plan changes no files — if the task is a question or analysis, set "deliverable" to "answer" and put the full answer in "answer"; otherwise list the files to change');
       if (!errs.length && p.deliverable !== 'answer' && !(p.acceptanceCriteria?.length > 0)) errs.push('$.acceptanceCriteria: needs at least 1 item for a code change');
+      if (!errs.length) errs.push(...validateTaskGraph(p)); // a malformed decomposition goes back to the planner once (corrective re-ask), then to a human
       return errs;
     });
     if (called.kind === 'stop') return;
