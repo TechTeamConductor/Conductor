@@ -39,8 +39,16 @@ function assertRev(rev: string, what = 'revision'): void {
   }
 }
 
-export const branchFor = (key: string): string => `conductor/${key.toLowerCase()}`;
-export const baseRefFor = (key: string): string => `refs/conductor/${key}/base`;
+/**
+ * v2-wide namespace (review K5): branches, base/backup refs and the default worktree folder are all DISTINCT from v1's
+ * (`conductor/…`, `refs/conductor/…`, `.conductor-worktrees`), so v1 and v2 can run on the same repository — even for the same
+ * card key — without ever sharing or deleting each other's checkout, branch or refs.
+ */
+export const BRANCH_PREFIX = 'conductor-v2/';
+export const REF_PREFIX = 'refs/conductor-v2/';
+export const DEFAULT_WORKTREE_DIR = '.conductor-v2-worktrees';
+export const branchFor = (key: string): string => `${BRANCH_PREFIX}${key.toLowerCase()}`;
+export const baseRefFor = (key: string): string => `${REF_PREFIX}${key}/base`;
 
 function isInside(parent: string, child: string): boolean {
   const rel = relative(parent, child);
@@ -178,7 +186,7 @@ async function detectDefaultBranch(root: string, currentBranch: string | null): 
 export interface WorktreeInfo {
   path: string;
   head: string | null;
-  branch: string | null; // full ref, e.g. refs/heads/conductor/eng-1
+  branch: string | null; // full ref, e.g. refs/heads/conductor-v2/eng-1
   detached: boolean;
   locked: boolean;
   prunable: boolean;
@@ -335,7 +343,7 @@ export async function createWorktree(opts: {
 
   const repoRoot = await realpath(repo.path);
   return withRepoLock(repoRoot, async () => {
-    const root = opts.worktreeRoot ?? join(dirname(repo.path), '.conductor-worktrees');
+    const root = opts.worktreeRoot ?? join(dirname(repo.path), DEFAULT_WORKTREE_DIR);
     const wtPath = join(root, repo.name, key);
     const branch = branchFor(key);
     const branchRef = `refs/heads/${branch}`;
@@ -795,8 +803,8 @@ async function createStashCommit(top: string, message: string): Promise<string |
 }
 
 /**
- * Carry-forward C5. Writes `refs/conductor/<key>/prev-<rev>` at HEAD and, when the working tree has uncommitted
- * changes (tracked OR untracked), `refs/conductor/<key>/stash-<rev>` (a stash-format commit, see `createStashCommit`).
+ * Carry-forward C5. Writes `refs/conductor-v2/<key>/prev-<rev>` at HEAD and, when the working tree has uncommitted
+ * changes (tracked OR untracked), `refs/conductor-v2/<key>/stash-<rev>` (a stash-format commit, see `createStashCommit`).
  * Never overwrites an existing, different backup: a numeric suffix (`-2`, `-3`, …) is added instead; the returned
  * names are authoritative. Recover with `git stash apply <stashRef>` / `git checkout <headRef>`.
  */
@@ -805,14 +813,14 @@ export async function backupRefs(worktree: string, key: string, rev: number): Pr
   if (!Number.isInteger(rev) || rev < 0) throw new Error(`invalid rev ${rev}`);
   const top = await topLevel(worktree);
   const head = await gitOk(top, ['rev-parse', 'HEAD']);
-  const headRef = await putRef(top, `refs/conductor/${key}/prev-${rev}`, head, async (existing) => existing === head);
+  const headRef = await putRef(top, `${REF_PREFIX}${key}/prev-${rev}`, head, async (existing) => existing === head);
 
   const stash = await createStashCommit(top, `conductor backup ${key} rev ${rev}`);
   let stashRef: string | null = null;
   if (stash) {
     const newTree = await gitOk(top, ['rev-parse', `${stash}^{tree}`]);
     const newU = await git(top, ['rev-parse', '--verify', '--quiet', `${stash}^3^{tree}`]);
-    stashRef = await putRef(top, `refs/conductor/${key}/stash-${rev}`, stash, async (existing) => {
+    stashRef = await putRef(top, `${REF_PREFIX}${key}/stash-${rev}`, stash, async (existing) => {
       // same backup content ⇒ reuse (idempotent re-run); compare tracked tree, base commit and untracked tree
       const t = await git(top, ['rev-parse', '--verify', '--quiet', `${existing}^{tree}`]);
       const p = await git(top, ['rev-parse', '--verify', '--quiet', `${existing}^1`]);
@@ -857,7 +865,7 @@ export async function removeWorktree(
     }
     await git(root, ['worktree', 'prune']);
     if (o.deleteBranch) {
-      if (!branch.startsWith('conductor/')) throw new Error(`refusing to delete non-conductor branch ${JSON.stringify(branch)}`);
+      if (!branch.startsWith(BRANCH_PREFIX)) throw new Error(`refusing to delete non-conductor branch ${JSON.stringify(branch)}`);
       assertRev(branch, 'branch');
       if (await refExists(root, `refs/heads/${branch}`)) {
         await gitOk(root, ['branch', o.force ? '-D' : '-d', '--', branch]);

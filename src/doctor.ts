@@ -88,7 +88,7 @@ export async function runChecks(cfg: Config): Promise<Check[]> {
       continue;
     }
     add(`repo:${r.name}`, `Repo ${r.name}`, r.gates.length ? 'ok' : 'warn', r.gates.length ? `Gates: ${r.gates.map((g) => g.name).join(', ')}` : 'No test/lint/typecheck commands detected — results will be flagged "unverified".');
-    const wtRoot = cfg.worktreeRoot ?? join(r.path, '..', '.conductor-worktrees');
+    const wtRoot = cfg.worktreeRoot ?? join(r.path, '..', '.conductor-v2-worktrees');
     const anc = await scanAncestors(join(wtRoot, r.name, 'x')).catch(() => []);
     if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `Cursor may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in the data folder's config.json to a clean folder if this causes trouble.`);
     if (r.path.startsWith('/Volumes/')) add(`volume:${r.name}`, 'External drive', 'warn', `${r.name} lives on an external volume — if you install the background service, launchd may start before the drive mounts (it retries automatically).`);

@@ -18,7 +18,7 @@ import { Auth } from '../src/server/auth.ts';
 import type { Plan, Run } from '../src/types.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'cond-core-'));
-const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHash: 'h', repo: 'r', branch: 'conductor/eng-1', worktree: '/w/ENG-1', baseSha: 'abc', loopBudget: 3 };
+const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHash: 'h', repo: 'r', branch: 'conductor-v2/eng-1', worktree: '/w/ENG-1', baseSha: 'abc', loopBudget: 3 };
 
 test('config: defaults are safe; hostile/garbage input is clamped, never trusted', () => {
   const d = defaultConfig();

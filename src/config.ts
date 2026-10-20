@@ -5,7 +5,7 @@ import type { Config, RepoConfig, Settings } from './types.ts';
 import { paths, ensureHome } from './paths.ts';
 import { atomicWriteFile, deepClone, readJsonFile } from './util.ts';
 import { CorruptFileError } from './schema/errors.ts';
-import { loadVersioned, quarantine, type VersionSpec } from './schema/version.ts';
+import { assertNotNewer, loadVersioned, quarantine, type VersionSpec } from './schema/version.ts';
 import { backupPaths } from './schema/backup.ts';
 import { logger } from './log.ts';
 
@@ -129,9 +129,11 @@ export function normalizeConfig(input: unknown): Config {
     worktreeRoot: typeof i.worktreeRoot === 'string' && i.worktreeRoot ? i.worktreeRoot : undefined,
   };
   // keys this build does not know (written by a newer build or by hand) are carried through untouched
-  const extra: Record<string, unknown> = { ...(i.extra && typeof i.extra === 'object' && !Array.isArray(i.extra) ? (i.extra as Record<string, unknown>) : {}) };
-  for (const [k, v] of Object.entries(i)) if (!KNOWN_CONFIG_KEYS.has(k) && k !== '__proto__') extra[k] = v;
-  if (Object.keys(extra).length) cfg.extra = extra;
+  const extra: Record<string, unknown> = Object.create(null); // no prototype: assigning "__proto__" below can never rewrite one
+  const BAD = new Set(['__proto__', 'constructor', 'prototype']); // S-10: never carried (they could rewrite a prototype when merged later)
+  if (i.extra && typeof i.extra === 'object' && !Array.isArray(i.extra)) for (const [k, v] of Object.entries(i.extra as Record<string, unknown>)) if (!BAD.has(k)) extra[k] = v;
+  for (const [k, v] of Object.entries(i)) if (!KNOWN_CONFIG_KEYS.has(k) && !BAD.has(k)) extra[k] = v;
+  if (Object.keys(extra).length) cfg.extra = { ...extra };
   if (!cfg.pipeline.failOn.length) cfg.pipeline.failOn = d.pipeline.failOn;
   return cfg;
 }
@@ -174,13 +176,11 @@ export function loadConfig(): Config {
 
 export function saveConfig(cfg: Config): void {
   ensureHome();
+  assertNotNewer(paths.config(), CONFIG_SPEC); // a newer build wrote it since we loaded it: do not overwrite (S-9)
   if (backupBeforeNextSave) {
+    // the old file is only replaced once its backup is safely on disk (S-7): a failed backup aborts the save
+    backupPaths([paths.config()], { label: 'pre-upgrade-config' });
     backupBeforeNextSave = false;
-    try {
-      backupPaths([paths.config()], { label: 'pre-upgrade-config' });
-    } catch (e) {
-      log.warn(`could not back up the old config before upgrading it: ${(e as Error).message}`);
-    }
   }
   const { extra, ...known } = cfg;
   atomicWriteFile(paths.config(), JSON.stringify({ ...(extra ?? {}), ...known }, null, 2) + '\n', 0o600);
@@ -257,5 +257,6 @@ export function loadState(): PersistentState {
 }
 export function saveState(s: PersistentState): void {
   ensureHome();
+  assertNotNewer(paths.state(), STATE_SPEC);
   atomicWriteFile(paths.state(), JSON.stringify({ ...s, schemaVersion: STATE_SPEC.current }, null, 2) + '\n', 0o600);
 }

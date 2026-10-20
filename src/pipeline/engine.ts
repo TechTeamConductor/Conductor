@@ -11,6 +11,7 @@ import { loadEnvSecrets, redact } from '../redact.ts';
 import { logger } from '../log.ts';
 import { notify as defaultNotify } from '../notify.ts';
 import * as W from '../git/worktree.ts';
+import { BRANCH_PREFIX } from '../git/worktree.ts';
 import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
 import { laneForRun } from '../board/lanes.ts';
@@ -307,7 +308,7 @@ export class Engine {
       description: item.description ?? '',
       descHash: sha1(item.description ?? ''),
       repo: repo?.name ?? '',
-      branch: `conductor/${slug(item.key)}`,
+      branch: `${BRANCH_PREFIX}${slug(item.key)}`,
       worktree: '',
       baseSha: '',
       loopBudget: cfg.pipeline.maxLoops,

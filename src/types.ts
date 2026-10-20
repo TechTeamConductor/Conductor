@@ -186,7 +186,7 @@ export interface Run {
   description: string; // snapshot at claim; a later edit halts the run at the next stage boundary
   descHash: string;
   repo: string; // RepoConfig.name
-  branch: string; // conductor/<key-lower>
+  branch: string; // conductor-v2/<key-lower>
   worktree: string;
   baseSha: string;
   commitSha?: string;

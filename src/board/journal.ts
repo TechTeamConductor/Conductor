@@ -1,9 +1,10 @@
-import { closeSync, existsSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, readdirSync } from 'node:fs';
+import { closeSync, constants, existsSync, lstatSync, fchmodSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync, readdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { acquireLock, type LockInfo } from '../lock.ts';
 import { loadVersioned, type VersionSpec } from '../schema/version.ts';
 import { CorruptFileError, NewerVersionError } from '../schema/errors.ts';
 import { randomToken } from '../util.ts';
+import { validateEntity } from './validate.ts';
 import { BOARD_SCHEMA_VERSION, type BoardSnapshot, type JournalOp } from './types.ts';
 
 const OP_KINDS = new Set(['project', 'milestone', 'item', 'comment', 'decision']);
@@ -58,7 +59,14 @@ export class Journal {
     this.journalFile = join(dir, 'journal.ndjson');
     this.readOnly = opts.readOnly === true;
     this.fault = opts.fault ?? (() => undefined);
-    if (!this.readOnly) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!this.readOnly) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      try {
+        chmodSync(dir, 0o700); // an existing folder with loose permissions is tightened (S-12)
+      } catch {
+        /* not ours / unsupported */
+      }
+    }
   }
 
   /** Writer: take the single-writer lock. Throws LockHeldError when another live writer exists. */
@@ -68,6 +76,13 @@ export class Journal {
   }
 
   load(): JournalLoad {
+    for (const f of [this.snapshotFile, this.journalFile]) {
+      try {
+        if (lstatSync(f).isSymbolicLink()) throw new CorruptFileError('board', f, 'is a symbolic link — Conductor never follows links for its own data files');
+      } catch (e) {
+        if (e instanceof CorruptFileError) throw e; // (a missing file is fine)
+      }
+    }
     const snap = loadVersioned<BoardSnapshot>(this.snapshotFile, SNAPSHOT_SPEC, () => null as unknown as BoardSnapshot);
     const snapshot = snap.existed ? snap.data : null;
     const baseSeq = snapshot?.seq ?? 0;
@@ -75,43 +90,54 @@ export class Journal {
     let tornBytes = 0;
     if (existsSync(this.journalFile)) {
       const buf = readFileSync(this.journalFile);
-      const text = buf.toString('utf8');
-      const lines = text.split('\n');
-      const last = lines.length - 1; // the segment after the final '\n' (empty when the file ends cleanly)
-      // index of the last non-empty segment: only THAT line may be torn
+      // split on 0x0A at the BYTE level: offsets stay exact whatever the encoding of the content (S-8)
+      const segs: { start: number; end: number; terminated: boolean }[] = [];
+      for (let pos = 0; pos < buf.length; ) {
+        const nl = buf.indexOf(0x0a, pos);
+        if (nl < 0) {
+          segs.push({ start: pos, end: buf.length, terminated: false });
+          break;
+        }
+        segs.push({ start: pos, end: nl, terminated: true });
+        pos = nl + 1;
+      }
       let lastNonEmpty = -1;
-      for (let i = last; i >= 0; i--) if (lines[i]!.length > 0) { lastNonEmpty = i; break; }
+      for (let i = segs.length - 1; i >= 0; i--) if (segs[i]!.end > segs[i]!.start) { lastNonEmpty = i; break; }
       let goodBytes = 0;
-      let cursor = 0;
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i]!;
-        const lineBytes = Buffer.byteLength(line, 'utf8') + (i < last ? 1 : 0);
-        if (line.length === 0) {
-          cursor += lineBytes;
-          if (i < last) goodBytes = cursor;
+      let tornCopy: Buffer | null = null;
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i]!;
+        const after = seg.terminated ? seg.end + 1 : seg.end;
+        if (seg.end === seg.start) {
+          goodBytes = after; // a blank line is harmless
           continue;
         }
-        let op: JournalOp | null = null;
+        let parsed: unknown = null;
         try {
-          op = JSON.parse(line) as JournalOp;
-          if (!op || typeof op !== 'object' || typeof (op as any).seq !== 'number' || !OP_KINDS.has((op as any).t) || !(op as any).e || typeof (op as any).e !== 'object') throw new Error('not an operation');
+          parsed = JSON.parse(buf.toString('utf8', seg.start, seg.end));
         } catch {
-          op = null;
+          parsed = null;
         }
+        // a newer build's operation is refused WHATEVER else is wrong with it or where it sits in the file (S-2: it must never be
+        // mistaken for a torn tail and deleted by an older build)
+        if (parsed && typeof parsed === 'object' && typeof (parsed as any).v === 'number' && (parsed as any).v > 1) {
+          throw new NewerVersionError('board journal', this.journalFile, (parsed as any).v, 1);
+        }
+        const op = this.asOp(parsed);
         if (!op) {
           if (i === lastNonEmpty) {
-            tornBytes = buf.length - cursor;
-            break; // torn / garbled final line: ignore it
+            tornBytes = buf.length - seg.start;
+            tornCopy = buf.subarray(seg.start);
+            break; // torn / garbled FINAL line: ignore it (a copy is kept when we cut it off)
           }
           throw new CorruptFileError('board journal', this.journalFile, `line ${i + 1} is unreadable and is followed by more data (refusing to skip it silently)`);
         }
-        if ((op as any).v > 1) throw new NewerVersionError('board journal', this.journalFile, (op as any).v, 1);
         if (op.seq > baseSeq) ops.push(op);
-        cursor += lineBytes;
-        goodBytes = cursor;
+        goodBytes = after;
       }
       if (!this.readOnly && tornBytes > 0) {
-        // cut the torn tail so the next append starts on a clean line boundary
+        // keep what we are about to cut off (a complete-but-garbled last line may be recoverable by hand), then truncate
+        if (tornCopy) writeFileSync(`${this.journalFile}.torn-${Date.now()}`, tornCopy, { mode: 0o600 });
         const fd = openSync(this.journalFile, 'r+');
         try {
           ftruncateSync(fd, goodBytes);
@@ -130,9 +156,35 @@ export class Journal {
         }
       }
     }
+    if (snapshot) this.validateSnapshot(snapshot);
     this.size = existsSync(this.journalFile) ? statSync(this.journalFile).size : 0;
     if (!this.readOnly) this.cleanStaleTemps();
     return { snapshot, ops, tornBytes };
+  }
+
+  /** Structural validation of one journal line (S-5): shape, then entity fields. Returns null for anything that is not a valid operation. */
+  private asOp(parsed: unknown): JournalOp | null {
+    if (!parsed || typeof parsed !== 'object') return null;
+    const op = parsed as any;
+    if (op.v !== 1 || !Number.isInteger(op.seq) || op.seq < 1 || !OP_KINDS.has(op.t) || !Number.isFinite(op.ts)) return null;
+    if (validateEntity(op.t, op.e) !== null) return null;
+    if (op.nextSeq !== undefined && !(op.nextSeq && typeof op.nextSeq.projectId === 'string' && Number.isInteger(op.nextSeq.value) && op.nextSeq.value >= 1)) return null;
+    return op as JournalOp;
+  }
+
+  private validateSnapshot(s: BoardSnapshot): void {
+    const bad = (what: string) => {
+      throw new CorruptFileError('board snapshot', this.snapshotFile, what);
+    };
+    if (!Number.isInteger(s.seq) || s.seq < 0) bad('seq');
+    for (const [name, list] of [['projects', s.projects], ['milestones', s.milestones], ['items', s.items], ['comments', s.comments], ['decisions', s.decisions]] as const) {
+      if (!Array.isArray(list)) bad(`${name} is not a list`);
+      const t = name === 'projects' ? 'project' : name === 'milestones' ? 'milestone' : name === 'items' ? 'item' : name === 'comments' ? 'comment' : 'decision';
+      for (const e of list) {
+        const err = validateEntity(t, e);
+        if (err) bad(`${name}: ${err}`);
+      }
+    }
   }
 
   /** Snapshot temp files left behind by a crash mid-compaction are garbage. */
@@ -152,7 +204,13 @@ export class Journal {
   private openJournal(): number {
     if (this.fd === null) {
       const existed = existsSync(this.journalFile);
-      this.fd = openSync(this.journalFile, 'a', 0o600);
+      // O_NOFOLLOW: a symlink planted at the journal path is refused, never written through (S-12)
+      this.fd = openSync(this.journalFile, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+      try {
+        fchmodSync(this.fd, 0o600);
+      } catch {
+        /* best effort (Windows) */
+      }
       if (!existed) fsyncDir(this.dir); // make the new file's directory entry durable
     }
     return this.fd;

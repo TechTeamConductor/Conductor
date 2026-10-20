@@ -191,7 +191,7 @@ test('crash recovery: a run that was mid-build restarts cleanly without duplicat
     const after = h.run(key);
     assert.equal(after.status, 'ready');
     assert.ok(!git(after.worktree, 'ls-files').includes('partial.mjs'), 'partial work was discarded (and backed up)');
-    assert.ok(git(after.worktree, 'for-each-ref', '--format=%(refname)', `refs/conductor/${key}/`).includes('stash-'), 'partial work is recoverable');
+    assert.ok(git(after.worktree, 'for-each-ref', '--format=%(refname)', `refs/conductor-v2/${key}/`).includes('stash-'), 'partial work is recoverable');
     const plans = (await comments(h, key)).filter((c) => c.includes('Conductor plan'));
     assert.equal(plans.length, 1);
   } finally {

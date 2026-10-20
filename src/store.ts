@@ -13,12 +13,13 @@ import type { LogEvent, Run } from './types.ts';
 import { paths } from './paths.ts';
 import { atomicWriteFile, deepClone } from './util.ts';
 import { NewerVersionError } from './schema/errors.ts';
-import { quarantine } from './schema/version.ts';
+import { assertNotNewer, quarantine, type VersionSpec } from './schema/version.ts';
 import { migrateRunV1ToV2 } from './schema/run-migrations.ts';
 import { logger } from './log.ts';
 
 /** Version of the run.json shape this build reads and writes. (Shape-changing migrations are registered with the code that consumes them — M1b.) */
 export const RUN_SCHEMA_VERSION = 2;
+const RUN_SPEC: VersionSpec = { kind: 'run record', field: 'schemaVersion', current: RUN_SCHEMA_VERSION, assumeWhenMissing: 1 };
 const log = logger('store');
 
 export type StoreEvent = { type: 'run'; key: string } | { type: 'log'; key: string; event: LogEvent };
@@ -99,10 +100,19 @@ export class RunStore {
   private readRunFile(key: string): Run | null {
     const f = this.runFile(key);
     if (!existsSync(f)) return null;
+    let text: string;
+    try {
+      text = readFileSync(f, 'utf8');
+    } catch (e) {
+      // an I/O error (permissions, EIO) is not corruption: leave the file exactly where it is — has() stays true, so the key is never re-claimed (S-4)
+      log.warn(`${key}: run.json cannot be read (${(e as Error).message}) — left untouched and ignored`);
+      return null;
+    }
     let raw: any;
     try {
-      raw = JSON.parse(readFileSync(f, 'utf8'));
+      raw = JSON.parse(text);
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('not an object');
+      if (raw.schemaVersion !== undefined && !(Number.isInteger(raw.schemaVersion) && raw.schemaVersion >= 1)) throw new Error('schemaVersion is not a positive integer');
     } catch (e) {
       const kept = this.readOnly ? null : quarantine(f);
       log.warn(`${key}: run.json is unreadable (${(e as Error).message})${kept ? ` — kept as ${kept}` : ' — left in place'} and ignored`);
@@ -132,6 +142,7 @@ export class RunStore {
     fn(cur);
     cur.updatedAt = Date.now();
     cur.schemaVersion = RUN_SCHEMA_VERSION;
+    assertNotNewer(this.runFile(key), RUN_SPEC); // a newer build wrote this record meanwhile: do not overwrite it (S-9)
     atomicWriteFile(this.runFile(key), JSON.stringify(cur, null, 2) + '\n', 0o600);
     this.cache.set(key, deepClone(cur));
     this.emit({ type: 'run', key });

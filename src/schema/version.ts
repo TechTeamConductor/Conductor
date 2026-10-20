@@ -36,14 +36,16 @@ export interface Loaded<T> {
  */
 export function loadVersioned<T extends Record<string, any>>(file: string, spec: VersionSpec, fallback: () => T): Loaded<T> {
   if (!existsSync(file)) return { data: fallback(), fromVersion: spec.current, migrated: false, existed: false };
+  const text = readFileSync(file, 'utf8'); // an I/O error (EACCES, EIO …) is NOT corruption: it propagates and nothing is touched (S-4)
   let raw: any;
   try {
-    raw = JSON.parse(readFileSync(file, 'utf8'));
+    raw = JSON.parse(text);
   } catch (e) {
     throw new CorruptFileError(spec.kind, file, `not valid JSON (${(e as Error).message})`);
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new CorruptFileError(spec.kind, file, 'expected a JSON object');
-  const v = typeof raw[spec.field] === 'number' && Number.isFinite(raw[spec.field]) ? (raw[spec.field] as number) : spec.assumeWhenMissing;
+  if (raw[spec.field] !== undefined && !(Number.isInteger(raw[spec.field]) && raw[spec.field] >= 1)) throw new CorruptFileError(spec.kind, file, `"${spec.field}" is not a positive integer`);
+  const v = raw[spec.field] === undefined ? spec.assumeWhenMissing : (raw[spec.field] as number);
   if (v > spec.current) throw new NewerVersionError(spec.kind, file, v, spec.current);
   let data = raw;
   let migrated = false;
@@ -67,8 +69,24 @@ export function saveVersioned(file: string, data: Record<string, any>, spec: Ver
     backupPaths([file], { root: opts.backupRoot, label: `pre-migration-${spec.kind.replace(/[^a-z0-9]+/gi, '-')}` });
     backedUp.add(file);
   }
+  assertNotNewer(file, spec);
   const out = { ...data, [spec.field]: spec.current };
   atomicWriteFile(file, JSON.stringify(out, null, 2) + '\n', opts.mode ?? 0o600);
+}
+
+/**
+ * Refuse to overwrite a file that a NEWER build has written since we loaded it (S-9). Unreadable/garbled files do not block a write
+ * (they were handled at load time); only a clearly newer version does.
+ */
+export function assertNotNewer(file: string, spec: VersionSpec): void {
+  if (!existsSync(file)) return;
+  let v: unknown;
+  try {
+    v = JSON.parse(readFileSync(file, 'utf8'))?.[spec.field];
+  } catch {
+    return;
+  }
+  if (typeof v === 'number' && Number.isFinite(v) && v > spec.current) throw new NewerVersionError(spec.kind, file, v, spec.current);
 }
 
 /** Keep a corrupt file next to itself for forensics before anything else touches it. */

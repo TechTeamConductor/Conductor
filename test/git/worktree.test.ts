@@ -183,16 +183,16 @@ describe('withRepoLock', () => {
 // ───────────────────────────── createWorktree ─────────────────────────────
 
 describe('createWorktree', () => {
-  it('creates <repo parent>/.conductor-worktrees/<name>/<key> on branch conductor/<key-lowercase> at the base SHA', async () => {
+  it('creates <repo parent>/.conductor-v2-worktrees/<name>/<key> on branch conductor-v2/<key-lowercase> at the base SHA', async () => {
     const r = makeRepo();
     const base = r.head();
     const w = await mkWt(r, 'ENG-123');
-    assert.equal(w.path, join(r.root, '.conductor-worktrees', 'demo', 'ENG-123'));
-    assert.equal(w.branch, 'conductor/eng-123');
+    assert.equal(w.path, join(r.root, '.conductor-v2-worktrees', 'demo', 'ENG-123'));
+    assert.equal(w.branch, 'conductor-v2/eng-123');
     assert.equal(w.baseSha, base);
     assert.equal(w.created, true);
     assert.equal(sgt(w.path, ['rev-parse', 'HEAD']), base);
-    assert.equal(sgt(w.path, ['symbolic-ref', '--short', 'HEAD']), 'conductor/eng-123');
+    assert.equal(sgt(w.path, ['symbolic-ref', '--short', 'HEAD']), 'conductor-v2/eng-123');
     assert.ok(statSync(join(w.path, '.conductor')).isDirectory());
     assert.equal(sgt(r.dir, ['rev-parse', baseRefFor('ENG-123')]), base, 'base is recorded in a ref');
     const wts = await listWorktrees(r.dir);
@@ -261,15 +261,15 @@ describe('createWorktree', () => {
     assert.equal(new Set(out.map((o) => o.path)).size, 5);
     for (const [i, o] of out.entries()) {
       assert.equal(o.baseSha, base);
-      assert.equal(o.branch, `conductor/${keys[i]!.toLowerCase()}`);
+      assert.equal(o.branch, `conductor-v2/${keys[i]!.toLowerCase()}`);
       assert.equal(sgt(o.path, ['rev-parse', 'HEAD']), base);
       assert.ok(existsSync(join(o.path, '.conductor')));
     }
     assert.equal((await listWorktrees(r.dir)).length, 6);
     const fsck = sgTry(r.dir, ['fsck', '--no-dangling']);
     assert.equal(fsck.code, 0, fsck.stderr);
-    const branches = sgt(r.dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/conductor']).split('\n').sort();
-    assert.deepEqual(branches, keys.map((k) => `conductor/${k.toLowerCase()}`).sort());
+    const branches = sgt(r.dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/conductor-v2']).split('\n').sort();
+    assert.deepEqual(branches, keys.map((k) => `conductor-v2/${k.toLowerCase()}`).sort());
   });
 
   it('worktree-isolation: main checkout is byte-identical after creating worktrees and committing in them', async () => {
@@ -285,7 +285,7 @@ describe('createWorktree', () => {
     assert.equal(sgt(r.dir, ['rev-parse', 'HEAD']), r.head());
     assert.equal(readFileSync(join(r.dir, 'src/index.js'), 'utf8'), 'a\n');
     const heads = sgt(r.dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']).split('\n').sort();
-    assert.deepEqual(heads, ['conductor/eng-1', 'conductor/eng-2', 'main']);
+    assert.deepEqual(heads, ['conductor-v2/eng-1', 'conductor-v2/eng-2', 'main']);
   });
 
   it('git-excludes .conductor/, copied env files and node_modules in the SHARED exclude file', async () => {
@@ -336,8 +336,8 @@ describe('createWorktree', () => {
     for (const bad of ['../outside-secret', 'a/../../outside-secret', '/etc/hosts', '~/x', '.git/config', 'ok/../../x', '']) {
       await assert.rejects(mkWt(r, 'ENG-1', { copyFiles: [bad] }), /copyFiles|escapes|invalid/, `entry ${JSON.stringify(bad)}`);
     }
-    assert.equal(existsSync(join(r.root, '.conductor-worktrees')), false, 'nothing was created');
-    assert.equal(sgTry(r.dir, ['rev-parse', '--verify', '--quiet', 'refs/heads/conductor/eng-1']).code !== 0, true, 'no branch created');
+    assert.equal(existsSync(join(r.root, '.conductor-v2-worktrees')), false, 'nothing was created');
+    assert.equal(sgTry(r.dir, ['rev-parse', '--verify', '--quiet', 'refs/heads/conductor-v2/eng-1']).code !== 0, true, 'no branch created');
   });
 
   it('copyFiles: does not follow symlinks out of the repo', async () => {
@@ -360,7 +360,7 @@ describe('createWorktree', () => {
 
   it('refuses to adopt a non-empty directory that is not a registered worktree', async () => {
     const r = makeRepo();
-    const target = join(r.root, '.conductor-worktrees', 'demo', 'ENG-1');
+    const target = join(r.root, '.conductor-v2-worktrees', 'demo', 'ENG-1');
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, 'precious.txt'), 'x');
     await assert.rejects(mkWt(r, 'ENG-1'), /not a registered worktree/);
@@ -837,8 +837,8 @@ describe('backupRefs + resetToBase (C5)', () => {
     const { r, w, commitA } = await dirtyWorktree();
     const stBefore = sg(w.path, ['status', '--porcelain=v2', '--untracked-files=all']);
     const { headRef, stashRef } = await backupRefs(w.path, 'ENG-1', 1);
-    assert.equal(headRef, 'refs/conductor/ENG-1/prev-1');
-    assert.equal(stashRef, 'refs/conductor/ENG-1/stash-1');
+    assert.equal(headRef, 'refs/conductor-v2/ENG-1/prev-1');
+    assert.equal(stashRef, 'refs/conductor-v2/ENG-1/stash-1');
     assert.equal(sgt(r.dir, ['rev-parse', headRef]), commitA, 'headRef = pre-reset HEAD');
     assert.equal(sg(w.path, ['status', '--porcelain=v2', '--untracked-files=all']), stBefore, 'backupRefs does not touch the work tree or index');
     const parents = sgt(r.dir, ['rev-list', '--parents', '-n', '1', stashRef!]).split(' ');
@@ -916,12 +916,12 @@ describe('backupRefs + resetToBase (C5)', () => {
     const two = await backupRefs(w.path, 'ENG-1', 1);
     assert.equal(two.headRef, one.headRef, 'same HEAD ⇒ same headRef');
     assert.notEqual(two.stashRef, one.stashRef);
-    assert.equal(two.stashRef, 'refs/conductor/ENG-1/stash-1-2');
+    assert.equal(two.stashRef, 'refs/conductor-v2/ENG-1/stash-1-2');
     assert.equal(sgt(r.dir, ['rev-parse', one.stashRef!]), firstStash, 'earlier stash untouched');
 
     await commitAllIn(w.path, 'moved head', { 'b.txt': 'b' });
     const three = await backupRefs(w.path, 'ENG-1', 1);
-    assert.equal(three.headRef, 'refs/conductor/ENG-1/prev-1-2');
+    assert.equal(three.headRef, 'refs/conductor-v2/ENG-1/prev-1-2');
     assert.equal(sgt(r.dir, ['rev-parse', one.headRef]), w.baseSha);
   });
 
@@ -981,10 +981,10 @@ describe('removeWorktree', () => {
 
   it('refuses the main working tree, unregistered directories and non-conductor branches', async () => {
     const r = makeRepo();
-    await assert.rejects(removeWorktree(r.dir, r.dir, 'conductor/x'), /main working tree/);
+    await assert.rejects(removeWorktree(r.dir, r.dir, 'conductor-v2/x'), /main working tree/);
     const stray = tmpDir('stray');
     writeFileSync(join(stray, 'keep.txt'), 'keep');
-    await assert.rejects(removeWorktree(r.dir, stray, 'conductor/x'), /not a registered worktree/);
+    await assert.rejects(removeWorktree(r.dir, stray, 'conductor-v2/x'), /not a registered worktree/);
     assert.ok(existsSync(join(stray, 'keep.txt')));
     const w = await mkWt(r);
     await assert.rejects(removeWorktree(r.dir, w.path, 'main', { deleteBranch: true }), /non-conductor branch/);
@@ -1208,5 +1208,36 @@ describe('writeCursorGuard / checkCursorGuard', () => {
     writeFileSync(file, CURSOR_GUARD_JSON);
     assert.equal((await checkCursorGuard(w.path, g.sha256)).ok, true, 'restoring the exact bytes passes');
     assert.equal((await checkCursorGuard(w.path, null)).ok, true, 'no sha expected ⇒ nothing to check');
+  });
+});
+
+// ───────────────────────────── K5: v2-wide namespace — v1 and v2 never share a checkout, branch or ref ─────────────────────────────
+describe('v2 namespace (review K5)', () => {
+  it('a v1-registered worktree/branch/base-ref for the SAME key is never re-attached, modified or deleted by v2', async () => {
+    const r = makeRepo();
+    // what v1 would have created for ENG-1
+    const v1Root = join(r.root, '.conductor-worktrees', 'demo', 'ENG-1');
+    mkdirSync(join(r.root, '.conductor-worktrees', 'demo'), { recursive: true });
+    sgt(r.dir, ['worktree', 'add', '-q', '-b', 'conductor/eng-1', v1Root, 'HEAD']);
+    sgt(r.dir, ['update-ref', 'refs/conductor/ENG-1/base', r.head()]);
+    writeFileSync(join(v1Root, 'v1-work.txt'), 'v1 was here');
+    const v1Head = sgt(v1Root, ['rev-parse', 'HEAD']);
+
+    const w = await mkWt(r, 'ENG-1');
+    assert.notEqual(w.path, v1Root);
+    assert.match(w.path, /\.conductor-v2-worktrees/);
+    assert.equal(w.branch, 'conductor-v2/eng-1');
+    assert.equal(existsSync(join(w.path, 'v1-work.txt')), false, 'v2 did not pick up v1\'s checkout');
+
+    // v1's checkout is exactly as it was
+    assert.equal(readFileSync(join(v1Root, 'v1-work.txt'), 'utf8'), 'v1 was here');
+    assert.equal(sgt(v1Root, ['rev-parse', 'HEAD']), v1Head);
+    assert.equal(sgt(v1Root, ['symbolic-ref', '--short', 'HEAD']), 'conductor/eng-1');
+
+    // removing v2's worktree (with branch deletion) cannot touch v1's branch/ref, and v2 refuses to delete a v1 branch by name
+    await removeWorktree(r.dir, w.path, w.branch!.replace('refs/heads/', ''), { deleteBranch: true });
+    assert.equal(sgt(r.dir, ['rev-parse', '--verify', 'refs/heads/conductor/eng-1']), v1Head);
+    assert.equal(sgt(r.dir, ['rev-parse', '--verify', 'refs/conductor/ENG-1/base']), r.head());
+    await assert.rejects(removeWorktree(r.dir, v1Root, 'conductor/eng-1', { deleteBranch: true }), /refusing to delete non-conductor branch/);
   });
 });

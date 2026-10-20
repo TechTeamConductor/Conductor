@@ -47,7 +47,7 @@ test('re-run from To do while work is mid-flight: backup ref is written before t
     // human wants a completely fresh attempt: status ready + To do ⇒ rework (keeps commits) — verify backup ref exists
     await h.engine.applyHumanMove(key, 'todo');
     await h.settle();
-    const refs = git(run.worktree, 'for-each-ref', '--format=%(refname)', `refs/conductor/${key}/`);
+    const refs = git(run.worktree, 'for-each-ref', '--format=%(refname)', `refs/conductor-v2/${key}/`);
     assert.ok(refs.includes(`prev-${run.rev}`), `backup ref present: ${refs}`);
   } finally {
     await h.cleanup();

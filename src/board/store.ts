@@ -23,7 +23,7 @@ import {
   type ExternalLink,
 } from './types.ts';
 
-export const LIMITS = { title: 200, description: 50_000, comment: 100_000, decisionBody: 50_000, maxDepth: 6, maxDeps: 50 };
+export const LIMITS = { title: 200, description: 50_000, comment: 100_000, decisionBody: 50_000, maxDepth: 6, maxDeps: 50, maxItems: 50_000, maxCommentsPerItem: 2_000, maxBytes: 120_000_000 };
 const PROJECT_KEY_RE = /^[A-Z]{2,6}$/;
 /** Same shape the HTTP API and the run store accept (api.ts KEY_RE ∩ store.ts KEY_RE ∩ branch naming). */
 const ITEM_KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
@@ -104,6 +104,8 @@ export class Board {
   private commentsByItem = new Map<string, BoardComment[]>();
   private commentIdem = new Map<string, string>(); // `${itemId}|${idemKey}` → comment id
   private decisionsById = new Map<string, Decision>();
+  /** Rough size of all text held (titles, descriptions, comments, decisions): keeps compaction far below V8's string limit (S-6). */
+  private approxBytes = 0;
 
   private constructor(opts: BoardOptions) {
     this.dir = opts.dir ?? paths.board();
@@ -124,6 +126,7 @@ export class Board {
       this.opsSinceSnapshot = loaded.ops.length;
       this.recoveredTornBytes = loaded.tornBytes;
       this.rederiveNextSeq();
+      this.approxBytes = this.measure();
     } catch (e) {
       this.journal.close();
       throw e;
@@ -195,6 +198,17 @@ export class Board {
         this.decisionsById.set(op.e.id, op.e);
         break;
     }
+  }
+
+  private measure(): number {
+    let n = 0;
+    for (const i of this.itemsById.values()) n += i.title.length + i.description.length;
+    for (const l of this.commentsByItem.values()) for (const c of l) n += c.body.length;
+    for (const d of this.decisionsById.values()) n += d.title.length + d.body.length;
+    return n;
+  }
+  private reserve(bytes: number): void {
+    if (this.approxBytes + bytes > LIMITS.maxBytes) throw new BoardError('full', 'The board holds as much text as it safely can. Archive or clean up old work first.');
   }
 
   /** nextSeq can never lag behind an existing key (guards a torn write between an item and its counter). */
@@ -353,7 +367,9 @@ export class Board {
       author: actor === 'user' ? 'user' : 'conductor',
       ts: this.now(),
     };
+    this.reserve(d.title.length + d.body.length);
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'decision', e: d }), { type: 'decision', id: d.id });
+    this.approxBytes += d.title.length + d.body.length;
     return { ...d };
   }
   decisions(projectId?: string): Decision[] {
@@ -404,6 +420,7 @@ export class Board {
       const existing = this.itemIdem.get(input.idemKey);
       if (existing) return cloneItem(this.itemsById.get(existing)!);
     }
+    if (this.itemsById.size >= LIMITS.maxItems) throw new BoardError('full', `The board holds at most ${LIMITS.maxItems} cards.`);
     const project = this.projectsById.get(input.projectId);
     if (!project) throw new BoardError('not_found', 'Unknown project.');
     if (project.archived) throw new BoardError('archived', 'This project is archived.');
@@ -458,7 +475,9 @@ export class Board {
       idemKey: input.idemKey,
     };
     // ONE journal line carries the item and the project's bumped counter (C2): a torn write can never re-issue a key.
+    this.reserve(item.title.length + item.description.length);
     this.commit((seq, t) => ({ v: 1, seq, ts: t, t: 'item', e: item, nextSeq: { projectId: project.id, value: n } }), { type: 'item', id: item.id });
+    this.approxBytes += item.title.length + item.description.length;
     return cloneItem(item);
   }
 
@@ -544,7 +563,10 @@ export class Board {
       ts: this.now(),
       idemKey: opts.idemKey,
     };
+    if ((this.commentsByItem.get(item.id)?.length ?? 0) >= LIMITS.maxCommentsPerItem) throw new BoardError('full', `A card can hold at most ${LIMITS.maxCommentsPerItem} comments.`);
+    this.reserve(c.body.length);
     this.commit((seq, ts) => ({ v: 1, seq, ts, t: 'comment', e: c }), { type: 'comment', id: c.id });
+    this.approxBytes += c.body.length;
     return { ...c };
   }
   comments(itemId: string): BoardComment[] {
