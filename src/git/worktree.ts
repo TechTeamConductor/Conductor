@@ -132,7 +132,7 @@ export async function inspectRepo(path: string): Promise<RepoInfo> {
   if (homes.has(real)) throw new Error('refusing to use the home directory as a repository');
 
   const condHomes = new Set<string>();
-  for (const c of [conductorHome(), join(homedir(), '.conductor')]) condHomes.add(await realpathLoose(c));
+  for (const c of [conductorHome(), join(homedir(), '.conductor'), join(homedir(), '.conductor-v2')]) condHomes.add(await realpathLoose(c));
   for (const c of condHomes) {
     if (isInside(c, real)) throw new Error(`refusing to use a path inside the Conductor home (${c})`);
   }

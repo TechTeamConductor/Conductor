@@ -176,6 +176,8 @@ export interface HistoryLine {
   text: string;
 }
 export interface Run {
+  /** On-disk data version of this record (see src/schema). Stamped on every write; absent in legacy files = 1. */
+  schemaVersion?: number;
   key: string; // Linear identifier, e.g. "ENG-123"
   issueId: string;
   teamId: string;
@@ -248,6 +250,8 @@ export interface RepoConfig {
 }
 export interface Config {
   version: number;
+  /** Unknown top-level keys found on disk (e.g. written by a newer build) — preserved verbatim on save, never interpreted. */
+  extra?: Record<string, unknown>;
   ui: { port: number; openBrowser: boolean };
   linear: {
     teamId?: string;

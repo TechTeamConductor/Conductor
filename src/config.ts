@@ -4,6 +4,15 @@ import { homedir } from 'node:os';
 import type { Config, RepoConfig, Settings } from './types.ts';
 import { paths, ensureHome } from './paths.ts';
 import { atomicWriteFile, deepClone, readJsonFile } from './util.ts';
+import { CorruptFileError } from './schema/errors.ts';
+import { loadVersioned, quarantine, type VersionSpec } from './schema/version.ts';
+import { backupPaths } from './schema/backup.ts';
+import { logger } from './log.ts';
+
+const log = logger('config');
+/** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 2, assumeWhenMissing: 1 };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'linear', 'repos', 'agents', 'stages', 'pipeline', 'worktreeRoot', 'extra']);
 
 export function defaultConfig(): Config {
   return {
@@ -119,6 +128,10 @@ export function normalizeConfig(input: unknown): Config {
     },
     worktreeRoot: typeof i.worktreeRoot === 'string' && i.worktreeRoot ? i.worktreeRoot : undefined,
   };
+  // keys this build does not know (written by a newer build or by hand) are carried through untouched
+  const extra: Record<string, unknown> = { ...(i.extra && typeof i.extra === 'object' && !Array.isArray(i.extra) ? (i.extra as Record<string, unknown>) : {}) };
+  for (const [k, v] of Object.entries(i)) if (!KNOWN_CONFIG_KEYS.has(k) && k !== '__proto__') extra[k] = v;
+  if (Object.keys(extra).length) cfg.extra = extra;
   if (!cfg.pipeline.failOn.length) cfg.pipeline.failOn = d.pipeline.failOn;
   return cfg;
 }
@@ -139,13 +152,38 @@ function normRepo(r: RepoConfig): RepoConfig {
   };
 }
 
+/**
+ * Reads the config under the version contract. A config written by a NEWER build throws NewerVersionError (the caller must
+ * refuse to start and must not write). A corrupt file is kept aside as `config.json.corrupt-<ts>` and defaults are used.
+ */
+let backupBeforeNextSave = false;
 export function loadConfig(): Config {
-  return normalizeConfig(readJsonFile<unknown>(paths.config(), {}));
+  try {
+    const l = loadVersioned<Record<string, any>>(paths.config(), CONFIG_SPEC, () => ({}));
+    backupBeforeNextSave = l.existed && l.fromVersion < CONFIG_SPEC.current; // an older file is rewritten in the new shape on the next save → keep the original first
+    return normalizeConfig(l.data);
+  } catch (e) {
+    if (e instanceof CorruptFileError) {
+      const kept = quarantine(paths.config());
+      log.warn(`config.json was unreadable — kept as ${kept ?? paths.config()}; starting from defaults`);
+      return normalizeConfig({});
+    }
+    throw e;
+  }
 }
 
 export function saveConfig(cfg: Config): void {
   ensureHome();
-  atomicWriteFile(paths.config(), JSON.stringify(cfg, null, 2) + '\n', 0o600);
+  if (backupBeforeNextSave) {
+    backupBeforeNextSave = false;
+    try {
+      backupPaths([paths.config()], { label: 'pre-upgrade-config' });
+    } catch (e) {
+      log.warn(`could not back up the old config before upgrading it: ${(e as Error).message}`);
+    }
+  }
+  const { extra, ...known } = cfg;
+  atomicWriteFile(paths.config(), JSON.stringify({ ...(extra ?? {}), ...known }, null, 2) + '\n', 0o600);
   try {
     chmodSync(paths.config(), 0o600);
   } catch {
@@ -209,11 +247,21 @@ export function resolveBin(bin: string): string | null {
 export interface PersistentState {
   repos: Record<string, { approvedPlans: number }>;
 }
+export const STATE_SPEC: VersionSpec = { kind: 'state', field: 'schemaVersion', current: 1, assumeWhenMissing: 1 };
 export function loadState(): PersistentState {
-  const s = readJsonFile<Partial<PersistentState>>(paths.state(), {});
-  return { repos: s.repos && typeof s.repos === 'object' ? s.repos : {} };
+  try {
+    const s = loadVersioned<Partial<PersistentState>>(paths.state(), STATE_SPEC, () => ({})).data;
+    return { repos: s.repos && typeof s.repos === 'object' ? s.repos : {} };
+  } catch (e) {
+    if (e instanceof CorruptFileError) {
+      const kept = quarantine(paths.state());
+      log.warn(`state.json was unreadable — kept as ${kept ?? paths.state()}; starting empty`);
+      return { repos: {} };
+    }
+    throw e;
+  }
 }
 export function saveState(s: PersistentState): void {
   ensureHome();
-  atomicWriteFile(paths.state(), JSON.stringify(s, null, 2) + '\n', 0o600);
+  atomicWriteFile(paths.state(), JSON.stringify({ ...s, schemaVersion: STATE_SPEC.current }, null, 2) + '\n', 0o600);
 }

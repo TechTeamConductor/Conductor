@@ -64,6 +64,12 @@ Nothing in your working tree or branches. It does add: a git **worktree** per ta
 `config.json` (0600) · `state.json` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock}`.
 Worktrees: `<repo parent>/.conductor-worktrees/<repo>/<KEY>` on branch `conductor/<key>`; recoverable backups under `refs/conductor/<KEY>/…`.
 
+## v2 data home, versions and backups (M1a)
+
+v2 keeps its data in **`~/.conductor-v2`** (override with `CONDUCTOR_HOME`) — never in the v1 `~/.conductor`, so running v2 code can never touch v1 data. Everything it writes carries a data version: `config.json` (`version`), `state.json`/`run.json` (`schemaVersion`), the native board (`board/snapshot.json` header + a `v` on every `board/journal.ndjson` line). Rules: a file from a **newer** build is refused (nothing is written, the app tells you to upgrade or restore); an older file is migrated in memory and its original is copied to **`~/.conductor-backups/<timestamp>/`** (outside every Conductor home, override `CONDUCTOR_BACKUP_DIR`) before the first write; unknown config keys are preserved; a corrupt `config.json`/`state.json`/`run.json` is kept aside as `*.corrupt-<ts>` instead of being overwritten.
+
+**Board storage** (`board/`): an append-only journal (one line per change = the resulting entity; each append is written and `fsync`ed) plus an atomic snapshot (temp file → `fsync` → rename → directory `fsync`), compacted every 500 operations and on clean close. A torn final journal line is ignored; a corrupt middle line makes the board refuse to open. Single writer (lock); `doctor`/dry-runs open it read-only. Durability is scoped to the board: run records still use plain atomic writes.
+
 ## Known limits (v1)
 
 - Claude headless sessions are not listed by the Claude app's Code tab; use "Open in Claude app" (`claude --desktop --resume`) or the resume command.

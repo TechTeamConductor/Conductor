@@ -6,7 +6,7 @@ import { mkdirSync } from 'node:fs';
 export function conductorHome(): string {
   return process.env.CONDUCTOR_HOME && process.env.CONDUCTOR_HOME.length > 0
     ? process.env.CONDUCTOR_HOME
-    : join(homedir(), '.conductor');
+    : join(homedir(), '.conductor-v2'); // v2's own home: running this code can never touch the v1 data in ~/.conductor
 }
 export const paths = {
   home: () => conductorHome(),
@@ -14,6 +14,7 @@ export const paths = {
   secrets: () => join(conductorHome(), 'secrets.json'),
   state: () => join(conductorHome(), 'state.json'),
   runs: () => join(conductorHome(), 'runs'),
+  board: () => join(conductorHome(), 'board'),
   run: (key: string) => join(conductorHome(), 'runs', key),
   logs: () => join(conductorHome(), 'logs'),
   runtime: () => join(conductorHome(), 'run'),

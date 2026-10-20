@@ -11,7 +11,14 @@ import {
 import { join } from 'node:path';
 import type { LogEvent, Run } from './types.ts';
 import { paths } from './paths.ts';
-import { atomicWriteFile, deepClone, readJsonFile } from './util.ts';
+import { atomicWriteFile, deepClone } from './util.ts';
+import { NewerVersionError } from './schema/errors.ts';
+import { quarantine } from './schema/version.ts';
+import { logger } from './log.ts';
+
+/** Version of the run.json shape this build reads and writes. (Shape-changing migrations are registered with the code that consumes them — M1b.) */
+export const RUN_SCHEMA_VERSION = 1;
+const log = logger('store');
 
 export type StoreEvent = { type: 'run'; key: string } | { type: 'log'; key: string; event: LogEvent };
 export type StoreListener = (e: StoreEvent) => void;
@@ -78,9 +85,28 @@ export class RunStore {
         mkdirSync(dir, { recursive: false, mode: 0o700 });
       } else throw e;
     }
+    run.schemaVersion = RUN_SCHEMA_VERSION;
     atomicWriteFile(this.runFile(run.key), JSON.stringify(run, null, 2) + '\n', 0o600);
     this.cache.set(run.key, deepClone(run));
     this.emit({ type: 'run', key: run.key });
+  }
+
+  /** Read run.json under the version contract: newer ⇒ refuse (NewerVersionError); corrupt ⇒ keep the bad file aside and report "no run". */
+  private readRunFile(key: string): Run | null {
+    const f = this.runFile(key);
+    if (!existsSync(f)) return null;
+    let raw: any;
+    try {
+      raw = JSON.parse(readFileSync(f, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('not an object');
+    } catch (e) {
+      const kept = quarantine(f);
+      log.warn(`${key}: run.json is unreadable (${(e as Error).message}) — kept as ${kept ?? 'run.json'} and ignored`);
+      return null;
+    }
+    const v = typeof raw.schemaVersion === 'number' ? raw.schemaVersion : 1;
+    if (v > RUN_SCHEMA_VERSION) throw new NewerVersionError('run record', f, v, RUN_SCHEMA_VERSION);
+    return raw as Run;
   }
 
   has(key: string): boolean {
@@ -90,7 +116,7 @@ export class RunStore {
   get(key: string): Run | null {
     const hit = this.cache.get(key);
     if (hit) return deepClone(hit);
-    const r = readJsonFile<Run | null>(this.runFile(key), null);
+    const r = this.readRunFile(key);
     if (r) this.cache.set(key, deepClone(r));
     return r ? deepClone(r) : null;
   }
@@ -101,6 +127,7 @@ export class RunStore {
     if (!cur) throw new RunStoreError('missing', `run ${key} not found`);
     fn(cur);
     cur.updatedAt = Date.now();
+    cur.schemaVersion = RUN_SCHEMA_VERSION;
     atomicWriteFile(this.runFile(key), JSON.stringify(cur, null, 2) + '\n', 0o600);
     this.cache.set(key, deepClone(cur));
     this.emit({ type: 'run', key });

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "ui": {
+    "port": 4317,
+    "openBrowser": true
+  },
+  "linear": {
+    "teamId": "team-0000",
+    "teamKey": "ENG",
+    "mode": "labels",
+    "triggerLabel": "conductor",
+    "pollSeconds": 30,
+    "pickupFromBacklog": false,
+    "allowAssignedToMe": false,
+    "viewerId": "user-0000"
+  },
+  "repos": [
+    {
+      "name": "demo-app",
+      "path": "/tmp/demo-app",
+      "baseBranch": "main",
+      "gates": [
+        {
+          "name": "test",
+          "cmd": "npm test"
+        }
+      ],
+      "copyFiles": [
+        ".env",
+        ".env.local"
+      ],
+      "envPassthrough": []
+    }
+  ],
+  "agents": {
+    "claude": {
+      "bin": "claude",
+      "isolation": "safe-mode",
+      "maxTurns": {
+        "plan": 40,
+        "review": 25,
+        "verify": 40
+      }
+    },
+    "cursor": {
+      "bin": "agent"
+    }
+  },
+  "stages": {
+    "plan": "claude",
+    "review": "claude",
+    "verify": "claude"
+  },
+  "pipeline": {
+    "maxParallel": 2,
+    "maxLoops": 3,
+    "maxAgentRunsPerIssue": 10,
+    "planApproval": "first",
+    "planReview": "auto",
+    "onClaudeLimit": "wait",
+    "failOn": [
+      "blocker",
+      "major"
+    ],
+    "noGates": "warn",
+    "timeoutsMin": {
+      "plan": 20,
+      "review": 10,
+      "build": 90,
+      "verify": 30,
+      "idle": 10,
+      "gate": 15
+    }
+  }
+}
