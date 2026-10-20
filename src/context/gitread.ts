@@ -38,6 +38,8 @@ export interface GitSource {
   lsTreeRecursive(tree: string): Promise<{ entries: TreeEntry[]; truncated: boolean }>;
   /** Contents of blobs by id (each already known to be ≤ `maxEach` bytes); null when missing or too large. */
   catBlobs(shas: string[], maxEach: number): Promise<Map<string, string | null>>;
+  /** Same, byte-exact (for writing files): total output of one call is capped at `READER_LIMITS.catBytes`. */
+  catBuffers(shas: string[], maxEach: number): Promise<Map<string, Buffer | null>>;
 }
 
 const HEX_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -121,7 +123,12 @@ export class GitReader implements GitSource {
   }
 
   async catBlobs(shas: string[], maxEach: number): Promise<Map<string, string | null>> {
-    const out = new Map<string, string | null>();
+    const raw = await this.catBuffers(shas, maxEach);
+    return new Map([...raw].map(([k, v]) => [k, v === null ? null : v.toString('utf8')]));
+  }
+
+  async catBuffers(shas: string[], maxEach: number): Promise<Map<string, Buffer | null>> {
+    const out = new Map<string, Buffer | null>();
     const want = [...new Set(shas)].filter(isObjectId);
     if (!want.length) return out;
     this.guard();
@@ -170,7 +177,7 @@ export class GitReader implements GitSource {
       if (len > maxEach || m[2] !== 'blob') {
         out.set(sha, null);
       } else {
-        out.set(sha, buf.subarray(pos, pos + len).toString('utf8'));
+        out.set(sha, Buffer.from(buf.subarray(pos, pos + len)));
       }
       pos += len + 1; // content + the newline git appends
     }

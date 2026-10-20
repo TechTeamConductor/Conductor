@@ -143,6 +143,7 @@ function verdictFor() {
 let payload;
 if (stage === 'plan') payload = planFor();
 else if (stage === 'plan_review') payload = reviewFor();
+else if (stage === 'ask') payload = { kind: 'answer', answer: `Answer about ${title}.`, citations: [], ...(step.json ?? {}) };
 else if (stage === 'analysis') payload = { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) };
 else if (stage === 'verify') payload = verdictFor();
 else payload = { note: `fake claude does not handle stage ${stage}` };

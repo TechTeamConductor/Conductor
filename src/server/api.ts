@@ -17,6 +17,8 @@ import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
 import { OFFLINE_OPERATIONS } from '../net/offline.ts';
+import { AskError, type AskService } from '../asks/service.ts';
+import { ASK_ID_RE } from '../asks/store.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
 import { errMsg, truncate } from '../util.ts';
@@ -42,6 +44,8 @@ export interface ApiResult {
 }
 
 export interface ApiDeps {
+  /** Quick Ask (M5). Absent ⇒ the ask endpoints answer 501. */
+  asks?: AskService;
   engine: Engine;
   store: RunStore;
   board: Board;
@@ -307,6 +311,11 @@ export class Api {
     };
   }
 
+  private asksSvc(): AskService {
+    if (!this.d.asks) throw new ApiFail(501, 'not_available', 'Quick Ask is not available here.');
+    return this.d.asks;
+  }
+
   runDetail(key: string): ApiRunDetail {
     if (!KEY_RE.test(key)) throw new ApiFail(404, 'not_found', 'Unknown run.');
     const run = this.d.store.get(key);
@@ -347,6 +356,7 @@ export class Api {
       if (e instanceof ApiFail) throw e;
       if (e instanceof EngineError) throw new ApiFail(e.code === 'missing' ? 404 : e.code === 'bad_lane' || e.code === 'bad_repo' ? 400 : 409, e.code, e.message);
       if (e instanceof BoardError) throw new ApiFail(boardStatus(e.code), e.code, e.message);
+      if (e instanceof AskError) throw new ApiFail(e.status, e.code, e.message);
       if (e instanceof OpenError) throw new ApiFail(e.code === 'bad_target' ? 400 : 409, e.code, e.message);
       throw e;
     }
@@ -360,6 +370,13 @@ export class Api {
       if (path === '/api/board') return { json: this.boardView() };
       if (path === '/api/providers') return { json: { providers: this.providers(await this.cachedHealth()) } };
       if (path === '/api/roles') return { json: this.roles() };
+      if (path === '/api/asks') return { json: { asks: this.asksSvc().list() } };
+      if ((m = /^\/api\/asks\/([^/]+)$/.exec(path))) {
+        const id = safeDecode(m[1]!);
+        const rec = ASK_ID_RE.test(id) ? this.asksSvc().get(id) : null;
+        if (!rec) throw new ApiFail(404, 'not_found', 'Unknown question.');
+        return { json: rec };
+      }
       if (path === '/api/offline') return { json: { online: (await this.d.engine.probe.check()) !== 'offline', checkedAt: this.d.engine.probe.last()?.at ?? null, operations: OFFLINE_OPERATIONS } };
       if ((m = /^\/api\/items\/([^/]+)$/.exec(path))) return { json: this.itemView(safeDecode(m[1]!)) };
       if ((m = /^\/api\/runs\/([^/]+)\/log$/.exec(path))) {
@@ -368,6 +385,24 @@ export class Api {
       throw new ApiFail(404, 'not_found', 'No such endpoint.');
     }
 
+    if (method === 'POST' && path === '/api/ask') {
+      const allowed = new Set(['question', 'repo', 'allowChange']);
+      for (const k of Object.keys(body)) if (!allowed.has(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      if (body.allowChange !== undefined && typeof body.allowChange !== 'boolean') throw new ApiFail(400, 'bad_request', '"allowChange" must be true or false.');
+      return { status: 202, json: this.asksSvc().start({ question: body.question, repo: body.repo, allowChange: body.allowChange }) };
+    }
+    if ((m = /^\/api\/asks\/([^/]+)\/cancel$/.exec(path)) && method === 'POST') {
+      const id = safeDecode(m[1]!);
+      const rec = ASK_ID_RE.test(id) ? this.asksSvc().cancel(id) : null;
+      if (!rec) throw new ApiFail(404, 'not_found', 'Unknown question.');
+      return { json: rec };
+    }
+    if ((m = /^\/api\/asks\/([^/]+)$/.exec(path)) && method === 'DELETE') {
+      const id = safeDecode(m[1]!);
+      if (!ASK_ID_RE.test(id)) throw new ApiFail(404, 'not_found', 'Unknown question.');
+      this.asksSvc().remove(id);
+      return { json: { ok: true } };
+    }
     if (method === 'POST' && path === '/api/auth/logout') return { json: { ok: true }, logout: true };
 
     if (method === 'POST' && path === '/api/tasks') {

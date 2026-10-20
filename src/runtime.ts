@@ -1,3 +1,4 @@
+import { AskService } from './asks/service.ts';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './types.ts';
@@ -94,7 +95,10 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     }
     return { ...agentsNow, warnings };
   };
+  const asks = new AskService({ getConfig, agents, routeStates: () => engine.routeStates(), freshHealth: () => engine.freshHealth(), secrets: () => [] });
+  asks.failInterrupted();
   const apiRef = new Api({
+    asks,
     engine,
     store,
     board,

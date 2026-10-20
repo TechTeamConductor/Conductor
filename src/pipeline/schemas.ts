@@ -144,3 +144,19 @@ export const ITEM_NOTE_SCHEMA: Schema = {
     decisions: { ...strArr, description: 'decisions the implementation tasks must follow, one per entry' },
   },
 };
+
+/** Quick Ask: one call decides whether the request is a question (answer) or a request to change something (offered, never auto-run). */
+export const ASK_SCHEMA: Schema = {
+  type: 'object',
+  required: ['kind'],
+  properties: {
+    kind: { type: 'string', enum: ['answer', 'change'] },
+    answer: { ...str, description: 'markdown, at most 20 000 characters, citing files' },
+    change: {
+      type: 'object',
+      required: ['title', 'description', 'files', 'complexity'],
+      properties: { title: str, description: str, files: strArr, complexity: { type: 'string', enum: ['S', 'M', 'L'] } },
+    },
+    citations: { type: 'array', maxItems: 30, items: { type: 'object', required: ['file', 'lines'], properties: { file: str, lines: str } } },
+  },
+};

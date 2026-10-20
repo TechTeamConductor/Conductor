@@ -113,6 +113,7 @@ if (!isBuild) {
   const payload =
     stage === 'plan' ? { ...planDefault, ...(step.json ?? {}) }
     : stage === 'plan_review' ? { decision: 'approved', summary: 'Looks right.', issues: [], ...(step.json ?? {}) }
+    : stage === 'ask' ? { kind: 'answer', answer: 'Answer.', citations: [], ...(step.json ?? {}) }
     : stage === 'analysis' ? { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) }
     : { verdict: step.json?.verdict ?? 'pass', summary: step.json?.summary ?? 'Verified.', acceptance: step.json?.acceptance ?? ids.map((id) => ({ id, status: (step.json?.verdict ?? 'pass') === 'pass' ? 'met' : 'not_met', evidence: 'feature.mjs:1' })), bugs: step.json?.bugs ?? [] };
   const text = `Using SoftCo Lead to analyse this.\n\`\`\`json\n${JSON.stringify(step.raw ?? payload, null, 2)}\n\`\`\``;

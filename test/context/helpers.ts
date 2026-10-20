@@ -83,6 +83,10 @@ export class SpyReader implements GitSource {
     this.catted.push(...shas);
     return this.inner.catBlobs(shas, max);
   }
+  catBuffers(shas: string[], max: number) {
+    this.catted.push(...shas);
+    return this.inner.catBuffers(shas, max);
+  }
 }
 
 /** A stub source over a synthetic listing (no git). */
@@ -110,6 +114,10 @@ export function stubSource(opts: { top: TreeEntry[]; recursive: Record<string, T
     async catBlobs(shas: string[]) {
       calls++;
       return new Map(shas.map((s) => [s, opts.blobs?.[s] ?? null]));
+    },
+    async catBuffers(shas: string[]) {
+      calls++;
+      return new Map(shas.map((s) => [s, opts.blobs?.[s] != null ? Buffer.from(opts.blobs[s]!) : null]));
     },
   };
 }

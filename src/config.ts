@@ -72,6 +72,7 @@ export function defaultConfig(): Config {
       maxItems: 12,
       readOnlyParallel: 2,
       contextRunsPerDay: 12,
+      asksPerHour: 20,
       verifyEachItem: false,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
@@ -141,6 +142,7 @@ export function normalizeConfig(input: unknown): Config {
       maxItems: clamp(pl.maxItems, 1, 12, d.pipeline.maxItems), // 12 is the hard v2.0 ceiling (src/pipeline/graph.ts) — config can only lower it
       readOnlyParallel: clamp(pl.readOnlyParallel, 1, 4, d.pipeline.readOnlyParallel),
       contextRunsPerDay: clamp(pl.contextRunsPerDay, 1, 48, d.pipeline.contextRunsPerDay),
+      asksPerHour: clamp(pl.asksPerHour, 1, 60, d.pipeline.asksPerHour),
       verifyEachItem: pl.verifyEachItem === true,
       timeoutsMin: {
         plan: clamp(to.plan, 1, 240, d.pipeline.timeoutsMin.plan),
