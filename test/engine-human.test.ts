@@ -120,6 +120,7 @@ test('description edited by the viewer mid-run halts at the next stage boundary'
     // re-plan from Todo snapshots the new description
     h.linear.humanMove(h.linear.issueByKey(key).id, 'Todo');
     await h.settle();
+    assert.equal(h.run(key).rev, 2, 'Todo after a description change RE-PLANS (rev 2), it does not just retry the build');
     assert.ok(['awaiting_approval', 'ready'].includes(h.run(key).status));
     assert.equal(h.run(key).description, 'Actually do something else');
   } finally {

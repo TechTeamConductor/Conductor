@@ -25,14 +25,15 @@ test('config: defaults are safe; hostile/garbage input is clamped, never trusted
   assert.equal(d.linear.mode, 'labels');
   assert.equal(d.linear.pickupFromBacklog, false);
   assert.equal(d.linear.allowAssignedToMe, false);
-  assert.equal(d.pipeline.planApproval, 'first');
+  assert.equal(d.pipeline.planApproval, 'auto', 'hands-off by default');
+  assert.equal(d.pipeline.onClaudeLimit, 'cursor', 'a rate-limited Claude must not stall the pipeline');
   const n = normalizeConfig({ ui: { port: 3 }, linear: { pollSeconds: 1, mode: 'weird' }, pipeline: { maxParallel: 999, maxLoops: -4, planApproval: 'sometimes', failOn: ['nope'] }, repos: [{ name: '../evil', path: 'relative' }, { name: 'ok', path: '/abs' }], stages: { plan: 'gpt' } });
   assert.equal(n.ui.port, 1024);
   assert.equal(n.linear.pollSeconds, 15);
   assert.equal(n.linear.mode, 'labels');
   assert.equal(n.pipeline.maxParallel, 6);
   assert.equal(n.pipeline.maxLoops, 1);
-  assert.equal(n.pipeline.planApproval, 'first');
+  assert.equal(n.pipeline.planApproval, 'auto');
   assert.deepEqual(n.pipeline.failOn, ['blocker', 'major']);
   assert.deepEqual(n.repos.map((r) => r.name), ['ok']);
   assert.equal(n.stages.plan, 'claude');
@@ -132,7 +133,7 @@ test('service: plist is valid XML (plutil -lint), uses absolute paths, escapes v
   if (process.platform === 'darwin') assert.match(execFileSync('plutil', ['-lint', f], { encoding: 'utf8' }), /OK/);
   assert.ok(xml.includes(`<string>${SERVICE_LABEL}</string>`));
   assert.ok(xml.includes('/b&amp;c'), 'ampersand escaped');
-  assert.match(xml, /<key>KeepAlive<\/key>\s*<true\/>/);
+  assert.match(xml, /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>/, 'restart after crashes, not after a clean "already running" exit');
   assert.match(xml, /<key>RunAtLoad<\/key>\s*<true\/>/);
   assert.ok(xml.includes('<string>--no-open</string>') && xml.includes('<string>start</string>'));
   assert.ok(!xml.includes('LINEAR') && !xml.includes('API_KEY'), 'no secrets in the plist');
@@ -234,3 +235,17 @@ test('auth: OTP expires; sessions are random; revoke works', () => {
   assert.equal(a.validSession(undefined), false);
 });
 void chmodSync;
+
+test('auth: sessions can survive a restart (only hashes are stored, file is 0600)', () => {
+  const dir = tmp();
+  const f = join(dir, 'sessions.json');
+  const a1 = new Auth({ persistPath: f });
+  const sid = a1.consumeOtp(a1.mintOtp())!;
+  assert.equal((statSync(f).mode & 0o777).toString(8), '600');
+  assert.ok(!readFileSync(f, 'utf8').includes(sid), 'the session id itself is never written to disk');
+  const a2 = new Auth({ persistPath: f });
+  assert.equal(a2.validSession(sid), true, 'still signed in after a restart');
+  a2.revoke(sid);
+  assert.equal(new Auth({ persistPath: f }).validSession(sid), false, 'logout survives a restart too');
+  rmSync(dir, { recursive: true, force: true });
+});

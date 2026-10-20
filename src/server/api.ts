@@ -85,13 +85,22 @@ export class Api {
     const cfg = this.d.getConfig();
     const now = Date.now();
     const st = this.d.engine.status();
+    // Say WHICH Claude is limited: Conductor uses the `claude` CLI login, which can differ from the Claude desktop app's account.
+    const providerPause = { ...st.providerPause };
+    const claudeHealth = this.healthCache?.value.claude;
+    if (providerPause.claude && claudeHealth?.found && claudeHealth.detail) {
+      providerPause.claude = {
+        ...providerPause.claude,
+        reason: `${providerPause.claude.reason} — Conductor uses the "claude" command-line tool (${claudeHealth.detail}). That login can be a different plan from the Claude desktop app. To switch it run: claude auth logout && claude auth login`,
+      };
+    }
     return {
       now,
       runs: this.d.store.list().map((r) => toSummary(r, cfg, now)),
       engine: {
         paused: st.paused,
         pauseReason: st.pauseReason,
-        providerPause: st.providerPause,
+        providerPause,
         running: st.running,
         maxParallel: st.maxParallel,
         lastPollAt: st.lastPollAt,
@@ -127,7 +136,8 @@ export class Api {
       now: live.now,
       version: this.d.version,
       csrf: this.d.auth.csrf,
-      setup: { complete: steps.every((s) => s.ok), steps },
+      // Agent health is a banner, not a gate: a Claude sign-out must not send a configured user back to the wizard.
+      setup: { complete: steps.filter((s) => s.id !== 'agents').every((s) => s.ok), steps },
       health,
       quota: live.quota,
       engine: live.engine,

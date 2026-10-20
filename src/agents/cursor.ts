@@ -20,7 +20,7 @@ export function buildCursorArgs(c: Pick<CursorCall, 'mode' | 'cwd' | 'model'>): 
   return args;
 }
 
-const LIMIT_RE = /(usage|rate|spend|request)\s*limit|quota|exceeded (your|the) (plan|limit|usage)|too many requests|\b429\b|out of (usage|credits)/i;
+const LIMIT_RE = /(usage|rate|spend)\s*limit|quota (exceeded|reached)|exceeded (your|the) (plan|limit|usage|quota)|too many requests|out of (usage|credits)/i;
 
 export interface CursorNormState {
   thinking: string;
@@ -53,8 +53,9 @@ function toolOutcome(name: string, result: any): { ok: boolean; text: string } {
     if (name === 'glob') return { ok: true, text: `${s.totalFiles ?? 0} files` };
     return { ok: true, text: '' };
   }
-  const err = result.error ?? result.failure ?? result.rejected ?? result.permissionDenied;
-  return { ok: false, text: truncate(typeof err === 'string' ? err : JSON.stringify(err ?? result).slice(0, 200), 200) };
+  const err = result.error ?? result.failure ?? result.rejected ?? result.permissionDenied ?? Object.values(result).find((v) => v && typeof v === 'object');
+  const reason = typeof err === 'string' ? err : err && typeof err === 'object' && typeof (err as any).error === 'string' ? (err as any).error : JSON.stringify(err ?? result);
+  return { ok: false, text: truncate(reason, 200) };
 }
 
 export function normalizeCursorEvent(obj: any, ctx: { stage: CursorCall['stage']; secrets?: string[] }, st: CursorNormState): EmitEvent[] {

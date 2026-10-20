@@ -288,6 +288,7 @@ export class Engine {
       }
     }
     for (const issue of issues) {
+      if (this.globalPaused) break; // paused from the dashboard: no new claims, no new Linear writes for new issues
       if (this.d.store.has(issue.identifier)) continue;
       try {
         await this.maybeClaim(issue);
@@ -360,7 +361,7 @@ export class Engine {
     await this.effects.comment(
       full.identifier,
       'claimed',
-      `🤖 **Conductor picked this up.** Plan (Claude) → build (Cursor) → independent verification (Claude). Live view: http://127.0.0.1:${cfg.ui.port}`,
+      `🤖 **Conductor picked this up.** Plan (Claude) → build (Cursor) → independent verification (Claude).`,
     );
     if (!repo) {
       await this.stages.toNeedsHuman(
@@ -431,7 +432,8 @@ export class Engine {
     // started
     if (run.status === 'parked') {
       this.d.store.update(run.key, (r) => {
-        r.status = 'queued';
+        r.status = restoredStatus(r);
+        r.parkedFrom = undefined;
         r.history.push({ ts: this.clock.now(), text: 'Un-parked' });
       });
       return;
@@ -508,8 +510,12 @@ export class Engine {
       }
     }
     const repo = run0.repo ? null : issue ? this.resolveRepo(issue) : null;
+    const obsolete = retryStage ? [] : run0.bugs.filter((b) => b.status === 'open' && b.linearId);
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
+      r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-issue cap becomes a dead end)
+      r.buildFails = 0;
+      r.limitStreak = 0;
       if (issue) {
         r.title = issue.title;
         r.description = issue.description ?? '';
@@ -543,6 +549,11 @@ export class Engine {
         r.history.push({ ts: now, text: `Re-planning from scratch (rev ${r.rev}) — requested by you` });
       }
     });
+    if (obsolete.length) {
+      const done = await this.completedStateId().catch(() => null);
+      const rev = this.d.store.get(key)?.rev ?? run0.rev + 1;
+      if (done) for (const b of obsolete) await this.effects.close(key, `bugclose:${b.fp}:rerun${rev}`, b.linearId!, done);
+    }
     if (!this.d.store.get(key)!.repo) {
       await this.stages.toNeedsHuman(key, `Still no repository for this issue. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none)'}. Add the label \`repo:<name>\` and move it back to Todo.`, 'plan');
       return;
@@ -687,6 +698,19 @@ export class Engine {
       throw new EngineError('bad_state', 'This run is already working.');
     }
     this.failCounts.delete(key);
+    if (run.status === 'parked') {
+      throw new EngineError('bad_state', 'This issue is parked in Backlog. Move it to Todo in Linear to continue — Conductor never moves your issues out of Backlog itself.');
+    }
+    if (run.status === 'failed') {
+      // an internal hiccup: retry the same step, don't throw the work away
+      this.d.store.update(key, (r) => {
+        r.status = 'queued';
+        r.lastError = undefined;
+        r.history.push({ ts: this.clock.now(), text: 'Retrying after an internal error (requested by you)' });
+      });
+      this.tickSoon();
+      return;
+    }
     await this.rerunFromHuman(key);
   }
 
@@ -701,10 +725,7 @@ export class Engine {
         r.history.push({ ts: this.clock.now(), text: 'Resumed manually' });
       });
     } else if (run.status === 'parked') {
-      this.d.store.update(key, (r) => {
-        r.status = 'queued';
-        r.history.push({ ts: this.clock.now(), text: 'Un-parked manually' });
-      });
+      throw new EngineError('bad_state', 'This issue is parked in Backlog. Move it to Todo in Linear to continue — Conductor never moves your issues out of Backlog itself.');
     } else throw new EngineError('bad_state', 'Nothing to resume.');
     this.tickSoon();
   }
@@ -728,7 +749,7 @@ export class Engine {
     if (!['ready', 'finished', 'aborted'].includes(run.status)) throw new EngineError('bad_state', 'Only finished runs can be cleaned up.');
     const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
     if (repo && run.worktree) {
-      await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: false });
+      await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: true }); // git refuses unless fully merged
       this.d.store.update(key, (r) => {
         r.worktree = '';
         r.history.push({ ts: this.clock.now(), text: 'Worktree removed (branch kept)' });
@@ -788,6 +809,12 @@ export class Engine {
   isRunning(key: string): boolean {
     return this.jobs.has(key);
   }
+}
+
+/** What a parked run goes back to when its issue leaves Backlog. */
+function restoredStatus(r: Run): Run['status'] {
+  const was = r.parkedFrom;
+  return was && ['awaiting_approval', 'needs_human', 'ready'].includes(was) ? was : 'queued';
 }
 
 export class EngineError extends Error {

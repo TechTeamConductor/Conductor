@@ -218,7 +218,7 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
   if (proc.timedOut) return { ...base, errorKind: proc.timedOut === 'idle' ? 'timeout_idle' : 'timeout_hard', error: `claude timed out (${proc.timedOut})` };
 
   const apiErr = r?.api_error;
-  if (state.limit || apiErr === 'usage_limit_reached' || (r?.is_error && /weekly limit|usage limit|limit reached|resets/i.test(String(r?.result ?? '')))) {
+  if (state.limit || apiErr === 'usage_limit_reached' || (r?.is_error && /weekly limit|usage limit|limit reached/i.test(String(r?.result ?? '')))) {
     return {
       ...base,
       errorKind: 'limit',

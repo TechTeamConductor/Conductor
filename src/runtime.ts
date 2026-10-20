@@ -30,6 +30,9 @@ export interface RuntimeOptions {
   secretStore?: SecretStore;
   persistent?: { load(): PersistentState; save(s: PersistentState): void };
   /** Replace real CLI health checks (demo/tests). */
+  /** Test seams for the setup wizard: replace Linear key validation / client construction. */
+  connect?: (key: string) => Promise<{ viewer: { id: string; name: string; email: string }; teams: { id: string; key: string; name: string }[] }>;
+  makeLinear?: (key: string) => LinearPort;
   health?: () => Promise<{ claude: any; cursor: any }>;
   probe?: (t: 'claude' | 'cursor' | 'linear') => Promise<{ ok: boolean; detail: string; durationMs: number }>;
   openExec?: ExecFn;
@@ -71,7 +74,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   }
   const agents = opts.agents ?? new Agents(getConfig);
   const persistent = opts.persistent ?? { load: loadState, save: saveState };
-  const auth = new Auth();
+  const auth = new Auth({ persistPath: opts.ephemeral ? undefined : join(paths.runtime(), 'sessions.json') });
   let serverRef: DashboardServer | null = null;
   const notify = (t: string, m: string) => {
     (opts.notify ?? osNotify)(t, m);
@@ -106,10 +109,10 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     persistent: () => persistent.load(),
     linear: () => linearRef.port,
     connectLinear: async (key) => {
-      const r = await validateKey(key);
+      const r = opts.connect ? await opts.connect(key) : await validateKey(key);
       await putSecret(secretStore, SECRET_LINEAR, key);
       linearRef.key = key;
-      linearRef.port = new LinearClient({ apiKey: key });
+      linearRef.port = opts.makeLinear ? opts.makeLinear(key) : new LinearClient({ apiKey: key });
       configureLog({ secrets: [key] });
       save({ ...getConfig(), linear: { ...getConfig().linear, viewerId: r.viewer.id } });
       engine.invalidate();

@@ -940,6 +940,8 @@ export const CURSOR_GUARD_DENY = [
   'Shell(git:push*)',
   'Shell(git:*push*)',
   'Shell(/usr/bin/git:*push*)',
+  'Shell(/opt/homebrew/bin/git:*push*)',
+  'Shell(/usr/local/bin/git:*push*)',
   'Shell(env:*git*)',
   'Shell(sh:*git*push*)',
   'Shell(bash:*git*push*)',

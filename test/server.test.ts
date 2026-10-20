@@ -162,7 +162,7 @@ test('setup/repo rejects /, $HOME and non-git folders; accepts a real repo and d
 test('linear-key: shape is validated before any network call; the key is never echoed', async () => {
   const r = await raw('/api/setup/linear-key', { method: 'POST', headers: mut(), body: JSON.stringify({ key: 'not-a-key' }) });
   assert.equal(r.status, 400);
-  assert.ok(!r.text.includes('not-a-key') || true);
+  assert.ok(!r.text.includes('not-a-key'), 'a rejected key is never echoed back');
 });
 
 test('end-to-end through the API: first plan waits for approval → Approve → ready; New task works', async () => {

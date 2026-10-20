@@ -158,7 +158,7 @@ function fmtClock(ts) {
   const d = new Date(ts);
   return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
 }
-const fmtCost = (n) => '$' + (Number(n) || 0).toFixed(2);
+const fmtCost = (n) => '≈$' + (Number(n) || 0).toFixed(2);
 /** Quota values may be a 0..1 fraction or a 0..100 percentage (contract does not say): treat <=1 as a fraction. */
 function pctOf(v) {
   if (typeof v !== 'number' || !isFinite(v)) return null;
@@ -302,7 +302,41 @@ function closeRoute() {
 }
 
 /* ───────────────────────── state loading ───────────────────────── */
+/** Fill in anything optional or missing so rendering never throws on a partial payload. */
+function normalizeState(d) {
+  d.runs = Array.isArray(d.runs) ? d.runs : [];
+  d.repos = Array.isArray(d.repos) ? d.repos : [];
+  d.setup = d.setup && Array.isArray(d.setup.steps) ? d.setup : { complete: false, steps: [] };
+  d.health = d.health || {};
+  d.health.claude = d.health.claude || { found: false, ok: false };
+  d.health.cursor = d.health.cursor || { found: false, ok: false };
+  d.health.linear = d.health.linear || { ok: false };
+  d.health.warnings = Array.isArray(d.health.warnings) ? d.health.warnings : [];
+  d.quota = d.quota || {};
+  d.engine = Object.assign({ paused: false, providerPause: {}, running: 0, maxParallel: 0, lastPollAt: null, lastPollError: null, pollSeconds: 30 }, d.engine || {});
+  d.engine.providerPause = d.engine.providerPause || {};
+  d.settings = Object.assign({ planApproval: 'auto', planReview: 'auto', maxLoops: 3, maxParallel: 2, onClaudeLimit: 'wait', noGates: 'warn', pickupFromBacklog: false, linearMode: 'labels' }, d.settings || {});
+  d.settings.stages = Object.assign({ plan: 'claude', review: 'claude', verify: 'claude' }, d.settings.stages || {});
+  return d;
+}
+function normalizeDetail(d) {
+  d.sessions = Array.isArray(d.sessions) ? d.sessions : [];
+  d.verdicts = Array.isArray(d.verdicts) ? d.verdicts : [];
+  d.bugs = Array.isArray(d.bugs) ? d.bugs : [];
+  d.timeline = Array.isArray(d.timeline) ? d.timeline : [];
+  d.gates = d.gates || {};
+  d.gates.loops = Array.isArray(d.gates.loops) ? d.gates.loops : [];
+  if (d.gates.baseline && !Array.isArray(d.gates.baseline.results)) d.gates.baseline.results = [];
+  for (const g of d.gates.loops) { g.run = g.run || { results: [] }; if (!Array.isArray(g.run.results)) g.run.results = []; }
+  if (d.plan) {
+    for (const k of ['acceptanceCriteria', 'filesToChange', 'steps', 'assumptions', 'risks']) if (!Array.isArray(d.plan[k])) d.plan[k] = [];
+    d.plan.testing = d.plan.testing || { commands: [], cases: [] };
+  }
+  for (const v of d.verdicts) { if (v.verdict) { v.verdict.acceptance = v.verdict.acceptance || []; v.verdict.bugs = v.verdict.bugs || []; } }
+  return d;
+}
 function applyState(data, quiet) {
+  normalizeState(data);
   S.state = data;
   S.offset = (data.now || Date.now()) - Date.now();
   S.csrf = data.csrf || S.csrf;
@@ -404,7 +438,7 @@ async function resyncAfterDrop() {
 function onStateEvent(d) {
   if (!S.state) return;
   if (Array.isArray(d.runs)) S.state.runs = d.runs;
-  if (d.engine) S.state.engine = d.engine;
+  if (d.engine) { S.state.engine = Object.assign({}, S.state.engine, d.engine); S.state.engine.providerPause = S.state.engine.providerPause || {}; }
   if (d.quota) S.state.quota = d.quota;
   if (d.now) S.offset = d.now - Date.now();
   renderLive();
@@ -783,7 +817,7 @@ function createCard(key) {
   p.loop = h('span', { class: 'chip', title: 'Fix loops used / allowed', hidden: true }, icon('repeat'), p.loopT);
   p.bugs = h('span', { class: 'chip is-bad', hidden: true }, icon('bug'), p.bugsT);
   p.unv = h('span', { class: 'badge tone-warn', hidden: true, title: 'No reliable gates: regressions cannot be ruled out' }, icon('warn'), 'Unverified');
-  p.cost = h('span', { class: 'card-cost', title: 'Agent cost so far' });
+  p.cost = h('span', { class: 'card-cost', title: 'Estimated API-equivalent value of the agent work so far. Not a charge — you are on flat-rate Claude/Cursor plans.' });
   p.meta = h('div', { class: 'card-meta' }, p.repo, p.loop, p.bugs, p.unv, p.cost);
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
@@ -968,7 +1002,7 @@ function updateDrawerHead() {
       r.repo ? h('span', { class: 'chip' }, icon('folder'), r.repo) : null,
       r.branch ? h('span', { class: 'chip chip-mono', title: 'Branch' }, icon('branch'), r.branch) : null,
       r.loop > 0 && r.maxLoops > 0 ? h('span', { class: 'chip', title: 'Fix loops used / allowed' }, icon('repeat'), `Loop ${r.loop}/${r.maxLoops}`) : null,
-      r.costUsd > 0 ? h('span', { class: 'chip', title: 'Agent cost so far' }, fmtCost(r.costUsd)) : null].filter(Boolean));
+      r.costUsd > 0 ? h('span', { class: 'chip', title: 'Estimated API-equivalent value of the agent work so far. Not a charge — you are on flat-rate Claude/Cursor plans.' }, fmtCost(r.costUsd)) : null].filter(Boolean));
   }
   const bugs = r.bugsOpen || 0;
   setText(D.counts.verification, bugs);
@@ -995,7 +1029,7 @@ async function fetchDetail() {
   if (D.fetching) { D.again = true; return; }
   D.fetching = true;
   try {
-    const d = await api('GET', '/api/runs/' + enc(key));
+    const d = normalizeDetail(await api('GET', '/api/runs/' + enc(key)));
     if (S.detailKey !== key) return;
     S.detailError = null;
     const sig = JSON.stringify(d);
@@ -1120,7 +1154,7 @@ function renderOverview(d) {
     fact('Plan revision', 'rev ' + d.rev + (d.complexity ? ' · size ' + d.complexity : '')),
     fact('Verdict', d.verdict ? badge(d.verdict === 'pass' ? 'good' : 'bad', d.verdict === 'pass' ? 'Pass' : 'Fail', d.verdict === 'pass' ? 'tick' : 'x-circle') : 'Not yet'),
     fact('Open bugs', String(d.bugsOpen || 0)),
-    fact('Cost so far', fmtCost(d.costUsd)),
+    fact('Est. value (not billed)', fmtCost(d.costUsd)),
     fact('Started', h('span', { title: fmtFull(d.startedAt) }, fmtWhen(d.startedAt))),
     fact('Last change', h('span', { title: fmtFull(d.updatedAt) }, fmtAgo(d.updatedAt))),
     fact('Branch', [h('span', { class: 'val' }, d.branch || 'none'), d.branch ? copyBtn(d.branch, 'branch name') : null], true),
@@ -2163,7 +2197,7 @@ function repoBody() {
       h('span', { class: 'chip chip-mono' }, icon('branch'), r.baseBranch),
       (r.gates || []).length ? r.gates.map((g) => h('span', { class: 'chip', title: g.cmd }, icon('shield'), g.name)) : badge('warn', 'No gates detected', 'warn'),
       r.approvedPlans ? h('span', { class: 'chip' }, plural(r.approvedPlans, 'approved plan')) : null),
-    (r.warnings || []).map((w) => h('p', { class: 'muted', style: null }, w))));
+    (r.warnings || []).map((w) => h('p', { class: 'muted' }, w))));
   return h('div', null,
     h('p', null, 'Pick a project folder the agents may work on. Conductor never edits your checkout: every task runs in its own git worktree.'),
     repos.length ? h('div', { role: 'list', 'aria-label': 'Registered repositories' }, list) : null,

@@ -109,23 +109,37 @@ export class Stages {
     this.c.notify(`${key} needs you`, truncate(reason, 160));
   }
 
+  /**
+   * Pause (never fail) on a provider usage limit. With a known reset time we wait for it; with an unknown one
+   * (Cursor) we back off 15 m → 30 m → 1 h → 2 h → 4 h → 6 h. One Linear comment and one notification per limit
+   * *episode* (a streak of consecutive rejections), and rejected attempts never count toward the run budget.
+   */
   async pauseForLimit(key: string, limit: LimitInfo): Promise<void> {
     const now = this.c.clock.now();
-    const until = limit.resetsAt && limit.resetsAt > now ? limit.resetsAt : now + (limit.provider === 'claude' ? 30 : 15) * 60_000;
+    const before = this.run(key);
+    const streak = (before.limitStreak ?? 0) + 1;
+    const episode = streak === 1 ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
+    const known = !!limit.resetsAt && limit.resetsAt > now;
+    const backoffMin = Math.min(360, 15 * 2 ** (streak - 1));
+    const until = known ? limit.resetsAt! : now + backoffMin * 60_000;
     this.c.providerPause(limit.provider, until, limit.message);
     this.patch(key, (r) => {
       r.status = 'paused';
       r.pausedUntil = until;
       r.pauseReason = truncate(limit.message, 300);
-      r.history.push({ ts: now, text: `Paused: ${limit.provider} usage limit — resuming automatically` });
+      r.limitStreak = streak;
+      r.limitEpisode = episode;
+      if (streak === 1) r.history.push({ ts: now, text: `Paused: ${limit.provider} usage limit — resuming automatically` });
     });
     this.c.emit(key, { agent: limit.provider, stage: this.run(key).stage ?? 'engine', kind: 'error', text: `Usage limit reached — paused until ${new Date(until).toLocaleString()}` });
-    await this.c.effects.comment(
-      key,
-      `pause:${until}`,
-      `🤖 **Paused — ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} usage limit reached.** Conductor will resume automatically after ${new Date(until).toLocaleString()}. Nothing is lost.`,
-    );
-    this.c.notify('Usage limit reached', `${limit.provider} — Conductor resumes automatically`);
+    if (streak === 1) {
+      await this.c.effects.comment(
+        key,
+        `pause:ep${episode}`,
+        `🤖 **Paused — ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} usage limit reached.** Conductor will resume automatically${known ? ` after ${new Date(until).toLocaleString()}` : ' (it retries with growing gaps until the limit lifts)'}. Nothing is lost.`,
+      );
+      this.c.notify('Usage limit reached', `${limit.provider} — Conductor resumes automatically`);
+    }
   }
 
   private recordSession(key: string, rec: Omit<SessionRec, 'status'> & { status?: SessionRec['status'] }): void {
@@ -146,7 +160,12 @@ export class Stages {
         s.cliVersion = res.cliVersion ?? s.cliVersion;
       }
       if (typeof res.costUsd === 'number') r.costUsd += res.costUsd;
+      if (res.ok) r.limitStreak = 0;
     });
+  }
+  /** A limit-rejected attempt did no work: it must not eat the per-issue run budget. */
+  private refundIfLimit(key: string, res: AgentResult): void {
+    if (!res.ok && res.errorKind === 'limit') this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
   }
   private emitter(key: string, stage: StageName, loop: number, rev: number): (ev: EmitEvent) => void {
     return (ev) => {
@@ -224,6 +243,7 @@ export class Stages {
         maxTurnsFactor: turnsFactor,
       });
       this.finishSession(key, res);
+      this.refundIfLimit(key, res);
       if (res.quota) this.c.recordQuota(res.agent, res.quota);
       this.writePromptAudit(key, `${stage}-${run.loop}-${attempt}`, prompt + corrective);
       if (res.ok) {
@@ -330,7 +350,7 @@ export class Stages {
 
   private async runAllGates(key: string, repo: RepoConfig, defs: GateDef[]): Promise<GateRun> {
     const run = this.run(key);
-    const o = { cwd: run.worktree, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) };
+    const o = { cwd: run.worktree, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key), secrets: this.c.secretsFor(run) };
     const results: GateResult[] = [];
     for (const def of defs) {
       let r = await G.runGate(def, o);
@@ -376,6 +396,8 @@ export class Stages {
       const errs = validateSchema(PLAN_SCHEMA, j);
       const p = j as Plan;
       if (!errs.length && p.blocked?.is && !(p.blocked.questions?.length > 0)) errs.push('$.blocked.questions: required when blocked.is is true');
+      if (!errs.length && p.deliverable === 'answer' && !String(p.answer ?? '').trim()) errs.push('$.answer: required when deliverable is "answer"');
+      if (!errs.length && p.deliverable !== 'answer' && !(p.acceptanceCriteria?.length > 0)) errs.push('$.acceptanceCriteria: needs at least 1 item for a code change');
       return errs;
     });
     if (called.kind === 'stop') return;
@@ -398,6 +420,20 @@ export class Stages {
     if (plan.blocked.is) {
       const qs = plan.blocked.questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
       return this.toNeedsHuman(key, `The planner needs a decision before it can proceed:\n${qs}`, 'plan', `The planner needs your input before it can proceed:\n\n${qs}\n\nAnswer in a comment, then move this issue back to **Todo**.`);
+    }
+    if (plan.deliverable === 'answer' && String(plan.answer ?? '').trim()) {
+      // a question / analysis: deliver the answer in Linear and finish — never push it through build + verify
+      this.patch(key, (r) => {
+        r.answered = true;
+        r.status = 'ready';
+        r.next = 'none';
+        r.needsHuman = undefined;
+        r.history.push({ ts: this.c.clock.now(), text: 'Answered (no code change needed)' });
+      });
+      await this.applyStage(key, 'ready');
+      await this.c.effects.comment(key, `answer:${run.rev}`, `🤖 **Answer** — no code change was needed\n\n${truncate(plan.answer!, 24_000)}`);
+      this.c.notify(`${key} answered`, truncate(run.title, 80));
+      return;
     }
     await this.c.effects.comment(key, `plan:${run.rev}`, `🤖 **Conductor plan** (revision ${run.rev}, complexity ${plan.complexity})\n\n${truncate(md, 24_000)}`);
     const cfg = this.c.cfg();
@@ -464,7 +500,8 @@ export class Stages {
     const run = this.run(key);
     const cfg = this.c.cfg();
     const approved = this.c.persistent.load().repos[run.repo]?.approvedPlans ?? 0;
-    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L';
+    const touchesProtected = W.diffScopeViolations(plan.filesToChange.map((f) => f.path), []).length > 0;
+    const required = cfg.pipeline.planApproval === 'manual' || (cfg.pipeline.planApproval === 'first' && approved === 0) || plan.complexity === 'L' || touchesProtected;
     if (!required) {
       this.patch(key, (r) => {
         r.planApproved = true;
@@ -482,7 +519,7 @@ export class Stages {
     await this.c.effects.comment(
       key,
       `approval:${run.rev}`,
-      `🤖 **Plan ready — your approval is needed${plan.complexity === 'L' ? ' (large change)' : approved === 0 ? ' (first plan for this repo)' : ''}.**\n\nReply \`/approve\` on this issue, or press **Approve** in the dashboard. To change the plan, add a comment and move the issue back to **Todo**.`,
+      `🤖 **Plan ready — your approval is needed${touchesProtected ? ' (the plan touches protected files such as CI or agent config)' : plan.complexity === 'L' ? ' (large change)' : approved === 0 ? ' (first plan for this repo)' : ''}.**\n\nReply \`/approve\` on this issue, or press **Approve** in the dashboard. To change the plan, add a comment and move the issue back to **Todo**.`,
     );
     this.c.notify(`${key}: plan ready`, 'Your approval is needed.');
   }
@@ -498,7 +535,7 @@ export class Stages {
     });
     await this.applyStage(key, 'building');
     const { issue, problem } = await this.integrity(run);
-    if (problem) return this.toNeedsHuman(key, problem, 'build');
+    if (problem) return this.toNeedsHuman(key, problem, 'plan');
     void issue;
     const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
     if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
@@ -516,11 +553,17 @@ export class Stages {
       });
       return;
     }
-    if (await this.hasUncommitted(run.worktree)) {
-      // leftover partial work from an interrupted build: keep a recoverable copy, then start clean
-      const refs = await W.backupRefs(run.worktree, run.key, run.rev).catch(() => null);
+    if ((await this.hasUncommitted(run.worktree)) && !run.commitNote) {
+      // leftover partial work from an interrupted build: keep a recoverable copy, then start clean.
+      // (A commit rejected by a repo hook leaves the previous build's files in place ON PURPOSE — fixed in place.)
+      let refs: Awaited<ReturnType<typeof W.backupRefs>> | null = null;
+      try {
+        refs = await W.backupRefs(run.worktree, run.key, run.rev);
+      } catch (e) {
+        return this.toNeedsHuman(key, `Unfinished work from an interrupted build could not be backed up (${truncate(errMsg(e), 160)}), so Conductor will not discard it. Check the worktree, then move the issue to Todo.`, 'build');
+      }
       await W.resetToCommit(run.worktree, known);
-      this.note(key, 'build', `Discarded partial work from an interrupted build${refs?.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
+      this.note(key, 'build', `Discarded partial work from an interrupted build${refs.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
     }
 
     const guard = await W.writeCursorGuard(run.worktree);
@@ -554,6 +597,7 @@ export class Stages {
         loop: String(run.loop),
         maxLoops: String(run.loopBudget),
         bugs: this.bugList(run),
+        verifierSummary: this.c.store.readArtifact<Verdict | null>(key, `verdict-${prevLoop}.json`, null)?.summary ?? '',
         gateFailures,
         commitNote: run.commitNote ? fence('commit-hook-output', run.commitNote, 4000) : '',
       });
@@ -577,15 +621,28 @@ export class Stages {
       secrets,
     });
     this.finishSession(key, res);
+    this.refundIfLimit(key, res);
     if (!res.ok) return this.handleBuildFailure(key, res);
+    this.patch(key, (r) => void (r.buildFails = 0));
 
     // layer-1 guard intact?
     const chk = await W.checkCursorGuard(run.worktree, guard.sha256);
     if (!chk.ok) return this.toNeedsHuman(key, `The builder tampered with the no-push guard (${chk.detail}). Review the worktree before continuing.`, 'build');
 
-    const committed = await W.commitAll({ worktree: run.worktree, message: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}\n\nBuilt by Conductor (Cursor). Plan rev ${run.rev}.` });
+    const committed = await W.commitAll({ worktree: run.worktree, message: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}\n\nBuilt by Conductor (Cursor). Plan rev ${run.rev}.`, secrets });
     if (!committed.ok) {
       if (committed.reason === 'nothing') {
+        // the builder may have committed by itself: accept real work instead of calling it "no changes"
+        const headNow = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
+        if (headNow && headNow !== known && headNow !== run.baseSha) {
+          this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
+          this.patch(key, (r) => {
+            r.commitSha = headNow;
+            r.commitNote = undefined;
+            r.next = 'verify';
+          });
+          return;
+        }
         if (run.loop === 1 && !isFix) {
           return this.toNeedsHuman(key, 'The builder finished without changing any files. The task may need to be clarified.', 'build');
         }
@@ -634,8 +691,9 @@ export class Stages {
       case 'spawn':
         return this.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
       default: {
-        const tries = run.history.filter((h) => h.text.startsWith('Build attempt failed')).length;
+        const tries = run.buildFails ?? 0;
         this.patch(key, (r) => {
+          r.buildFails = tries + 1;
           r.history.push({ ts: this.c.clock.now(), text: `Build attempt failed: ${truncate(res.error ?? 'error', 120)}` });
         });
         if (tries < 1) {
@@ -680,7 +738,7 @@ export class Stages {
     });
     await this.applyStage(key, 'verifying');
     const { problem } = await this.integrity(run);
-    if (problem) return this.toNeedsHuman(key, problem, 'verify');
+    if (problem) return this.toNeedsHuman(key, problem, 'plan');
     const plan = this.c.store.readArtifact<Plan | null>(key, `plan-${run.rev}.json`, null);
     if (!plan) return this.toNeedsHuman(key, 'The approved plan is missing; re-planning is needed.', 'plan');
 
@@ -689,6 +747,7 @@ export class Stages {
     if (run.lockfileHash && run.lockfileHash !== lock) {
       const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
       if (inst.ok) this.patch(key, (r) => void (r.lockfileHash = lock));
+      else this.note(key, 'verify', `Re-installing dependencies failed (${truncate(inst.output.slice(-200), 200)}) — gates may fail for that reason.`);
     }
     const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     let current: GateRun = { at: this.c.clock.now(), sha: run.commitSha ?? '', results: [] };
@@ -777,19 +836,42 @@ export class Stages {
     const failing = bugs.filter((b) => failOn.has(b.severity));
     const pass = verdict.verdict === 'pass' && failing.length === 0;
 
+    // Not a pass, yet nothing the builder could act on (e.g. only an "unverifiable" criterion or nitpicks):
+    // looping Cursor with an empty problem list just burns quota — hand it to a human with the verifier's reasoning.
+    if (!pass && failing.length === 0) {
+      const unver = verdict.acceptance.filter((a) => a.status === 'unverifiable');
+      const minor = bugs.filter((b) => !failOn.has(b.severity));
+      this.patch(key, (r) => {
+        r.verdict = 'fail';
+      });
+      const detail = [
+        verdict.summary,
+        unver.length ? `\nCould not be verified automatically:\n${unver.map((a) => `- ${a.id}: ${a.evidence}`).join('\n')}` : '',
+        minor.length ? `\nMinor notes:\n${minor.map((b) => `- (${b.severity}) ${b.title}`).join('\n')}` : '',
+      ].filter(Boolean).join('\n');
+      return this.toNeedsHuman(
+        key,
+        `The verifier did not pass this change, but found nothing the builder can fix: ${truncate(verdict.summary, 300)}`,
+        'verify',
+        `The independent verifier could not give a clean pass, and it did not report a concrete problem for the builder to fix, so I am not looping.\n\n${detail}\n\nIf you are happy with the branch as it is, you can merge it; to have me verify again, move the issue back to **Todo**.`,
+      );
+    }
+
     // bug records: upsert by fingerprint, close those not re-observed
     const seen = new Set<string>();
     const prov = await this.c.prov().catch(() => null);
     const done = await this.c.completedStateId().catch(() => null);
+    const reopened = new Map<string, BugRec>();
+    const detailOf = new Map<string, string>();
     for (const b of bugs) {
       const fp = bugFingerprint(b);
       seen.add(fp);
       const detail = `**Severity:** ${b.severity}${b.file ? `\n**File:** \`${b.file}${b.line ? `:${b.line}` : ''}\`` : ''}\n\n**Evidence:** ${b.evidence}${b.repro ? `\n\n**Repro:** ${b.repro}` : ''}${b.suggestedFix ? `\n\n**Suggested fix:** ${b.suggestedFix}` : ''}`;
-      let reopen: BugRec | undefined;
+      detailOf.set(fp, detail);
       this.patch(key, (r) => {
         const cur = r.bugs.find((x) => x.fp === fp);
         if (cur) {
-          if (cur.status === 'closed') reopen = { ...cur };
+          if (cur.status === 'closed') reopened.set(fp, { ...cur });
           cur.status = 'open';
           cur.detail = detail;
           cur.severity = b.severity;
@@ -798,21 +880,37 @@ export class Stages {
           r.bugs.push({ fp, title: b.title, severity: b.severity, file: b.file, detail, status: 'open', loops: [run.loop] });
         }
       });
-      if (failOn.has(b.severity) && !pass && prov) {
+    }
+
+    // Linear: file at most N sub-issues per loop / per run (most severe first); summarise the rest in the comment.
+    const PER_LOOP = 5;
+    const PER_RUN = 8;
+    const rank: Record<string, number> = { blocker: 0, major: 1, minor: 2, nit: 3 };
+    const overflow: Bug[] = [];
+    if (!pass && prov) {
+      let createdNow = 0;
+      for (const b of [...failing].sort((x, y) => (rank[x.severity] ?? 9) - (rank[y.severity] ?? 9))) {
+        const fp = bugFingerprint(b);
         const cur = this.run(key).bugs.find((x) => x.fp === fp);
-        if (reopen?.linearId && prov.todoStateId) await this.c.effects.close(key, `bugreopen:${fp}:${run.loop}`, reopen.linearId, prov.todoStateId);
-        else if (!cur?.linearId) {
+        const re = reopened.get(fp);
+        if (re?.linearId && prov.todoStateId) {
+          await this.c.effects.close(key, `bugreopen:${fp}:${run.rev}:${run.loop}`, re.linearId, prov.todoStateId);
+        } else if (cur?.linearId) {
+          await this.c.effects.commentOn(key, `bugseen:${fp}:${run.rev}:${run.loop}`, cur.linearId, `Still failing after loop ${run.loop}:\n\n${detailOf.get(fp) ?? b.evidence}`);
+        } else if (createdNow < PER_LOOP && this.run(key).bugs.filter((x) => x.linearId).length + createdNow < PER_RUN) {
+          createdNow += 1;
           await this.c.effects.subIssue(key, `bug:${fp}`, {
             fp,
             title: `[Bug] ${b.title}`,
-            description: `Found by Conductor's independent verification of **${run.key}** (loop ${run.loop}).\n\n${detail}`,
+            description: `Found by Conductor's independent verification of **${run.key}** (loop ${run.loop}).\n\n${detailOf.get(fp) ?? b.evidence}`,
             labelIds: [prov.bugLabelId],
             stateId: prov.todoStateId ?? undefined,
             teamId: run.teamId,
           });
-        }
+        } else overflow.push(b);
       }
     }
+
     const toClose: BugRec[] = [];
     this.patch(key, (r) => {
       for (const b of r.bugs) {
@@ -823,12 +921,12 @@ export class Stages {
       }
       r.verdict = pass ? 'pass' : 'fail';
     });
-    if (done) for (const b of toClose) if (b.linearId) await this.c.effects.close(key, `bugclose:${b.fp}:${run.loop}`, b.linearId, done);
+    if (done) for (const b of toClose) if (b.linearId) await this.c.effects.close(key, `bugclose:${b.fp}:${run.rev}:${run.loop}`, b.linearId, done);
 
     if (pass) return this.markReady(key, plan, verdict, cmp, diffStat);
 
-    const summary = `🤖 **Verification failed (loop ${run.loop}/${run.loopBudget})**\n\n${verdict.summary}\n\n${failing.map((b) => `- **${b.severity}** ${b.title}${b.file ? ` — \`${b.file}\`` : ''}`).join('\n')}`;
-    await this.c.effects.comment(key, `verify:${run.loop}`, summary);
+    const summary = `🤖 **Verification failed (loop ${run.loop}/${run.loopBudget})**\n\n${verdict.summary}\n\n${failing.map((b) => `- **${b.severity}** ${b.title}${b.file ? ` — \`${b.file}\`` : ''}`).join('\n')}${overflow.length ? `\n\n_${overflow.length} more finding(s) were not filed as separate issues (limit per loop): ${overflow.map((b) => b.title).join('; ')}_` : ''}`;
+    await this.c.effects.comment(key, `verify:${run.rev}:${run.loop}`, summary);
     this.patch(key, (r) => {
       r.history.push({ ts: this.c.clock.now(), text: `Verification ${run.loop}: ${failing.length} problem(s)` });
     });
@@ -858,14 +956,13 @@ export class Stages {
       run.unverifiedWhy ? `\n> ⚠️ ${run.unverifiedWhy}` : '',
       '',
       `**Branch:** \`${run.branch}\` (base \`${run.baseSha.slice(0, 7)}\`)`,
-      `**Worktree:** \`${run.worktree}\``,
       '',
       '```',
       truncate(diffStat, 1500),
       '```',
       '',
-      'Review: `' + `git -C ${repo.path} diff ${run.baseSha.slice(0, 7)}...${run.branch}` + '`',
-      'Merge when you are happy: `' + `git -C ${repo.path} merge --no-ff ${run.branch}` + '` (Conductor never merges or pushes).',
+      'Review (inside the repo): `' + `git diff ${run.baseSha.slice(0, 7)}...${run.branch}` + '`',
+      'Merge when you are happy: `' + `git merge --no-ff ${run.branch}` + '` (Conductor never merges or pushes).',
     ]
       .filter((l) => l !== undefined)
       .join('\n');

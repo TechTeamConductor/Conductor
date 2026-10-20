@@ -2,6 +2,8 @@
 
 **"Why didn't my issue get picked up?"** Check, in order: it has the label `conductor` · it is in **Todo** (not Backlog — or enable "pick up from Backlog" in Settings) · **you** created it (and added the label yourself or created it with the label) · you registered the repo, and the issue maps to it (label `repo:<name>`, or a Linear project named like the repo, or first line `repo: <name>`; with a single repo it is automatic) · the dashboard's *ignored issues* list names the reason.
 
+**"Which Claude is this?"** The `claude` command-line tool, not the desktop app — they can be signed into different plans. `npm run doctor` prints the account (e.g. `Signed in as you@company.com · Org · team plan`). Switch: `claude auth logout` then `claude auth login`.
+
 **"Paused — Claude usage limit".** Normal on Claude Pro. Runs resume by themselves after the reset time shown. To keep working meanwhile: Settings → *When Claude hits its limit* → "use Cursor for read-only stages". Check the account: `claude auth status`.
 
 **"Session expired" in the dashboard.** Run `npm run open` (one-time sign-in link).

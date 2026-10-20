@@ -3,7 +3,7 @@
 # Stage: FIX
 Issue key: {{key}}
 
-Independent verification of your previous build **found problems**. Fix them now in this working directory (git worktree, branch `{{branch}}`, loop {{loop}} of {{maxLoops}}). The implementation plan is still the approved one; do not re-plan.
+Your previous build needs another pass: independent verification found problems, or the repository's commit hook rejected it (see below). Fix it now, in place, in this working directory (git worktree, branch `{{branch}}`, loop {{loop}} of {{maxLoops}}). The implementation plan is still the approved one; do not re-plan.
 
 ## Task (context)
 {{task}}
@@ -13,6 +13,10 @@ Independent verification of your previous build **found problems**. Fix them now
 
 ## Problems found by the verifier (fix every blocker and major item)
 {{bugs}}
+{{#verifierSummary}}
+
+Verifier's overall summary: {{verifierSummary}}
+{{/verifierSummary}}
 {{#gateFailures}}
 
 ## Quality-gate regressions (these now fail but passed before your change)

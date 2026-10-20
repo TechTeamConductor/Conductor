@@ -4,8 +4,9 @@ import { readFileSync, existsSync } from 'node:fs';
 export const TOKEN_PATTERNS: RegExp[] = [
   /lin_api_[A-Za-z0-9]{20,}/g, // Linear personal API key
   /lin_oauth_[A-Za-z0-9]{20,}/g,
-  /sk-ant-[A-Za-z0-9_-]{20,}/g, // Anthropic
-  /sk-[A-Za-z0-9_-]{24,}/g, // OpenAI-style
+  /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}/g, // Anthropic
+  // OpenAI-style: must start a token and contain a digit/uppercase — kebab-case words like "task-card-header-title…" are NOT keys
+  /(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{24,}/g,
   /crsr_[A-Za-z0-9]{20,}/g, // Cursor API keys
   /gh[pousr]_[A-Za-z0-9]{30,}/g, // GitHub
   /github_pat_[A-Za-z0-9_]{40,}/g,

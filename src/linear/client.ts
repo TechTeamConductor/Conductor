@@ -633,7 +633,18 @@ export class LinearClient implements LinearPort {
     id: string,
     patch: { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[]; description?: string },
   ): Promise<void> {
-    const input = ops.issueUpdateInput(patch);
+    let effective = patch;
+    if ((patch.addLabelIds?.length ?? 0) > 0 || (patch.removeLabelIds?.length ?? 0) > 0) {
+      // Linear errors on removing a label that is not on the issue (and may on re-adding one that is): send only real changes.
+      const cur = await this.#request<{ issue: { labels: { nodes: { id: string }[] } } | null }>('update.labels', ops.Q_ISSUE_LABEL_IDS, { id });
+      const present = new Set((cur.issue?.labels.nodes ?? []).map((l) => l.id));
+      effective = {
+        ...patch,
+        addLabelIds: (patch.addLabelIds ?? []).filter((l) => !present.has(l)),
+        removeLabelIds: (patch.removeLabelIds ?? []).filter((l) => present.has(l)),
+      };
+    }
+    const input = ops.issueUpdateInput(effective);
     if (Object.keys(input).length === 0) return;
     const d = await this.#request<{ issueUpdate: { success: boolean } }>('update', ops.M_ISSUE_UPDATE, { id, input });
     if (!d.issueUpdate?.success) throw new LinearApiError('issueUpdate returned success=false', { status: 200, op: 'update' });

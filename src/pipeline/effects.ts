@@ -59,6 +59,17 @@ export class Effects {
     });
   }
 
+  /** Post a comment on a *different* issue (e.g. a bug sub-issue) once per (run, effKey). */
+  commentOn(key: string, effKey: string, issueId: string, body: string): Promise<void> {
+    return this.serial(key, async () => {
+      const run = this.deps.store.get(key);
+      if (!run || run.effects[effKey]?.status === 'done') return;
+      const safe = truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT);
+      this.setRec(key, effKey, { kind: 'comment', payload: { body: safe, issueId } });
+      await this.apply(key, effKey);
+    });
+  }
+
   /** Update state/labels; also records `run.expected`. */
   state(key: string, effKey: string, payload: StatePayload, stageName?: string): Promise<void> {
     return this.serial(key, async () => {
@@ -115,18 +126,26 @@ export class Effects {
     const run = this.deps.store.get(key);
     const rec = run?.effects[effKey];
     if (!linear || !run || !rec || rec.status === 'done') return;
-    const lookup = (rec.attempts ?? 0) > 0; // a previous attempt may have half-succeeded
+    const prior = rec.attempts ?? 0;
+    const lookup = prior > 0; // any earlier attempt (even one that crashed mid-flight) may have half-succeeded
+    // persist the attempt BEFORE touching Linear: after a crash the retry must look the marker up instead of re-creating
+    this.deps.store.update(key, (r) => {
+      const x = r.effects[effKey];
+      if (x) x.attempts = prior + 1;
+    });
     const mk = this.marker(run, effKey);
     try {
       let linearId: string | undefined = rec.linearId;
       if (rec.kind === 'comment') {
-        const body = String((rec.payload as { body: string }).body);
+        const p = rec.payload as { body: string; issueId?: string };
+        const body = String(p.body);
+        const target = p.issueId ?? run.issueId;
         let found: string | undefined;
         if (lookup) {
-          const issue = await linear.issue(run.issueId);
+          const issue = await linear.issue(target);
           found = issue.comments?.find((c) => hasMarker(c.body, mk))?.id;
         }
-        linearId = found ?? (await linear.comment(run.issueId, `${body}\n\n${markerLine(mk)}`)).id;
+        linearId = found ?? (await linear.comment(target, `${body}\n\n${markerLine(mk)}`)).id;
       } else if (rec.kind === 'state') {
         const p = rec.payload as StatePayload & { stageName?: string };
         await linear.update(run.issueId, { stateId: p.stateId, addLabelIds: p.addLabelIds, removeLabelIds: p.removeLabelIds });
@@ -166,6 +185,7 @@ export class Effects {
           e.status = 'done';
           e.linearId = linearId ?? e.linearId;
           e.lastError = undefined;
+          e.attempts = 0; // a success clears the retry history (state effects are re-used across stages)
         }
       });
     } catch (e) {
@@ -174,9 +194,8 @@ export class Effects {
       this.deps.store.update(key, (r) => {
         const x = r.effects[effKey];
         if (!x) return;
-        x.attempts = (x.attempts ?? 0) + 1;
         x.lastError = truncate(msg, 300);
-        if (x.attempts >= MAX_ATTEMPTS) x.status = 'done'; // give up; never loop forever
+        if ((x.attempts ?? 0) >= MAX_ATTEMPTS) x.status = 'done'; // give up; never loop forever (attempts already counted)
       });
     }
   }

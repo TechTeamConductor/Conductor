@@ -490,6 +490,11 @@ export function fakeBackedResponder(fake: FakeLinear, opts: FakeResponderOptions
         const input = a.input as Args;
         const known = new Set(['stateId', 'addedLabelIds', 'removedLabelIds', 'description']);
         for (const k of Object.keys(input)) if (!known.has(k)) throw new Error(`mock: unsupported IssueUpdateInput key "${k}"`);
+        // Real Linear is strict about this (observed live): removing a label that is not on the issue is an ERROR.
+        const cur = await fake.issue(String(a.id));
+        for (const rid of (input.removedLabelIds as string[] | undefined) ?? []) {
+          if (!cur.labels.some((l) => l.id === rid)) throw new Error(`Label not on issue — Label ${rid} is not on issue ${String(a.id)} and cannot be removed.`);
+        }
         await fake.update(String(a.id), {
           stateId: input.stateId as string | undefined,
           addLabelIds: input.addedLabelIds as string[] | undefined,

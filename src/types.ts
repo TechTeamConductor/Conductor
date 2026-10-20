@@ -62,6 +62,9 @@ export interface Plan {
   risks: string[];
   coverage: { requirement: string; change: string; verification: string }[];
   complexity: Complexity;
+  /** 'answer' = the task is a question/analysis that needs no code change: `answer` is the deliverable. Default 'code'. */
+  deliverable?: 'code' | 'answer';
+  answer?: string;
 }
 export interface PlanReview {
   decision: 'approved' | 'changes_requested';
@@ -209,6 +212,10 @@ export interface Run {
   approvedBy?: 'auto' | 'human';
   planReviewDone: boolean;
   planReviewRounds: number; // revisions requested by plan review so far
+  answered?: boolean; // deliverable was an answer (no code); finished without build/verify
+  limitStreak?: number; // consecutive usage-limit rejections (back-off); reset on any successful agent call
+  limitEpisode?: number; // increments when a new limit streak starts (one Linear comment/notification per episode)
+  buildFails?: number; // consecutive failed Cursor build attempts in the current stage
   feedback?: string; // reviewer/human feedback to include in the next plan prompt
   commitNote?: string; // repo-hook output from a failed commit, fed to the fix prompt
   lockfileHash?: string; // last installed lockfile hash (re-install when it changes)
@@ -238,7 +245,7 @@ export interface RepoConfig {
   envPassthrough: string[]; // extra env var names that gates/deps may receive
 }
 export interface Config {
-  version: 1;
+  version: number;
   ui: { port: number; openBrowser: boolean };
   linear: {
     teamId?: string;

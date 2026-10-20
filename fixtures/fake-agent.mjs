@@ -133,6 +133,10 @@ if (step.attemptPush) {
   const r = spawnSync('git', ['push', ...(step.attemptPush === true ? ['origin', 'HEAD:refs/heads/probe'] : step.attemptPush)], { cwd: workspace, encoding: 'utf8' });
   out({ type: 'tool_call', subtype: 'completed', call_id: 'push', tool_call: { shellToolCall: { args: { command: 'git push' }, result: { success: { exitCode: r.status ?? -1, stdout: r.stdout, stderr: r.stderr } } } }, session_id: sid });
 }
+if (step.commitSelf) {
+  spawnSync('git', ['add', '-A'], { cwd: workspace });
+  spawnSync('git', ['-c', 'user.name=Agent', '-c', 'user.email=agent@example.com', 'commit', '-q', '-m', 'agent committed by itself'], { cwd: workspace });
+}
 if (step.tamperGuard) writeFileSync(join(workspace, '.cursor', 'cli.json'), '{"permissions":{"allow":[],"deny":[]}}\n');
 out({ type: 'tool_call', subtype: 'started', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test', workingDirectory: workspace } } }, session_id: sid });
 out({ type: 'tool_call', subtype: 'completed', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test' }, result: { success: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' } } } }, session_id: sid });

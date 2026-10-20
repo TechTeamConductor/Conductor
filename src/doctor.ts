@@ -44,15 +44,15 @@ export async function agentHealth(cfg: Config, which: 'claude' | 'cursor', force
     const v = await cliOut(bin, ['--version'], claudeEnv());
     const a = await cliOut(bin, ['auth', 'status'], claudeEnv());
     let loggedIn = false;
-    let plan = '';
+    let who = '';
     try {
       const j = JSON.parse(a.out.slice(a.out.indexOf('{')));
       loggedIn = j.loggedIn === true;
-      plan = j.subscriptionType ? ` (${j.subscriptionType})` : '';
+      who = [j.email, j.orgName, j.subscriptionType ? `${j.subscriptionType} plan` : ''].filter(Boolean).join(' · ');
     } catch {
       loggedIn = /logged in/i.test(a.out) && !/not logged/i.test(a.out);
     }
-    value = { found: true, version: v.out.split('\n')[0]?.slice(0, 60), loggedIn, ok: loggedIn, detail: loggedIn ? `Signed in${plan}` : 'Not signed in — run `claude` once and sign in.' };
+    value = { found: true, version: v.out.split('\n')[0]?.slice(0, 60), loggedIn, ok: loggedIn, detail: loggedIn ? `Signed in as ${who || 'unknown account'}` : 'Not signed in — run `claude auth login`.' };
   } else {
     const v = await cliOut(bin, ['--version'], cursorEnv());
     const a = await cliOut(bin, ['status'], cursorEnv());

@@ -18,7 +18,6 @@ export const PLAN_SCHEMA: Schema = {
     expectedState: { ...str, description: 'the desired behaviour and what must not change' },
     acceptanceCriteria: {
       type: 'array',
-      minItems: 1,
       items: {
         type: 'object',
         required: ['id', 'text', 'verification'],
@@ -54,6 +53,8 @@ export const PLAN_SCHEMA: Schema = {
       },
     },
     complexity: { type: 'string', enum: ['S', 'M', 'L'] },
+    deliverable: { type: 'string', enum: ['code', 'answer'], description: "'answer' when the task is a question/analysis that needs no code change" },
+    answer: { ...str, description: 'REQUIRED when deliverable is "answer": the complete answer in markdown, citing files' },
   },
 };
 
@@ -90,6 +91,7 @@ export const VERDICT_SCHEMA: Schema = {
     },
     bugs: {
       type: 'array',
+      maxItems: 12,
       items: {
         type: 'object',
         required: ['title', 'severity', 'evidence'],

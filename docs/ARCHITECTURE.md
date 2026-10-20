@@ -35,6 +35,8 @@ Linear is authoritative for **human intent** (issue exists, trigger label, nativ
 - **Approval:** manual for the first plan per repo, for `L` complexity, or always — configurable.
 - **Build** (Cursor `--force` in the worktree): Conductor commits, not the agent. Guards: secret/size scan before commit, protected-path diff guard (`.claude/`, `.cursor/`, `AGENTS.md`, CI…), no-push guard hash.
 - **Verify:** deterministic **gates** first (failure *sets* compared to the baseline taken before the change; regressions are blamed even if the gate was already red), then the Claude verifier (maps each acceptance criterion to evidence, hunts defects). A gate regression overrides a "pass".
+- **Answer-only tasks:** if the plan's `deliverable` is `answer` (a question or analysis), the answer is posted to Linear and the run finishes — no build, no verify.
+- **Limits:** a rejected (limit) attempt never counts toward the per-issue run budget; unknown reset times back off 15 m → 6 h; one comment + one notification per limit episode. A human retry (Todo) always starts with a fresh budget.
 - **Loop:** fail → bug sub-issues (deduped by fingerprint, closed when fixed) → fix prompt → build → verify; capped by `maxLoops` (3).
 
 ## Idempotent Linear effects
@@ -52,6 +54,10 @@ Every Linear write (comment, state/labels, bug sub-issue, close) is first record
 | Dashboard | loopback only, `Host` check (DNS rebinding), single-use sign-in link → `HttpOnly; SameSite=Strict` cookie on every route incl. SSE, CSRF header + same-origin check on mutations, exact static whitelist, 1 MB body cap. |
 | Teammates / prompt injection via Linear | only issues **you created** (server-side `creator.isMe` + client re-check); trigger-label and description edits are attributed via issue history; only your comments reach prompts; all issue/repo text is fenced as untrusted data; the verifier is read-only. |
 | Cost | `maxParallel` 2, `maxLoops` 3, per-issue cap of 10 agent runs, usage-limit pause. |
+
+## What Conductor changes in your repositories
+
+Nothing in your working tree or branches. It does add: a git **worktree** per task (`<repo parent>/.conductor-worktrees/<repo>/<KEY>`, branch `conductor/<key>`), refs under `refs/conductor/<KEY>/` (base + recoverable backups), and a few lines in the repo's shared **`.git/info/exclude`** (`/.conductor/`, `node_modules`, copied env files, `/.cursor/cli.json`) so those never show up in `git status`. `uninstall` does not remove them; delete the lines by hand if you want.
 
 ## Files on disk (`~/.conductor`)
 

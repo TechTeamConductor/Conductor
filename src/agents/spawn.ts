@@ -168,7 +168,21 @@ export function runProcess(opts: SpawnOpts): Promise<SpawnResult> {
     child.stderr?.on('data', lineSplitter('stderr'));
 
     child.on('error', (e) => finish({ code: null, signal: null, timedOut, aborted, stdoutTail, stderrTail, spawnError: String(e) }));
-    child.on('close', (code, sig) => finish({ code, signal: sig, timedOut, aborted, stdoutTail, stderrTail }));
+    // `close` waits for every holder of the stdio pipes; a background grandchild (dev server, watcher) would otherwise keep us
+    // waiting until the idle timeout and turn a success into a timeout. After `exit`, give the pipes a short drain window,
+    // then reap the whole group and finish with the real exit status.
+    let drain: NodeJS.Timeout | null = null;
+    child.on('exit', (code, sig) => {
+      drain = setTimeout(() => {
+        if (pid) killGroup(pid, 'SIGKILL');
+        finish({ code, signal: sig, timedOut, aborted, stdoutTail, stderrTail });
+      }, 750);
+      drain.unref();
+    });
+    child.on('close', (code, sig) => {
+      if (drain) clearTimeout(drain);
+      finish({ code, signal: sig, timedOut, aborted, stdoutTail, stderrTail });
+    });
 
     child.stdin?.on('error', () => {
       /* EPIPE if the child exits early */

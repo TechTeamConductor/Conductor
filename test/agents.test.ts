@@ -157,6 +157,12 @@ test('Cursor usage-limit and failure classification', async () => {
   assert.equal(r2.errorKind, 'agent');
 });
 
+test('Cursor normaliser: a command blocked by the permission rules shows the readable reason', () => {
+  const ev = normalizeCursorEvent({ type: 'tool_call', subtype: 'completed', tool_call: { shellToolCall: { args: { command: 'git push' }, result: { rejected: { command: 'git push origin HEAD', workingDirectory: '/very/long/path/'.repeat(8), error: 'Command blocked by permissions configuration' } } } } }, { stage: 'build' }, { thinking: '' });
+  assert.equal(ev[0]!.ok, false);
+  assert.match(ev[0]!.text!, /blocked by permissions/);
+});
+
 test('extractJson: whole, fenced, last-fence-wins, prose around, nested/escaped braces, garbage', () => {
   assert.deepEqual(extractJson('{"a":1}'), { a: 1 });
   assert.deepEqual(extractJson('Using SoftCo Lead.\n```json\n{"x":[1,2]}\n```\nbye'), { x: [1, 2] });
@@ -175,7 +181,7 @@ test('validateSchema: plan and verdict schemas accept good data and name the exa
   bad.complexity = 'XL';
   bad.acceptanceCriteria = [];
   const errs = validateSchema(PLAN_SCHEMA, bad);
-  assert.ok(errs.some((e) => e.includes('summary')) && errs.some((e) => e.includes('complexity')) && errs.some((e) => e.includes('at least 1')), errs.join(' | '));
+  assert.ok(errs.some((e) => e.includes('summary')) && errs.some((e) => e.includes('complexity')), errs.join(' | '));
   assert.deepEqual(validateSchema(VERDICT_SCHEMA, { verdict: 'pass', summary: 's', acceptance: [], bugs: [] }), []);
   assert.ok(validateSchema(VERDICT_SCHEMA, { verdict: 'maybe', summary: 's', acceptance: [], bugs: [{ title: 't' }] }).length >= 2);
   assert.match(describeSchema(PLAN_SCHEMA), /acceptanceCriteria/);

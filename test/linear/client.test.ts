@@ -508,17 +508,30 @@ describe('LinearClient pagination', () => {
 });
 
 describe('LinearClient mutations', () => {
-  test('update(): maps addLabelIds/removeLabelIds to addedLabelIds/removedLabelIds; empty patch sends nothing', async () => {
+  test('update(): maps add/remove label ids to addedLabelIds/removedLabelIds; already-present adds and absent removes are dropped; empty patch sends nothing', async () => {
     const { client } = makeClient();
+    server.enqueue(ok({ issue: { id: 'i1', labels: { nodes: [{ id: 'a' }, { id: 'c' }] } } })); // current labels: a, c
     server.enqueue(ok({ issueUpdate: { success: true } }));
-    await client.update('i1', { stateId: 's1', addLabelIds: ['a', 'b'], removeLabelIds: ['c'], description: 'new' });
-    assert.deepEqual(server.requests[0]!.variables, {
+    await client.update('i1', { stateId: 's1', addLabelIds: ['a', 'b'], removeLabelIds: ['c', 'zzz'], description: 'new' });
+    assert.deepEqual(server.requests[1]!.variables, {
       id: 'i1',
-      input: { stateId: 's1', addedLabelIds: ['a', 'b'], removedLabelIds: ['c'], description: 'new' },
+      input: { stateId: 's1', addedLabelIds: ['b'], removedLabelIds: ['c'], description: 'new' },
     });
     await client.update('i1', {});
     await client.update('i1', { addLabelIds: [], removeLabelIds: [] });
-    assert.equal(server.requests.length, 1);
+    assert.equal(server.requests.length, 2, 'empty patches send nothing at all');
+  });
+
+  test('update(): REGRESSION (found live) — removing labels that are not on the issue sends no mutation (real Linear rejects it)', async () => {
+    const { client } = makeClient();
+    server.enqueue(ok({ issue: { id: 'i1', labels: { nodes: [] } } }));
+    await client.update('i1', { removeLabelIds: ['stage-a', 'stage-b'] });
+    assert.equal(server.requests.length, 1, 'only the label lookup; no issueUpdate');
+    server.reset();
+    server.enqueue(ok({ issue: { id: 'i1', labels: { nodes: [] } } }));
+    server.enqueue(ok({ issueUpdate: { success: true } }));
+    await client.update('i1', { stateId: 'st', addLabelIds: ['stage-a'], removeLabelIds: ['stage-b', 'stage-c'] });
+    assert.deepEqual(server.requests[1]!.variables, { id: 'i1', input: { stateId: 'st', addedLabelIds: ['stage-a'] } });
   });
 
   test('update(): success=false is an error', async () => {

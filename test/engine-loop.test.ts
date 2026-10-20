@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeHarness } from './helpers/harness.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { comments, labelNames } from './helpers/util.ts';
 
 const bug = { title: 'Feature returns wrong value for 0', severity: 'major', file: 'feature.mjs', line: 1, evidence: 'feature() ignores input', repro: 'feature(0)', suggestedFix: 'handle 0' };
@@ -8,7 +10,7 @@ const bug = { title: 'Feature returns wrong value for 0', severity: 'major', fil
 test('verifier fails → bug sub-issue (never trigger-labelled) → fix loop → pass → sub-issue closed', async () => {
   const h = await makeHarness();
   try {
-    h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'One real problem.', bugs: [bug] } }, { json: { verdict: 'pass' } }] } } });
+    h.scenario({ cursor: { '*': { build: [{ savePrompt: true }, { savePrompt: true }] } }, claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'One real problem.', bugs: [bug] } }, { json: { verdict: 'pass' } }] } } });
     const key = h.issue('Add the answer feature');
     await h.settle();
     const run = h.run(key);
@@ -24,9 +26,12 @@ test('verifier fails → bug sub-issue (never trigger-labelled) → fix loop →
     assert.ok(!kids[0]!.labels.some((l) => l.name === 'conductor'));
     assert.equal(kids[0]!.state.type, 'completed');
     // fix prompt reached the builder with the finding; the second build used the fix template
-    h.scenario({ ...JSON.parse('{}') });
     const calls = h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build');
     assert.equal(calls.length, 2);
+    const fixPrompt = readFileSync(join(h.fakeDir, `prompt-cursor-${key}-build-1.txt`), 'utf8');
+    assert.match(fixPrompt, /# Stage: FIX/, 'the second build uses the fix template');
+    assert.ok(fixPrompt.includes('Feature returns wrong value for 0') && fixPrompt.includes('feature(0)'), 'the verifier finding reaches the builder');
+    assert.ok(fixPrompt.includes('One real problem') || fixPrompt.includes('Verifier'), 'the verifier summary is included');
     const cs = await comments(h, key);
     assert.ok(cs.some((c) => c.includes('Verification failed (loop 1')));
     assert.ok(labelNames(h, key).includes('conductor:ready'));

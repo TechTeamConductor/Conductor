@@ -5,7 +5,7 @@ import { comments } from './helpers/util.ts';
 
 test('Claude usage limit pauses (does not fail), comments once, notifies, and auto-resumes after the reset', async () => {
   const clock = new TestClock();
-  const h = await makeHarness({ clock });
+  const h = await makeHarness({ clock, config: (c) => void (c.pipeline.onClaudeLimit = 'wait') });
   try {
     const resetsAt = Math.floor(clock.now() / 1000) + 2 * 3600;
     h.scenario({ claude: { '*': { plan: [{ limit: { resetsAt } }, {}] } } });

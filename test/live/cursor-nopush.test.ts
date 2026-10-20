@@ -44,6 +44,15 @@ Finish with a single line: RESULTS followed by nine words, each OK, BLOCKED or F
     const refs = git(bare, 'for-each-ref', '--format=%(refname)').split('\n').filter(Boolean);
     console.log('REMOTE REFS AFTER:', refs);
     for (const r of refs) assert.ok(r === 'refs/heads/main', `unexpected ref pushed to the remote: ${r}`);
+    const attempts = events.filter((e) => e.startsWith('tool:') && /git push|git -c|\/usr\/bin\/git|env git|sh -c/.test(e));
+    assert.ok(attempts.length >= 5, `the agent really tried the pushes (${attempts.length} attempts seen) — otherwise this test proves nothing`);
+    const blockedAfter = (needle: string) => {
+      const i = events.findIndex((e) => e.startsWith('tool:') && e.includes(needle));
+      assert.ok(i >= 0, `the agent attempted: ${needle}`);
+      return events.slice(i + 1).find((e) => e.startsWith('tool_result:')) ?? '';
+    };
+    assert.match(blockedAfter('security find-generic-password'), /blocked/i, 'security is denied');
+    assert.match(blockedAfter('gh --version'), /blocked/i, 'gh is denied');
     const shell = events.filter((e) => e.startsWith('tool_result:') || e.startsWith('tool:'));
     console.log('TOOL EVENTS:\n' + shell.slice(0, 40).join('\n'));
     void Agents;

@@ -131,6 +131,14 @@ export const Q_ISSUE_CORE = `query IssueCore($id: String!) {
   }
 }`;
 
+/**
+ * Current label ids of one issue. REAL Linear rejects `removedLabelIds` entries that are not on the issue
+ * ("Label not on issue … cannot be removed"), so `update()` filters against this first (found live, first contact).
+ */
+export const Q_ISSUE_LABEL_IDS = `query IssueLabelIds($id: String!) {
+  issue(id: $id) { id labels(first: 100) { nodes { id } } }
+}`;
+
 /** Lookup of one comment (used to recover after an ambiguous `commentCreate`). */
 export const Q_COMMENT_LOOKUP = `query CommentLookup($id: String!) { comment(id: $id) { id } }`;
 

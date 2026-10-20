@@ -7,7 +7,7 @@ import { atomicWriteFile, deepClone, readJsonFile } from './util.ts';
 
 export function defaultConfig(): Config {
   return {
-    version: 1,
+    version: 2,
     ui: { port: 4317, openBrowser: true },
     linear: {
       mode: 'labels',
@@ -26,12 +26,14 @@ export function defaultConfig(): Config {
       maxParallel: 2,
       maxLoops: 3,
       maxAgentRunsPerIssue: 10,
-      planApproval: 'first',
+      // Hands-off defaults: plans only wait for you when they are large or touch protected files; when Claude is
+      // rate-limited Cursor takes over the read-only stages instead of everything stalling until the reset.
+      planApproval: 'auto',
       planReview: 'auto',
-      onClaudeLimit: 'wait',
+      onClaudeLimit: 'cursor',
       failOn: ['blocker', 'major'],
       noGates: 'warn',
-      timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 10, gate: 15 },
+      timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
   };
 }
@@ -52,8 +54,13 @@ export function normalizeConfig(input: unknown): Config {
   const pl = (i.pipeline ?? {}) as any;
   const st = (i.stages ?? {}) as any;
   const to = (pl.timeoutsMin ?? {}) as any;
+  // v1 → v2: the v1 defaults ('first' approval, 'wait' on limit, 10-min idle) were friction, not choices — upgrade them once.
+  const v1 = !(typeof i.version === 'number' && i.version >= 2);
+  if (v1 && pl.planApproval === 'first') pl.planApproval = 'auto';
+  if (v1 && pl.onClaudeLimit === 'wait') pl.onClaudeLimit = 'cursor';
+  if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 1,
+    version: 2,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
@@ -177,7 +184,6 @@ export function applySettings(cfg: Config, patch: Partial<Settings>): Config {
     linear: {
       ...next.linear,
       ...(patch.pickupFromBacklog !== undefined ? { pickupFromBacklog: patch.pickupFromBacklog } : {}),
-      ...(patch.linearMode !== undefined ? { mode: patch.linearMode } : {}),
     },
     stages: { ...next.stages, ...(patch.stages ?? {}) },
   });
