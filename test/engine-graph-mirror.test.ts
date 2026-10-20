@@ -200,7 +200,7 @@ test('more than 8 tasks always waits for a person, even with automatic approval;
     const k1 = h.issue('Big change');
     await h.settle();
     assert.equal(h.run(k1).status, 'awaiting_approval');
-    assert.ok((await comments(h, k1)).some((c) => /9 tasks — more than 8/.test(c)));
+    assert.ok((await comments(h, k1)).some((c) => /more than 8 tasks/.test(c)));
     assert.equal(h.run(k1).graph, undefined, 'no graph before a person approves');
     const eight = graphPlan(Array.from({ length: 8 }, (_, i) => item(`T${i + 1}`, { criteria: i === 0 ? ['AC1', 'AC2'] : [] })));
     h.scenario({ claude: { '*': { plan: [{ json: eight }] } } });
