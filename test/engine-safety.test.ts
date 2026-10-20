@@ -38,7 +38,7 @@ test('builder env: no secrets, no-push git env present, Cursor deny rule written
     const run = h.run(key);
     const cli = JSON.parse(readFileSync(join(run.worktree, '.cursor', 'cli.json'), 'utf8'));
     assert.deepEqual(cli.permissions.allow, []);
-    assert.ok(cli.permissions.deny.includes('Shell(git:push*)'));
+    for (const d of ['Shell(git:push*)', 'Shell(git:*push*)', 'Shell(env:*git*)', 'Shell(sh:*git*push*)', 'Shell(gh:*)', 'Shell(security:*)']) assert.ok(cli.permissions.deny.includes(d), d);
     assert.equal(git(run.worktree, 'status', '--porcelain'), '', 'cli.json is git-excluded and never committed');
     const claude = h.calls().filter((c) => c.who === 'claude');
     for (const c of claude) {

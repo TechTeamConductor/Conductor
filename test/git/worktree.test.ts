@@ -24,8 +24,7 @@ import {
   scanAncestors,
   withRepoLock,
   writeCursorGuard,
-  CURSOR_GUARD_JSON,
-} from '../../src/git/worktree.ts';
+  CURSOR_GUARD_JSON, CURSOR_GUARD_DENY } from '../../src/git/worktree.ts';
 import {
   fingerprint,
   isolateGitHome,
@@ -1126,7 +1125,7 @@ describe('writeCursorGuard / checkCursorGuard', () => {
     const text = readFileSync(file, 'utf8');
     assert.equal(
       text,
-      '{"permissions":{"allow":[],"deny":["Shell(git:push*)","Shell(gh:*)","Shell(security:*)","Shell(osascript:*)","Shell(sudo:*)"]}}',
+      JSON.stringify({ permissions: { allow: [], deny: CURSOR_GUARD_DENY } }),
     );
     assert.equal(text, CURSOR_GUARD_JSON);
     const parsed = JSON.parse(text) as { permissions: { allow: unknown[]; deny: string[] } };

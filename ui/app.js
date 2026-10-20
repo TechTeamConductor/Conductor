@@ -170,6 +170,13 @@ function safeHttp(u) {
 }
 function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
 const ELAPSED_TAIL = /\s*[·•|–—-]\s*(?=\d)(?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?\s*$/;
+/** The server's activity sentence, minus the live timer, and minus any copy of the needs-human reason (shown separately). */
+function activitySentence(r, live) {
+  let t = live ? (r.activity || '').replace(ELAPSED_TAIL, '') : (r.activity || '');
+  const reason = r.needsHuman && r.needsHuman.reason ? String(r.needsHuman.reason) : '';
+  if (reason && t.toLowerCase().includes(reason.slice(0, 24).toLowerCase())) t = 'Blocked, waiting for you';
+  return t || runLabel(r);
+}
 function runLabel(run) { return run.status === 'awaiting_approval' ? 'Plan ready' : (STATUS_LABEL[run.status] || run.status); }
 function statusClass(run) {
   if (run.column === 'closed') return 'st-' + (run.status === 'failed' ? 'failed' : run.status === 'finished' ? 'finished' : 'aborted');
@@ -431,7 +438,7 @@ function buildHeader() {
   HDR.connIcon = h('span', { class: 'dot' });
   HDR.connLbl = h('span', { class: 'conn-label' });
   HDR.conn = h('span', { class: 'conn', hidden: true }, HDR.connIcon, HDR.connLbl);
-  HDR.newBtn = h('button', { type: 'button', class: 'btn btn-primary', onclick: () => openNewTask() }, icon('plus'), h('span', null, 'New task'));
+  HDR.newBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-label': 'New task', onclick: () => openNewTask() }, icon('plus'), h('span', { class: 'btn-label-hide' }, 'New task'));
   HDR.setBtn = h('button', { type: 'button', class: 'btn btn-icon', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings() }, icon('sliders'));
   top.append(brand, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.newBtn, HDR.setBtn);
 }
@@ -473,7 +480,8 @@ function updateHeader(wizard) {
     HDR.pauseSig = psig;
     HDR.pauseBtn.className = 'btn' + (paused ? ' btn-primary' : '') + (busy ? ' is-busy' : '');
     HDR.pauseBtn.disabled = busy;
-    HDR.pauseBtn.replaceChildren(icon(paused ? 'play' : 'pause-bars'), h('span', null, paused ? 'Resume' : 'Pause'));
+    HDR.pauseBtn.replaceChildren(icon(paused ? 'play' : 'pause-bars'), h('span', { class: 'btn-label-hide' }, paused ? 'Resume' : 'Pause'));
+    HDR.pauseBtn.setAttribute('aria-label', paused ? 'Resume the engine' : 'Pause the engine');
     HDR.pauseBtn.title = paused ? 'Let Conductor start new work again' : 'Stop starting new work. Running stages finish.';
   }
 
@@ -641,7 +649,7 @@ function buildBoardView() {
   }
   B.pollEl = h('span', { class: 'num' }, '30');
   B.empty = h('section', { class: 'empty', 'aria-labelledby': 'empty-h' },
-    h('h1', { id: 'empty-h' }, 'Nothing in flight'),
+    h('h2', { id: 'empty-h', class: 'empty-title' }, 'Nothing in flight'),
     h('p', null, 'Conductor is watching Linear. Tasks you create with the trigger label start here.'),
     h('ol', { class: 'flow', 'aria-label': 'How a task moves' },
       h('li', null, h('b', null, 'Plan'), h('span', null, 'Claude reads the issue and writes a plan')),
@@ -811,8 +819,7 @@ function updateCard(el, r) {
 
   const working = WORKING_COLUMNS.includes(r.column);
   const live = working && r.stageStartedAt;
-  const sentence = live ? (r.activity || '').replace(ELAPSED_TAIL, '') : (r.activity || '');
-  setText(p.sentence, sentence || runLabel(r));
+  setText(p.sentence, activitySentence(r, live));
   const icKey = working ? 'dot' : r.column;
   if (p._ic !== icKey) { p._ic = icKey; p.ic.replaceChildren(working ? h('span', { class: 'dot pulse' }) : icon(COLUMN_ICON[r.column] || 'info')); }
   if (live) { setText(p.lbl, ''); setTimer(p.timer, 't0', r.stageStartedAt); toggleHidden(p.tail, false); }
@@ -1038,8 +1045,7 @@ function renderDetailPanels() {
 function activityNodes(r) {
   const working = WORKING_COLUMNS.includes(r.column);
   const live = working && r.stageStartedAt;
-  const sentence = live ? (r.activity || '').replace(ELAPSED_TAIL, '') : (r.activity || '');
-  const out = [sentence || runLabel(r)];
+  const out = [activitySentence(r, live)];
   if (live) out.push(' · ', h('span', { class: 't-elapsed', data: { t0: r.stageStartedAt } }, ''));
   else if (r.column === 'paused' && r.pausedUntil) out.push(' · resumes in ', h('span', { class: 't-until', data: { t1: r.pausedUntil } }, ''));
   else if (WAITING_COLUMNS.includes(r.column) && r.updatedAt) out.push(' · waiting ', h('span', { class: 't-elapsed', data: { t0: r.updatedAt } }, ''));
@@ -1117,10 +1123,10 @@ function renderOverview(d) {
     fact('Cost so far', fmtCost(d.costUsd)),
     fact('Started', h('span', { title: fmtFull(d.startedAt) }, fmtWhen(d.startedAt))),
     fact('Last change', h('span', { title: fmtFull(d.updatedAt) }, fmtAgo(d.updatedAt))),
-    fact('Branch', [d.branch || '', d.branch ? copyBtn(d.branch, 'branch name') : null], true),
+    fact('Branch', [h('span', { class: 'val' }, d.branch || 'none'), d.branch ? copyBtn(d.branch, 'branch name') : null], true),
     fact('Base commit', d.baseSha ? d.baseSha.slice(0, 10) : 'none', true),
     fact('Commit', d.commitSha ? d.commitSha.slice(0, 10) : 'none yet', true),
-    fact('Worktree', d.worktree ? [d.worktree, copyBtn(d.worktree, 'worktree path')] : 'none', true, true))));
+    fact('Worktree', d.worktree ? [h('span', { class: 'val' }, d.worktree), copyBtn(d.worktree, 'worktree path')] : 'none', true, true))));
 
   if (d.diffStat) root.appendChild(h('div', { class: 'sec' }, h('h3', null, 'Changes'), h('pre', { class: 'diffstat mono' }, d.diffStat)));
   if (d.description) {
@@ -1861,10 +1867,12 @@ const W = {
 const stepOk = (id) => { const s = S.state.setup.steps.find((x) => x.id === id); return !!(s && s.ok); };
 const firstOpenStep = () => { const f = WIZ_STEPS.find(([id]) => !stepOk(id)); return f ? f[0] : null; };
 const rerenderWizard = () => renderWizard(true);
+const focusWiz = (id) => { const el = $('#view [data-focus="' + id + '"]'); if (el && !el.disabled) el.focus({ preventScroll: false }); };
 const advanceWizard = () => { W.open = firstOpenStep(); };
 const df = (id) => ({ focus: id });
 
 function renderWizard(force) {
+  if (S.view !== 'wizard' || !S.state) return;
   const st = S.state;
   const sig = JSON.stringify([st.setup, st.health, st.repos, S.route.view, st.settings && st.settings.pickupFromBacklog]);
   if (!force && sig === W.sig) return;
@@ -1979,6 +1987,7 @@ async function submitKey(input) {
   } catch (e) { W.linearErr = e.message; }
   body.key = '';
   W.linearBusy = false; rerenderWizard();
+  if (W.linearErr) focusWiz('key-input');
 }
 function linearBody(step) {
   const hl = S.state.health || {};
@@ -2093,7 +2102,7 @@ function teamPreview(pv) {
     h('button', { type: 'button', class: 'btn btn-primary' + (W.createBusy ? ' is-busy' : ''), disabled: W.createBusy, data: df('confirm-team'), onclick: confirmTeam },
       W.createBusy ? 'Creating…' : will.length ? `Confirm and create ${will.length}` : 'Confirm'),
     h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => { W.preview = null; rerenderWizard(); } }, 'Cancel')));
-  box.appendChild(inlineErr(W.createErr));
+  appendKids(box, [inlineErr(W.createErr)]);
   return box;
 }
 function teamResult(r) {
@@ -2123,8 +2132,10 @@ async function addRepo() {
     W.lastRepo = r.repo || null; W.repoPath = ''; W.repoName = '';
     await loadState();
     advanceWizard();
+    if (S.state.setup.complete) toast('good', 'Setup complete. Conductor is now watching Linear for tasks.');
   } catch (e) { W.repoErr = e.message; }
   W.repoBusy = false; rerenderWizard();
+  if (W.repoErr) focusWiz('repo-path');
 }
 async function removeRepo(name) {
   const ok = await confirmDialog({ title: `Remove ${name}?`, body: 'Conductor forgets this repository. The folder and its worktrees are not touched.', confirmLabel: 'Remove', danger: true });
@@ -2202,6 +2213,10 @@ function init() {
       closeSSE(); renderConn(); scheduleReconnect();
     }
   }, 10000);
+  let lastCrash = 0;
+  const crash = () => { if (Date.now() - lastCrash > 5000) { lastCrash = Date.now(); toast('error', 'Something went wrong in the dashboard. Reload the page if it looks stuck.'); } };
+  window.addEventListener('error', crash);
+  window.addEventListener('unhandledrejection', crash);
   S.route = parseHash();
   boot();
 }

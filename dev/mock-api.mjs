@@ -250,7 +250,7 @@ function pushLog(run, ev, tsOverride) {
 function genFor(run, stage, ts) {
   const [agent, stg] = AGENT_STAGE[stage] || ['claude', stage];
   const batch = pick(TEMPLATES[stage] || TEMPLATES.plan)();
-  batch.forEach((b, i) => pushLog(run, { agent, stage: stg, ...b }, ts ? ts + i * 40 : undefined));
+  batch.forEach((b, i) => pushLog(run, { agent: b.kind === 'note' ? 'conductor' : agent, stage: stg, ...b }, ts ? ts + i * 40 : undefined));
 }
 function seedStage(run, stage, count, endTs, gap) {
   const [agent, stg] = AGENT_STAGE[stage];
@@ -525,7 +525,7 @@ function recount() {
 /* ───────────────────────── setup state ───────────────────────── */
 function buildSetup() {
   const h = M.health;
-  const agentsOk = M.agentsOk && h.claude.ok && h.cursor.ok;
+  const agentsOk = M.agentsOk && h.claude.found && h.cursor.found && (M.scenario === 'setup0' ? h.claude.ok && h.cursor.ok : true);
   const team = TEAMS.find((x) => x.id === M.teamId);
   const steps = [
     { id: 'agents', label: 'Agents', ok: agentsOk, detail: agentsOk ? `Claude Code ${h.claude.version} and Cursor agent ${h.cursor.version} are ready` : [!h.claude.ok ? 'Claude Code needs attention' : null, !h.cursor.ok ? (h.cursor.found ? 'Cursor agent needs attention' : 'Cursor agent not found') : null].filter(Boolean).join(' · ') },

@@ -310,7 +310,7 @@ button.sum-item:hover { filter: brightness(0.97); }
   background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-lg);
   display: flex; flex-direction: column; max-height: calc(100vh - 210px);
 }
-.col.is-empty { flex: 0 0 124px; min-width: 124px; background: transparent; border-style: dashed; }
+.col.is-empty { flex: 0 0 140px; min-width: 140px; background: transparent; border-style: dashed; }
 .col-head {
   display: flex; align-items: center; gap: 7px; padding: 10px 12px 8px;
 }
@@ -380,7 +380,7 @@ button.sum-item:hover { filter: brightness(0.97); }
   max-width: 760px; margin: 28px auto 0; padding: 28px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--r-lg);
 }
-.empty h1 { margin-bottom: 6px; }
+.empty h1, .empty .empty-title { margin-bottom: 6px; font-size: 20px; line-height: 1.25; font-weight: 650; letter-spacing: -0.01em; }
 .empty p { color: var(--text-2); max-width: 62ch; }
 .flow { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0; align-items: stretch; }
 .flow li { flex: 1 1 130px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); position: relative; }
@@ -393,7 +393,10 @@ button.sum-item:hover { filter: brightness(0.97); }
 dialog { color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); padding: 0; }
 dialog::backdrop { background: var(--scrim); }
 .dlg { width: min(560px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); border-radius: var(--r-lg); box-shadow: var(--shadow); }
+.dlg { overflow: hidden; }
 .dlg[open] { display: flex; flex-direction: column; }
+.dlg > form { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.dlg-body > p:first-child { margin-bottom: 12px; }
 .dlg-wide { width: min(680px, calc(100vw - 24px)); }
 .dlg-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px 10px; }
 .dlg-head h2 { flex: 1 1 auto; font-size: 16px; }
@@ -465,7 +468,8 @@ dialog::backdrop { background: var(--scrim); }
 .facts > div { background: var(--surface); padding: 9px 12px; min-width: 0; }
 .facts dt { font-size: 12px; color: var(--text-3); margin-bottom: 1px; }
 .facts dd { font-weight: 560; overflow-wrap: anywhere; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.facts dd.mono { font-weight: 450; font-size: 12.5px; }
+.facts dd.mono { font-weight: 450; font-size: 12.5px; flex-wrap: nowrap; }
+.facts .val { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .facts .wide { grid-column: 1 / -1; }
 .desc { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: 12px 14px; max-height: 320px; overflow: auto; }
 .diffstat { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px 12px; overflow-x: auto; white-space: pre; font-size: 12px; }
@@ -569,7 +573,7 @@ dialog::backdrop { background: var(--scrim); }
 .table-wrap .table th, .table-wrap .table td { border-width: 0 0 1px 0; }
 .table-wrap .table tr:last-child td { border-bottom: 0; }
 .gate-name { font-weight: 620; }
-.gate-cmd { display: block; color: var(--text-3); font-size: 11.5px; font-family: var(--mono); overflow-wrap: anywhere; }
+.gate-cmd { display: block; color: var(--text-3); font-size: 11.5px; font-family: var(--mono); white-space: nowrap; }
 .gate-cell small { display: block; color: var(--text-3); font-size: 12px; }
 .fail-list { margin-top: 6px; display: grid; gap: 3px; }
 .fail-list code { display: block; font-size: 11.5px; padding: 2px 6px; background: var(--c-needs_human-bg); color: var(--c-needs_human-fg); border-radius: 4px; overflow-wrap: anywhere; }
@@ -638,7 +642,10 @@ dialog::backdrop { background: var(--scrim); }
 .agent-card .probe.bad { color: var(--c-needs_human-fg); font-weight: 560; }
 .agent-card > .btn { grid-column: 3; grid-row: 1 / span 3; }
 .preview { border: 1px solid var(--border); border-radius: var(--r-md); padding: 12px 14px; margin: 4px 0 14px; background: var(--surface-2); }
-.preview h3 { margin-bottom: 6px; }
+.preview > * + * { margin-top: 10px; }
+.preview h3 { margin-bottom: 0; }
+.callout .row, .callout-body .row { margin-top: 8px; }
+.callout-body > * + * { margin-top: 4px; }
 .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .repo-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); margin-bottom: 8px; background: var(--surface-2); }
 .repo-row .path { grid-column: 1; color: var(--text-3); font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
@@ -706,8 +713,12 @@ dialog::backdrop { background: var(--scrim); }
   .quota .meter { flex: 1 1 auto; }
   .quota-top { flex: none; }
   .quota-sub { order: 3; }
-  .conn .conn-label { display: none; }
+  .conn .conn-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
   .btn-label-hide { display: none; }
+  .topbar .btn { padding: 0 11px; }
+  .topbar .btn-icon { padding: 0; }
+  .brand { margin-right: 0; }
+  .engine .st { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .banner { padding: 9px 12px; flex-wrap: wrap; }
   .banner .btn { margin-left: 27px; }
 
@@ -738,6 +749,7 @@ dialog::backdrop { background: var(--scrim); }
   .toast-stack { right: 12px; left: 12px; width: auto; bottom: 12px; }
   .empty { padding: 18px 16px; margin-top: 8px; }
   .wiz-progress .meter { flex-basis: 90px; }
+  .gate-cmd { white-space: normal; overflow-wrap: anywhere; }
   .gate-table thead { display: none; }
   .gate-table, .gate-table tbody, .gate-table tr, .gate-table td { display: block; width: 100%; }
   .gate-table tr { border-bottom: 1px solid var(--border); padding: 8px 12px; }

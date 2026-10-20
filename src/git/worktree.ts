@@ -929,7 +929,25 @@ export async function agentGitEnv(repoRoot: string): Promise<Record<string, stri
 
 // ───────────────────────────── Cursor deny-rule guard ─────────────────────────────
 
-export const CURSOR_GUARD_DENY = ['Shell(git:push*)', 'Shell(gh:*)', 'Shell(security:*)', 'Shell(osascript:*)', 'Shell(sudo:*)'];
+/**
+ * Live-proven (Cursor 2026.10.19, --force): `Shell(git:push*)` alone stops `git push …` but NOT wrappers combined with an
+ * explicit URL (`env git push <path>`, `/usr/bin/git push …`, `git -c k=v push …`, `sh -c 'git push …'` all succeeded).
+ * The wider patterns below blocked every one of those. Known trade-off: a git command whose text contains "push"
+ * (e.g. a commit message) is blocked too — Conductor does the committing. Other interpreters (python, node, …) are
+ * not enumerable: this is defence in depth under a same-user threat model, not a sandbox.
+ */
+export const CURSOR_GUARD_DENY = [
+  'Shell(git:push*)',
+  'Shell(git:*push*)',
+  'Shell(/usr/bin/git:*push*)',
+  'Shell(env:*git*)',
+  'Shell(sh:*git*push*)',
+  'Shell(bash:*git*push*)',
+  'Shell(gh:*)',
+  'Shell(security:*)',
+  'Shell(osascript:*)',
+  'Shell(sudo:*)',
+];
 /** `allow` MUST be present (empty): Cursor's schema requires both arrays (proven live). */
 export const CURSOR_GUARD_JSON = JSON.stringify({ permissions: { allow: [], deny: CURSOR_GUARD_DENY } });
 
