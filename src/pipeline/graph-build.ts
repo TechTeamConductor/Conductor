@@ -160,7 +160,7 @@ export class GraphBuilder {
       ...failed.map((i) => `- ${label(i)} failed${i.note ? `: ${sanitizeLine(i.note, 400)}` : ''}`),
       ...blocked.map((i) => `- ${label(i)} was not started because ${i.dependsOn.filter((d) => ['failed', 'blocked'].includes(items.find((x) => x.id === d)?.state ?? '')).join(', ')} did not finish`),
       done.length ? `Finished and kept: ${done.map((i) => i.id).join(', ')}.` : '',
-      'Retry runs the failed and blocked tasks again; the finished tasks and their commits are kept. Moving the card to To do instead starts over with a new plan.',
+      'Retry runs the failed and blocked tasks again; the finished tasks and their commits are kept. Moving the card to To do does the same as Retry; to start over with a new plan, edit the card description (or stop the run, then Retry).',
     ].filter(Boolean);
     if (!failed.length && !blocked.length) {
       return this.h.toNeedsHuman(key, 'The task graph has no task that can run, but it is not complete. Move the card to To do to plan it again.', 'build');
@@ -563,7 +563,7 @@ export class GraphBuilder {
       r.commitNote = undefined;
       r.history.push({ ts: h.c.clock.now(), text: `Task ${id} failed: ${truncate(redact(reason, secrets), 160)}` });
     });
-    await this.cardNote(key, id, 'failed', `❌ **${id} failed** — ${truncate(redact(reason, secrets), 600)}${backup}`);
+    await this.cardNote(key, id, `failed:${this.item(key, id).agentRuns}`, `❌ **${id} failed** — ${truncate(redact(reason, secrets), 600)}${backup}`);
   }
 
   // ───────────────────────── prompt blocks ─────────────────────────

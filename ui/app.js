@@ -1738,7 +1738,7 @@ function renderTasks(d) {
       h('span', { class: 'chip' }, 'Plan rev ' + g.rev)),
     h('p', { class: 'muted' }, 'The plan was split into tasks. Conductor builds them one at a time on one branch, in dependency order, and runs the quality gates after each one; the whole change is verified at the end.'),
     d.status === 'needs_human' && (failed || n('blocked'))
-      ? h('p', null, h('b', null, 'Retry'), ' runs the failed and blocked tasks again; finished tasks and their commits are kept. Moving the card to To do starts over with a new plan.')
+      ? h('p', null, h('b', null, 'Retry'), ' runs the failed and blocked tasks again; finished tasks and their commits are kept. Moving the card to To do does the same as Retry; to start over with a new plan, edit the card description (or stop the run, then Retry).')
       : null));
   root.appendChild(h('ol', { class: 'task-list' }, g.items.map((it) => {
     const st = TASK_STATE[it.state] || TASK_STATE.pending;

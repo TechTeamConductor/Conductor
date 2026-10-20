@@ -335,6 +335,7 @@ export interface Config {
     /** Task graph (M3): item ceiling (1–12; 12 is a hard v2.0 limit), concurrent analysis-item calls (1–4) and an optional AI check per item. */
     maxItems: number;
     readOnlyParallel: number;
+    /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
     verifyEachItem: boolean;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
   };

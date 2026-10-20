@@ -510,6 +510,15 @@ export class Engine {
           const card = it.key ? this.board.item(it.key) : undefined;
           return card && card.parentId === run0.itemId ? [{ effKey: `subtask-cancel:${run0.graph!.rev}:${it.id}`, id: card.id, rev: run0.graph!.rev }] : [];
         });
+    // cards whose creation effect applied but whose key the graph never recorded (crash/transient window) are found through the effect's refId
+    if (!retryStage && run0.graph) {
+      for (const [ek, rec] of Object.entries(run0.effects)) {
+        if (!ek.startsWith(`subtask:${run0.graph.rev}:`) || rec.status !== 'done' || !rec.refId) continue;
+        const card = this.board.item(rec.refId);
+        const id = ek.split(':')[2]!;
+        if (card && card.parentId === run0.itemId && !superseded.some((c) => c.id === card.id)) superseded.push({ effKey: `subtask-cancel:${run0.graph.rev}:${id}`, id: card.id, rev: run0.graph.rev });
+      }
+    }
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
       r.restartTimes = [...recent, nowT];
@@ -562,6 +571,7 @@ export class Engine {
         r.feedback = undefined;
         r.verdict = null;
         for (const b of r.bugs) if (b.status === 'open') b.status = 'closed';
+        for (const [ek, rec] of Object.entries(r.effects)) if (ek.startsWith(`subtask:${r.rev - 1}:`) && rec.status === 'pending') rec.status = 'done'; // never create cards for a discarded graph
         r.graph = undefined;
         for (const c of superseded) Effects.enqueue(r, c.effKey, { kind: 'subtask-cancel', payload: { itemId: c.id, rev: c.rev } });
         r.history.push({ ts: now, text: `Re-planning from scratch (rev ${r.rev}) — requested by you` });
