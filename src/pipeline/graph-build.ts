@@ -21,7 +21,7 @@ import { redact } from '../redact.ts';
 import { truncate } from '../util.ts';
 import type { PipelineCtx } from './context.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
-import { ANALYSIS_ROLES, ancestorsOf, itemMarker, newNonce, parseItemMarker, pickNext, propagateBlocked, readySet, sanitizeLine } from './graph.ts';
+import { ANALYSIS_ROLES, ancestorsOf, itemMarker, newNonce, parseItemMarker, pickNext, propagateBlocked, readySet, sanitizeLine, stripInvisible } from './graph.ts';
 import type { Hold } from './stages.ts';
 import { fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
 
@@ -75,8 +75,8 @@ export function capNote(raw: unknown): ItemNote {
   const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const decisions = Array.isArray(o.decisions) ? o.decisions.filter((d): d is string => typeof d === 'string') : [];
   return {
-    summary: truncate(String(o.summary ?? ''), NOTE_SUMMARY_MAX),
-    details: truncate(String(o.details ?? ''), NOTE_DETAILS_MAX),
+    summary: truncate(stripInvisible(o.summary), NOTE_SUMMARY_MAX),
+    details: truncate(stripInvisible(o.details), NOTE_DETAILS_MAX),
     decisions: decisions.slice(0, NOTE_DECISIONS_MAX).map((d) => truncate(sanitizeLine(d, NOTE_DECISION_LEN), NOTE_DECISION_LEN)),
   };
 }
@@ -601,7 +601,7 @@ export class GraphBuilder {
         const n = this.h.c.store.readArtifact<ItemNote | null>(key, `item-${run.rev}-${a.id}.json`, null);
         if (!n) continue;
         const note = capNote(n);
-        lines.push(`### ${a.id} (${a.role}) — ${sanitizeLine(a.title, 120)}`, note.summary, ...(note.decisions.length ? ['Decisions:', ...note.decisions.map((d) => `- ${d}`)] : []), note.details ? `\n${note.details}` : '', '');
+        lines.push(`### ${a.id} (${a.role}) — ${sanitizeLine(a.title, 120)}`, note.summary, ...(note.decisions.length ? ['Decisions:', ...note.decisions.map((d) => `- ${d}`)] : []), '');
       } else {
         lines.push(`- ${a.id} "${sanitizeLine(a.title, 120)}" is already committed${a.commitSha ? ` (${a.commitSha.slice(0, 7)})` : ''} — build on it, do not redo it.`);
       }

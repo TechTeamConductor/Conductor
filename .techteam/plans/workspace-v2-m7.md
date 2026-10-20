@@ -140,3 +140,5 @@ electron-builder config: NSIS installer (`.exe`, per-user, no admin by default, 
 | §9 secure handling of credentials, tokens, local files | Covered by the secret inventory + safeStorage policy + redaction + hardened shell (design); verified at unit level only |
 | §9 reliability, crash recovery, background behaviour, diagnostics | Covered (existing recovery path, tray behaviour, diagnostics export) |
 | §1 "complete product" across OSes | **Partial** by the honesty rule: macOS verified (build + plan/review/verify); **Linux and Windows: planning/review/verification only — build disabled by code until each platform has its own live evidence (§2b-12)**; Linux container-verified at best; Windows preview |
+
+- **Scope decision (user, 2026-10-20): the only installer targets are the Windows `.exe` and the Debian `.deb`; no other packages or platforms.** (Everything else in §2.5 — extra formats, macOS packaging — is out of scope unless the user says otherwise.)

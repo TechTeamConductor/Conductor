@@ -16,10 +16,16 @@ const CONDUCTOR_OWNED_ROLES: ReadonlySet<string> = new Set(['review', 'verificat
 const ID_RE = /^T\d{1,2}$/;
 const AC_RE = /^[A-Za-z][A-Za-z0-9_-]{0,15}$/;
 
-/** Single-line, control and bidi/format characters stripped, length-capped — for anything that lands in a commit message, a card or a prompt. */
+/** Control, format (bidi, zero-width, Unicode tags …), separator, private-use and unassigned characters, plus invisible fillers and variation selectors. */
+const INVISIBLE_KEEP_NEWLINE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}\u034F\u115F\u1160\u3164\uFFA0\u2800]/gu;
+/** Multi-line text with invisible/format characters stripped (newlines and tabs kept) — for notes and objectives that stay multi-line. */
+export function stripInvisible(s: unknown): string {
+  return String(s ?? '').split(/([\n\t])/).map((part) => (part === '\n' || part === '\t' ? part : part.replace(INVISIBLE_KEEP_NEWLINE, ''))).join('');
+}
+/** Single-line, invisible/format characters stripped, length-capped — for anything that lands in a commit message, a card or a prompt. */
 export function sanitizeLine(s: unknown, max: number): string {
   return String(s ?? '')
-    .replace(/[\u0000-\u001f\u007f\u0080-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/g, ' ')
+    .replace(INVISIBLE_KEEP_NEWLINE, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, max);
@@ -138,7 +144,7 @@ export function buildGraph(plan: Plan, rev: number, now: number, loopBudget: num
       key: null,
       title: sanitizeLine(it.title, 160),
       role: it.role,
-      objective: String(it.objective).slice(0, 2000),
+      objective: sanitizeLine(it.objective, 2000),
       dependsOn: [...it.dependsOn],
       files: it.files.map(normPath),
       criteria: [...it.criteria],

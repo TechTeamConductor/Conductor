@@ -73,7 +73,10 @@ export function planToMarkdown(p: Plan): string {
   if (isGraphPlan(p)) {
     // the decomposition is part of what a human approves: items, order, files and the criteria each one owns
     L.push('### Tasks', '| Id | Role | Task | Depends on | Files | Criteria |', '| --- | --- | --- | --- | --- | --- |');
-    for (const it of itemsOf(p)) L.push(`| ${esc(it.id)} | ${esc(it.role)} | ${esc(sanitizeLine(it.title, 160))} — ${esc(sanitizeLine(it.objective, 300))} | ${esc(it.dependsOn.join(', ') || '—')} | ${esc(it.files.map((f) => `\`${f}\``).join(', ') || '—')} | ${esc(it.criteria.join(', ') || '—')} |`);
+    for (const it of itemsOf(p)) L.push(`| ${esc(it.id)} | ${esc(it.role)} | ${esc(sanitizeLine(it.title, 160))} — ${esc(sanitizeLine(it.objective, 2000))} | ${esc(it.dependsOn.join(', ') || '—')} | ${esc(it.files.map((f) => `\`${f}\``).join(', ') || '—')} | ${esc(it.criteria.join(', ') || '—')} |`);
+    L.push('');
+    // everything a builder is told about a task is shown here in full: the objective above and the checks below
+    for (const it of itemsOf(p)) if (it.verification.length) L.push(`**${esc(it.id)} checks:** ${it.verification.map((v) => esc(sanitizeLine(v, 300))).join(' · ')}`);
     L.push('');
   }
   if (p.steps.length) L.push('### Steps', ...p.steps.map((s, i) => `${i + 1}. ${s}`), '');
