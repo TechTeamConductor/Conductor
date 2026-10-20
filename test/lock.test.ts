@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireLock, LockHeldError, readLock } from '../src/lock.ts';
@@ -64,4 +64,19 @@ test('security review S-3: with a stale lock and several processes contending, t
   }
   assert.equal(violations, 0, 'two processes were inside the critical section at once');
   assert.ok(wins >= 12, `at least one winner per round (got ${wins})`);
+});
+
+test('a contender WAITS for a slow takeover (descheduled holder of the takeover mutex) instead of failing with a raw error', async () => {
+  const dir = tmp();
+  const lockPath = join(dir, 'c.lock');
+  const report = join(dir, 'report');
+  writeFileSync(report, '');
+  writeFileSync(lockPath, JSON.stringify({ pid: 999999, startedAt: Date.now() })); // stale
+  mkdirSync(`${lockPath}.takeover`); // somebody is in the middle of taking over …
+  const child = spawn(process.execPath, [join(import.meta.dirname, 'helpers', 'lock-child.ts')], { env: { ...process.env, LOCK_PATH: lockPath, MARKER: join(dir, 'inside'), REPORT: report }, stdio: 'ignore' });
+  const exited = new Promise<void>((r) => child.on('exit', () => r()));
+  await new Promise((r) => setTimeout(r, 900)); // … for much longer than the old 12 short back-offs allowed
+  rmSync(`${lockPath}.takeover`, { recursive: true, force: true });
+  await exited;
+  assert.deepEqual(readFileSync(report, 'utf8').split('\n').filter(Boolean), ['won']);
 });

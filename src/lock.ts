@@ -60,7 +60,10 @@ export function acquireLock(path: string = paths.lock(), info: Partial<LockInfo>
   const mine: LockInfo = { pid: process.pid, startedAt: Date.now(), ...info };
   const body = () => JSON.stringify(mine);
   let acquired = false;
-  for (let attempt = 0; attempt < 12 && !acquired; attempt++) {
+  // time-bounded, not attempt-bounded: under heavy load a contender holding the takeover mutex can be descheduled for far longer than a few
+  // back-offs, and the others must WAIT for it rather than fail with a raw error (seen as an intermittent S-3 failure in loaded full-suite runs)
+  const deadline = Date.now() + 5000;
+  for (let attempt = 0; !acquired && (attempt < 12 || Date.now() < deadline); attempt++) {
     const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     const fd = openSync(tmp, 'wx', 0o600);
     try {
@@ -115,7 +118,11 @@ export function acquireLock(path: string = paths.lock(), info: Partial<LockInfo>
       }
     }
   }
-  if (!acquired) throw new Error('could not acquire lock');
+  if (!acquired) {
+    const { stale, held } = isStale(path);
+    if (held && !stale) throw new LockHeldError(held); // somebody else did get it while we waited
+    throw new Error('could not acquire the lock: another process kept taking over a stale lock — try again');
+  }
   let released = false;
   const release = () => {
     if (released) return;
