@@ -149,6 +149,15 @@ export class Stages {
     };
   }
 
+  /** Fast-path runs skipped plan review, so the build may touch ONLY the files the plan listed (every path). Null = fine. */
+  private async fastPathScopeProblem(run: Run, plan: Plan, headSha: string): Promise<string | null> {
+    if (!run.fastPath) return null;
+    const files = (await gitOk(run.worktree, ['diff', '--name-only', '-z', run.baseSha, headSha]).catch(() => '')).split('\0').filter(Boolean);
+    const planSet = new Set(plan.filesToChange.map((f) => f.path.replace(/^\.\//, '')));
+    const extra = files.filter((f) => !planSet.has(f));
+    return extra.length ? `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. Review them (they are committed on the branch), then continue.` : null;
+  }
+
   /** The agent-run budget of a run: a task graph scales it with the amount of work (never past the hard ceiling). */
   runsLimit(run: Run): number {
     const base = this.c.cfg().pipeline.maxAgentRunsPerIssue;
@@ -769,6 +778,8 @@ export class Stages {
     const head = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
     const known = run.commitSha ?? run.baseSha;
     if (head && head !== known && head !== run.baseSha && !(await this.hasUncommitted(run.worktree))) {
+      const scope = await this.fastPathScopeProblem(run, plan, head);
+      if (scope) return this.toNeedsHuman(key, scope, 'build');
       this.note(key, 'build', 'Found a finished build from before a restart — moving on to verification.');
       this.patch(key, (r) => {
         r.commitSha = head;
@@ -882,6 +893,8 @@ export class Stages {
         if (headNow && headNow !== known && headNow !== run.baseSha) {
           const selfProblem = await postBuildChecks(run.worktree, run.baseSha, plan.filesToChange.map((f) => f.path), secrets);
           if (selfProblem) return this.toNeedsHuman(key, selfProblem, 'build');
+          const selfScope = await this.fastPathScopeProblem(run, plan, headNow);
+          if (selfScope) return this.toNeedsHuman(key, selfScope, 'build');
           this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
           this.patch(key, (r) => {
             r.commitSha = headNow;

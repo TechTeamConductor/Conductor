@@ -657,7 +657,16 @@ function tick() { for (const el of document.querySelectorAll('[data-t0],[data-t1
 /* ───────────────────────── run actions (cards + drawer) ───────────────────────── */
 const runUrl = (key, what) => `/api/runs/${enc(key)}/${what}`;
 const runRev = (key) => { if (S.detail && S.detail.key === key && Number.isFinite(S.detail.rev)) return S.detail.rev; const r = S.state && S.state.runs.find((x) => x.key === key); return r ? r.rev : 0; };
-const actApprove = (key) => runAction(key, 'approve', () => api('POST', runUrl(key, 'approve'), { rev: runRev(key) }), `Plan for ${key} approved. Cursor starts building.`);
+const actApprove = async (key) => {
+  const d = S.detail && S.detail.key === key ? S.detail : null;
+  const risks = (d && d.risks) || [];
+  let confirmRisks = false;
+  if (risks.length) {
+    confirmRisks = await confirmDialog({ title: `Approve ${key}?`, body: 'This plan includes risky steps: ' + risks.map((x) => x.rule + ' (' + x.detail + ')').join('; ') + '. Conductor cannot stop a builder from running its own commands — only approve if you understand what this plan runs.', confirmLabel: 'I understand — approve', danger: true });
+    if (!confirmRisks) return;
+  }
+  return runAction(key, 'approve', () => api('POST', runUrl(key, 'approve'), { rev: runRev(key), confirmRisks }), `Plan for ${key} approved. Cursor starts building.`);
+};
 const actMove = (key, lane, msg) => runAction(key, 'move:' + lane, () => api('POST', `/api/items/${enc(key)}/move`, { lane }), msg);
 const actRetry = (key) => runAction(key, 'retry', () => api('POST', runUrl(key, 'retry')), `${key}: retry started.`);
 const actResume = (key) => runAction(key, 'resume', () => api('POST', runUrl(key, 'resume')), `${key} resumed.`);
@@ -1657,6 +1666,7 @@ function renderPlan(d) {
   const p = d.plan; const md = d.planMarkdown; const rv = d.planReview;
   const root = h('div', { class: 'stack-lg' });
   if (d.canApprove) {
+    if ((d.holdReasons || []).length) root.appendChild(h('div', { class: 'callout c-bad' }, icon('shield'), h('div', { class: 'callout-body' }, h('b', null, 'Why it is waiting'), bulletList(d.holdReasons))));
     root.appendChild(h('div', { class: 'sticky-ask' }, h('b', null, 'This plan is waiting for your approval.'),
       actBtn(d, 'approve', 'Approve plan', 'tick', 'btn-primary', () => actApprove(d.key))));
   }

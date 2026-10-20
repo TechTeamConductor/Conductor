@@ -56,7 +56,7 @@ function ensureDir(): string {
 }
 const STATUSES: readonly AskStatus[] = ['running', 'paused', 'done', 'failed', 'canceled'];
 const own = (o: unknown, k: string): unknown => (o && typeof o === 'object' && Object.hasOwn(o, k) ? (o as Record<string, unknown>)[k] : undefined);
-const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
+const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.replace(/[\p{Cf}\p{Co}\p{Cn}\u{E0000}-\u{E007F}\u{FE00}-\u{FE0F}]/gu, '').slice(0, max) : '');
 
 /** A record from untrusted bytes; null when it is not one. Strings are capped, control/bidi characters stripped from one-line fields. */
 export function validateAsk(raw: unknown, id: string): AskRecord | null {

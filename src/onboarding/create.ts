@@ -12,7 +12,7 @@ import { paths } from '../paths.ts';
 export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export class CreateError extends Error {}
 const SYSTEM_DIRS = ['/', '/etc', '/usr', '/bin', '/sbin', '/var', '/System', '/Library', '/private/etc', '/private/var/db', '/private/var/root', '/dev', '/proc', '/sys', '/boot', '/opt'];
-const ID_RE = /^[^\n\r<>\u0000-\u001f]{1,100}$/;
+const ID_RE = /^(?!-)[^\n\r<>\p{Cc}\p{Cf}]{1,100}$/u;
 export interface Identity { name: string; email: string }
 export const CONDUCTOR_IDENTITY: Identity = { name: 'Conductor', email: 'conductor@localhost' };
 export function validateIdentity(i: unknown): Identity {

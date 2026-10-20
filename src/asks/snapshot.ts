@@ -8,13 +8,14 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { isObjectId, type GitSource, type TreeEntry } from '../context/gitread.ts';
 
 export const SNAPSHOT_LIMITS = Object.freeze({ totalBytes: 500 * 1024 * 1024, files: 200_000, blobBytes: 25 * 1024 * 1024, nameLen: 1024, depth: 64, batchBytes: 24 * 1024 * 1024 });
-const AGENT_CONFIG = /^(?:\.claude|\.cursor|\.codex|\.agents|\.husky)(?:\/|$)|^\.mcp\.json$/;
+const AGENT_CONFIG = /(?:^|\/)(?:\.claude|\.cursor|\.codex|\.agents|\.husky|\.windsurf|\.github\/copilot)(?:\/|$)|(?:^|\/)(?:\.mcp\.json|\.cursorrules|\.windsurfrules)$/i;
 export class SnapshotTooLarge extends Error {}
 
 export interface Snapshot { dir: string; files: number; symlinks: number; gitlinks: number; skippedLarge: number; skippedNames: number; omittedConfig: number; commit: string }
 
 /** A repository path that may be materialised, else null. */
 export function safeEntryName(p: string): string | null {
+  p = p.normalize('NFKC');
   if (!p || p.length > SNAPSHOT_LIMITS.nameLen || p.startsWith('/') || /[\u0000-\u001f\u007f]/.test(p)) return null;
   const segs = p.split('/');
   if (segs.length > SNAPSHOT_LIMITS.depth) return null;

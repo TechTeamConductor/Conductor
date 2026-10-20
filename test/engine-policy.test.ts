@@ -60,3 +60,14 @@ test('project settings API: strict body, full-auto needs an explicit confirmatio
     assert.equal((await put({ policy: 'full-auto', confirmFullAuto: true })).json.policy, 'full-auto');
   } finally { await h.cleanup(); }
 });
+
+test('Security blocker: changing context settings never resets the project policy', async () => {
+  const h = await makeHarness();
+  try {
+    h.cfg.projects = { ENG: { policy: 'manual-stages' } } as any;
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    await api.handle('PUT', '/api/projects/ENG/context/settings', new URLSearchParams(), { staleDays: 30, summaries: true });
+    assert.equal(h.cfg.projects.ENG!.policy, 'manual-stages');
+    assert.equal(h.cfg.projects.ENG!.context!.staleDays, 30);
+  } finally { await h.cleanup(); }
+});

@@ -94,3 +94,27 @@ test('eligibility is a pure function of the planner\'s plan', () => {
   assert.equal(fastPathEligible(plan({})), true);
   for (const bad of [{ complexity: 'M' }, { deliverable: 'answer' }, { filesToChange: [] }, { filesToChange: Array.from({ length: 4 }, (_, i) => ({ path: `f${i}.ts` })) }, { filesToChange: [{ path: '../x' }] }, { filesToChange: [{ path: '/etc/x' }] }, { filesToChange: [{ path: '.env' }] }, { filesToChange: [{ path: 'keys/id_rsa' }] }, { filesToChange: [{ path: '.git/config' }] }, { filesToChange: [{ path: 'CLAUDE.md' }] }, { filesToChange: [{ path: '.github/x.yml' }] }]) assert.equal(fastPathEligible(plan(bad)), false, JSON.stringify(bad));
 });
+
+test('Reviewer MJ-3 / Security: a cancelled ask never starts a card; a builder that commits by itself with an extra file is stopped on the fast path; one fast-path run per repo', async () => {
+  const h = await makeHarness();
+  try {
+    h.scenario({ claude: { '*': { ask: [{ json: change, delayMs: 300 }] } } });
+    const a = svc(h);
+    const rec = a.start({ question: 'Rename it', repo: 'demo', allowChange: true });
+    a.cancel(rec.id);
+    await a.idle();
+    assert.equal(h.store.list().length, 0);
+    assert.equal(h.board.items({ projectId: h.projectId }).length, 0);
+  } finally { await h.cleanup(); }
+  const h2 = await makeHarness();
+  try {
+    h2.scenario({ claude: { '*': { ask: [{ json: change }] } }, cursor: { '*': { build: [{ files: { 'feature-eng-1.mjs': 'x\n', 'sneaky.mjs': 'y\n' }, commitSelf: true }] } } });
+    const a = svc(h2);
+    const on = a.start({ question: 'Rename it', repo: 'demo', allowChange: true });
+    await a.idle();
+    const key = a.get(on.id)!.convertedTo!;
+    await h2.settle();
+    assert.equal(h2.run(key).status, 'needs_human');
+    assert.match(h2.run(key).needsHuman!.reason, /sneaky\.mjs/);
+  } finally { await h2.cleanup(); }
+});

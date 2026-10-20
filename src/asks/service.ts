@@ -43,6 +43,8 @@ export interface AskDeps {
   secrets?: () => string[];
   now?: () => number;
   /** Creates a board card for a repository with a SERVER-assigned actor (never from a request body). */
+  /** True when a fast-path run of this repository is still in progress (at most one at a time). */
+  fastPathBusy?: (repo: string) => boolean;
   cards?: { create(i: { repo: string; title: string; description: string; actor: 'user-ask' | 'ask-convert'; idemKey: string }): { key: string } };
 }
 
@@ -68,6 +70,7 @@ export class AskService {
       repo = cfg.repos.find((r) => r.name === input.repo);
       if (!repo) throw new AskError('bad_request', 'Unknown repository.');
     } else if (cfg.repos.length === 1) repo = cfg.repos[0];
+    if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', 'Quick Ask needs Claude\'s safe-mode isolation (project settings and hooks would be loaded from the snapshot otherwise).', 409);
     if (this.running.size >= MAX_CONCURRENT) throw new AskError('busy', 'Two questions are already being answered — try again in a moment.', 429);
     if (!take('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now() })) throw new AskError('limit', `You reached the limit of ${cfg.pipeline.asksPerHour} questions per hour.`, 429);
     const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'quick', repo: repo?.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], allowChange: input.allowChange === true };
@@ -151,7 +154,7 @@ export class AskService {
         }
         const done = this.patch(id, (r) => { r.status = 'done'; r.provider = out.agent; r.tierNote = tierNote; r.result = result; r.events = events; });
         // the fast path starts ONLY from the option ticked before the ask; the card's text is the user's own question, never the model's change text
-        if (done && result?.kind === 'change' && done.allowChange && repo && this.d.cards && take('fastPathPerHour', 5, { now: this.now() })) {
+        if (done && done.status === 'done' && result?.kind === 'change' && done.allowChange && repo && !this.d.fastPathBusy?.(repo.name) && this.d.cards && take('fastPathPerHour', 5, { now: this.now() })) {
           try {
             const card = this.d.cards.create({ repo: repo.name, title: cleanCommand(done.question).slice(0, 120) || 'Change from Quick Ask', description: done.question, actor: 'user-ask', idemKey: `ask-fast:${id}` });
             this.patch(id, (r) => void (r.convertedTo = card.key));

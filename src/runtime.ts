@@ -96,6 +96,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     return { ...agentsNow, warnings };
   };
   const asks = new AskService({ getConfig, agents, routeStates: () => engine.routeStates(), freshHealth: () => engine.freshHealth(), secrets: () => [],
+    fastPathBusy: (repo) => store.list().some((r) => r.fastPath && r.repo === repo && !['ready', 'finished', 'aborted', 'needs_human'].includes(r.status)),
     cards: { create: (i) => { const p = engine.ensureProjectForRepo(i.repo); const it = board.createItem({ projectId: p.id, title: i.title, description: i.description, kind: 'work', lane: 'todo', idemKey: i.idemKey }, i.actor); engine.tickSoon(); return { key: it.key }; } } });
   asks.failInterrupted();
   const apiRef = new Api({

@@ -433,7 +433,7 @@ export class Api {
       const cfg = this.d.getConfig();
       const cur = cfg.projects?.[key]?.context ?? { summaries: false, staleDays: 14, packBytes: 8192 };
       const next = normalizeProjects({ [key]: { context: { ...cur, ...body } } });
-      cfg.projects = { ...(cfg.projects ?? {}), ...next };
+      cfg.projects = { ...(cfg.projects ?? {}), [key]: { ...(cfg.projects?.[key] ?? {}), context: next[key]!.context } }; // keep everything else of the project (its policy!)
       this.d.saveConfig(cfg);
       return { json: { ok: true, context: cfg.projects[key]!.context, notice: cfg.projects[key]!.context!.summaries ? 'Directory summaries spend model quota (a small number of calls per day, see pipeline.contextRunsPerDay).' : undefined } };
     }

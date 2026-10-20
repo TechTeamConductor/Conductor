@@ -39,10 +39,10 @@ export function decideApproval(i: ApprovalInput): ApprovalDecision {
   if (i.forced.protectedPaths) { reasons.push('the plan touches protected files such as CI or agent config'); forcedHold = true; }
   if (i.forced.untrusted) { reasons.push('the task text came from an unverified source'); forcedHold = true; }
   if (i.forced.bigGraph) { reasons.push('more than 8 tasks'); forcedHold = true; }
-  const risks = i.policy === 'approve-risky' || i.policy === 'approve-plan' || i.policy === 'manual-stages' ? riskHits(i.plan) : [];
+  const risks = riskHits(i.plan); // always computed: a plan held for another reason still shows what it would run
   if (i.policy === 'approve-plan' || i.policy === 'manual-stages') reasons.push('your approval policy asks for every plan');
   if (i.policy === 'approve-risky' && risks.length) reasons.push(`risky: ${risks.map((r) => r.rule).join(', ')}`);
   if (i.firstPlanHold) reasons.push('first plan for this repo');
   const auto = reasons.length === 0;
-  return { auto, reasons, risks: risks.length && (i.policy === 'approve-risky' || !auto) ? risks : [], forcedHold };
+  return { auto, reasons, risks: auto ? [] : risks, forcedHold };
 }

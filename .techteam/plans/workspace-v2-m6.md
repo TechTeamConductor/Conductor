@@ -134,3 +134,7 @@ All M1–M5 safety properties; forced holds (D5) can never be disabled by any po
 | §7 configurable limits | Covered (retries, parallelism, time, agent-run budgets) |
 | §8 onboarding steps 1–9, recommended defaults first, sample task | Covered |
 | §8 "help configure Codex CLI, Claude Code CLI, Cursor CLI" | Covered as detection + guidance + sign-in command shown (never run by Conductor) |
+
+## 8. Implementation notes
+- Built: risk rules (hardened after review: NFKC/invisible-stripped/lower-cased matching, option-tolerant patterns, `~~~` and unclosed fences), one approval decision (`decideApproval`), per-project and global policy, `confirmRisks` (UI confirmation dialog + hold reasons shown), project settings API, safe project creation, constant-location sample project, environment report, Ask UI.
+- **Not built (deferred, tracked):** `manual-stages` behaves exactly like `approve-plan` (per-stage holds not implemented — must not be offered as such), `maxRunMinutes` and the per-project daily agent-run budget, the `approvedBy: policy:<name>` trail and settings audit entries, the structural "all transitions into build go through decideApproval" test, confirmRisks binding to {rev, reasons hash}, the hierarchy/project-page/wizard-v2/policy-editor UI.

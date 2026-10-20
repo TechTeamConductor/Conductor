@@ -35,7 +35,7 @@ test('create project: refuses bad names, bad identities, existing targets, links
   process.env.HOME = home;
   const parent = tmp();
   for (const name of ['', '.hidden', '-x', 'a/b', '..', 'x'.repeat(65), 'a b', 'a\nb', 5 as any]) bad(() => createProject({ parent, name }), /project name/);
-  for (const id of [{ name: 'A\nB', email: 'a@b' }, { name: 'A', email: 'no-at' }, { name: '<x>', email: 'a@b' }, null, { name: 'A' }]) assert.throws(() => validateIdentity(id), CreateError);
+  for (const id of [{ name: '--global', email: 'a@b' }, { name: 'A\u202eB', email: 'a@b' }, { name: 'A\nB', email: 'a@b' }, { name: 'A', email: 'no-at' }, { name: '<x>', email: 'a@b' }, null, { name: 'A' }]) assert.throws(() => validateIdentity(id), CreateError);
   mkdirSync(join(parent, 'exists'));
   bad(() => createProject({ parent, name: 'exists' }), /already exists|project name/);
   const link = join(tmp(), 'lnk');

@@ -547,6 +547,9 @@ export interface ApiRunDetail extends ApiRunSummary {
   diffStat: string | null;
   noPushEnvOnly: boolean;
   unverifiedWhy: string | null;
+  /** Why the plan waits for approval, and the risky steps that need an explicit confirmation (M6). */
+  holdReasons: string[];
+  risks: { rule: string; detail: string }[];
   /** The task graph (items, states, dependencies, commits), or null for a single-task run. */
   graph: ApiGraph | null;
 }

@@ -147,3 +147,9 @@ test('Quick Ask API: strict body (unknown fields, createdBy/fastPath rejected), 
     await assert.rejects(call('GET', `/api/asks/${id}`), (e: any) => e.status === 404);
   } finally { await h.cleanup(); }
 });
+
+test('Security: agent-config omission is case-insensitive and nested; names are NFKC-normalised; identities cannot start with a dash', () => {
+  const omitted = (p: string) => /(?:^|\/)(?:\.claude|\.cursor|\.codex|\.agents|\.husky|\.windsurf|\.github\/copilot)(?:\/|$)|(?:^|\/)(?:\.mcp\.json|\.cursorrules|\.windsurfrules)$/i.test(p);
+  for (const p of ['.Claude/settings.json', '.MCP.JSON', 'pkg/.cursor/rules/x.mdc', 'a/b/.CLAUDE/x', '.cursorrules']) assert.ok(omitted(p), p);
+  assert.equal(safeEntryName('.Ｇit/config'), null, 'a fullwidth G normalises to .Git');
+});

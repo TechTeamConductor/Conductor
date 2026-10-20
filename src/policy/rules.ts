@@ -7,18 +7,24 @@ import type { Plan } from '../types.ts';
 export interface RiskHit { rule: string; detail: string }
 
 const SECRET_FILE = /(^|\/)\.env(\.|$)|(^|\/)(id_rsa|id_ed25519|credentials|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|keystore)$/i;
-// destructive / production commands
+/** What a regex sees: NFKC (fullwidth etc.), format/invisible characters removed, lower-case, whitespace collapsed, quotes inside words dropped. */
+export function canon(s: string): string {
+  return String(s).normalize('NFKC').replace(/[\p{Cf}\p{Co}\p{Cn}\u{E0000}-\u{E007F}\u{FE00}-\u{FE0F}]/gu, '').replace(/(?<=\w)["'](?=\w)/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+const OPTS = String.raw`(?:\s+-{1,2}[a-z0-9-]+(?:[ =][^\s-][^\s]*)?)*`; // options (and their value) between a tool and its sub-command
+// destructive / production commands (matched on canon() text)
 const DESTRUCTIVE: [string, RegExp][] = [
-  ['recursive delete', /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|--recursive)\b/],
-  ['git push', /\bgit\s+push\b/],
-  ['git reset --hard', /\bgit\s+reset\s+--hard\b/],
-  ['drop/truncate', /\b(drop|truncate)\s+(table|database|schema)\b/i],
-  ['terraform apply/destroy', /\bterraform\s+(apply|destroy)\b/],
-  ['kubectl apply/delete', /\bkubectl\s+(apply|delete)\b/],
-  ['docker push', /\bdocker\s+push\b/],
-  ['package publish', /\b(npm|pnpm|yarn)\s+publish\b|\btwine\s+upload\b|\bpip\s+upload\b/],
-  ['pipe to shell', /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/],
-  ['aws delete', /\baws\b[^\n]*\b(delete|rm|terminate)[a-z-]*\b/],
+  ['recursive delete', /\brm\s+(?:-\S+\s+)*(?:-[a-z]*r[a-z]*|--recursive)\b/],
+  ['git push', new RegExp(String.raw`\bgit${OPTS}\s+push\b`)],
+  ['git reset --hard', new RegExp(String.raw`\bgit${OPTS}\s+reset\b[^;&|\n]*--hard\b`)],
+  ['git clean', new RegExp(String.raw`\bgit${OPTS}\s+clean\s+-[a-z]*f`)],
+  ['drop/truncate', /\b(?:drop\s+(?:table|database|schema|index)|truncate\s+(?:table\s+)?[a-z_"`]+)/],
+  ['terraform apply/destroy', new RegExp(String.raw`\bterraform${OPTS}\s+(?:apply|destroy)\b`)],
+  ['kubectl apply/delete', new RegExp(String.raw`\bkubectl${OPTS}\s+(?:apply|delete)\b`)],
+  ['docker push', new RegExp(String.raw`\bdocker${OPTS}\s+(?:image\s+)?push\b`)],
+  ['package publish', new RegExp(String.raw`\b(?:npm|pnpm|yarn)${OPTS}\s+publish\b|\btwine\s+upload\b|\bpip\s+upload\b`)],
+  ['pipe to shell', /\b(?:curl|wget)\b[^\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|python3?|node|perl|ruby)\b|\b(?:sh|bash|zsh)\s*<\(\s*(?:curl|wget)\b/],
+  ['aws delete', /\baws\b[^\n]*\b(?:delete|rm|terminate)[a-z-]*\b/],
 ];
 /** Deploy/CI definitions (one constant list, matched on the normalised path). */
 const DEPLOY_FILE = /(^|\/)(Dockerfile(\..+)?|docker-compose[^/]*\.ya?ml|compose[^/]*\.ya?ml|Chart\.yaml|serverless\.ya?ml|fly\.toml|vercel\.json|netlify\.toml|Procfile|app\.yaml|cloudbuild\.ya?ml|Jenkinsfile|\.gitlab-ci\.yml|azure-pipelines\.yml)$|\.(tf|tfvars)$|(^|\/)(helm|k8s|kubernetes)\/|^\.github\/workflows\//;
@@ -27,8 +33,9 @@ const norm = (p: string): string => p.replace(/\\/g, '/').replace(/^\.\//, '');
 /** Commands found in a prose step: only what is inside `backticks` or a ``` fence. */
 export function codeSpans(text: string): string[] {
   const out: string[] = [];
-  for (const m of text.matchAll(/```[^\n]*\n?([\s\S]*?)```/g)) out.push(m[1]!);
-  for (const m of text.replace(/```[\s\S]*?```/g, ' ').matchAll(/`([^`\n]+)`/g)) out.push(m[1]!);
+  const fence = /(?:```|~~~)[^\n]*\n?([\s\S]*?)(?:```|~~~|$)/g; // an unclosed fence runs to the end of the step
+  for (const m of text.matchAll(fence)) out.push(m[1]!);
+  for (const m of text.replace(fence, ' ').matchAll(/`([^`\n]+)`/g)) out.push(m[1]!);
   return out;
 }
 
@@ -50,6 +57,9 @@ export function riskHits(plan: Plan): RiskHit[] {
     ...(plan.taskGraph?.items ?? []).flatMap((i) => (Array.isArray(i.verification) ? i.verification : [])),
     ...(plan.steps ?? []).flatMap((s) => codeSpans(String(s))),
   ];
-  for (const c of commands) for (const [name, re] of DESTRUCTIVE) if (re.test(String(c))) add(name, String(c));
+  for (const c of commands) {
+    const text = canon(String(c));
+    for (const [name, re] of DESTRUCTIVE) if (re.test(text)) add(name, String(c));
+  }
   return hits;
 }
