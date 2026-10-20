@@ -16,6 +16,8 @@ import { redact } from '../redact.ts';
 import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
+import { CreateError, SAMPLE_KEY, SAMPLE_TASK, createProject, createSample } from '../onboarding/create.ts';
+import { environmentReport } from '../onboarding/env.ts';
 import { OFFLINE_OPERATIONS } from '../net/offline.ts';
 import { contextStatus, refreshContext, DEFAULT_STALE_DAYS } from '../context/incremental.ts';
 import { loadContext } from '../context/store.ts';
@@ -396,6 +398,7 @@ export class Api {
         const f = l.state === 'ok' ? l.facts : null;
         return { json: { key, status, summaries: this.d.getConfig().projects?.[key]?.context?.summaries === true, facts: f && { languages: f.languages, frameworks: f.frameworks, packageManagers: f.packageManagers, tests: f.tests, modules: f.modules.length, files: f.counts.files, truncated: f.counts.truncated } } };
       }
+      if (path === '/api/setup/environment') return { json: environmentReport() };
       if (path === '/api/offline') return { json: { online: (await this.d.engine.probe.check()) !== 'offline', checkedAt: this.d.engine.probe.last()?.at ?? null, operations: OFFLINE_OPERATIONS } };
       if ((m = /^\/api\/items\/([^/]+)$/.exec(path))) return { json: this.itemView(safeDecode(m[1]!)) };
       if ((m = /^\/api\/runs\/([^/]+)\/log$/.exec(path))) {
@@ -595,6 +598,34 @@ export class Api {
       return { json: { ok: true, repo: this.repoView(repo, this.d.persistent()) } };
     }
 
+    if (method === 'POST' && path === '/api/setup/project/create') {
+      for (const k of Object.keys(body)) if (!['parent', 'name', 'identity'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      let created: { path: string };
+      try {
+        created = createProject({ parent: body.parent, name: body.name, identity: body.identity });
+      } catch (e) {
+        if (e instanceof CreateError) throw new ApiFail(400, 'bad_project', e.message);
+        throw e;
+      }
+      return this.route('POST', '/api/setup/repo', q, { path: created.path, name: String(body.name) });
+    }
+    if (method === 'POST' && path === '/api/setup/sample') {
+      for (const k of Object.keys(body)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      let sample: { path: string; created: boolean };
+      try {
+        sample = createSample();
+      } catch (e) {
+        if (e instanceof CreateError) throw new ApiFail(409, 'sample_unavailable', e.message);
+        throw e;
+      }
+      await this.route('POST', '/api/setup/repo', q, { path: sample.path, name: 'conductor-sample' });
+      let project = this.d.board.projects().find((p) => p.key === SAMPLE_KEY);
+      if (!project) project = this.d.board.createProject({ key: SAMPLE_KEY, name: 'Conductor sample', repo: 'conductor-sample' });
+      let card = this.d.board.items({ projectId: project.id }).find((i) => i.title === SAMPLE_TASK.title);
+      // never starts by itself: it waits in Backlog until the user presses Start (which spends plan quota — said in the UI)
+      if (!card) card = this.d.board.user.createItem({ projectId: project.id, title: SAMPLE_TASK.title, description: SAMPLE_TASK.description, lane: 'backlog' });
+      return { json: { ok: true, created: sample.created, key: card.key, path: sample.path } };
+    }
     if (method === 'DELETE' && (m = /^\/api\/setup\/repo\/([^/]+)$/.exec(path))) {
       const name = safeDecode(m[1]!);
       const cfg = this.d.getConfig();
