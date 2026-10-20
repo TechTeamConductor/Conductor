@@ -12,6 +12,7 @@ import { redact } from '../redact.ts';
 import { errMsg, fmtDuration, sha1, sha256, truncate } from '../util.ts';
 import { logger } from '../log.ts';
 import * as W from '../git/worktree.ts';
+import { safeWriteInside } from '../fsutil.ts';
 import * as G from '../git/gates.ts';
 import { gitOk } from '../git/exec.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
@@ -318,6 +319,15 @@ export class Stages {
     let run = this.run(key);
     const repo = this.repo(run);
     const cfg = this.c.cfg();
+    if (run.worktree && existsSync(run.worktree)) {
+      // B-2: only ever work in the checkout v2 itself created for this card
+      try {
+        await W.assertOwnedWorktree(repo, run.key, run.worktree, cfg.worktreeRoot);
+      } catch (e) {
+        await this.toNeedsHuman(key, errMsg(e), 'plan');
+        return false;
+      }
+    }
     if (!run.worktree || !existsSync(run.worktree)) {
       this.note(key, 'plan', `Creating isolated worktree for ${repo.name}…`);
       const wt = await W.createWorktree({ repo, key: run.key, worktreeRoot: cfg.worktreeRoot });
@@ -415,8 +425,7 @@ export class Stages {
     const md = redact(planToMarkdown(plan), secretsForRun);
     this.c.store.writeArtifact(key, `plan-${run.rev}.md`, md);
     try {
-      mkdirSync(join(run.worktree, '.conductor'), { recursive: true });
-      writeFileSync(join(run.worktree, '.conductor', 'plan.md'), md);
+      safeWriteInside(run.worktree, '.conductor/plan.md', md); // never through a repo-planted symlink (B-1)
     } catch {
       /* non-fatal */
     }
@@ -802,7 +811,7 @@ export class Stages {
     }
     this.c.store.writeArtifact(key, 'diffstat.txt', diff.stat);
     try {
-      writeFileSync(join(run.worktree, '.conductor', 'diff.patch'), diff.patch);
+      safeWriteInside(run.worktree, '.conductor/diff.patch', diff.patch);
     } catch {
       /* non-fatal */
     }

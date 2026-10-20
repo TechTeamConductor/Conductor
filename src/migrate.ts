@@ -209,7 +209,7 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
           agentRuns: 0,
           expected: {},
           needsHuman: e.status === 'needs_human' && e.reset ? { reason: e.note ?? 'Imported while in progress', origin: 'plan', at: now() } : e.run.needsHuman,
-          legacy: { ...(e.run.legacy ?? {}), v1Key: e.run.key, v1Branch: e.run.branch, v1Worktree: e.run.worktree },
+          legacy: { ...(e.run.legacy ?? {}), v1Key: e.run.key }, // v1Branch / v1Worktree / v1BaseSha / v1CommitSha were set aside by the run migration
         };
         store.create(migrated);
         const srcDir = join(from, 'runs', e.run.key);

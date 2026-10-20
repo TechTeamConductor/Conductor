@@ -7,7 +7,8 @@ import { resolveBin } from './config.ts';
 import { paths } from './paths.ts';
 import type { Config } from './types.ts';
 
-export const SERVICE_LABEL = 'com.techteam.conductor';
+/** v2's own launchd label: installing v2's service must never overwrite or remove v1's launch agent (security review B-7). */
+export const SERVICE_LABEL = 'com.techteam.conductor-v2';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 export const plistPath = (): string => join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);

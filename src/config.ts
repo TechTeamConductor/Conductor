@@ -22,7 +22,7 @@ const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages',
 export function defaultConfig(): Config {
   return {
     version: 3,
-    ui: { port: 4317, openBrowser: true },
+    ui: { port: 4327, openBrowser: true }, // v1 uses 4317: both can run side by side
     repos: [],
     agents: {
       claude: { bin: 'claude', isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } },

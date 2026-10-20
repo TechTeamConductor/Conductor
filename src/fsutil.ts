@@ -39,3 +39,28 @@ export function safeWriteInside(root: string, rel: string, data: string | Buffer
     closeSync(fd);
   }
 }
+
+/**
+ * Make sure `<root>/<rel>` is a REAL directory inside root (security review B-1): a repo can track `.conductor` as a symlink (or a
+ * file); the LINK itself is removed and replaced, never followed. Creates missing parents.
+ */
+export function ensureRealDir(root: string, rel: string): string {
+  const parts = rel.split(/[\\/]+/).filter(Boolean);
+  if (parts.some((p) => p === '..' || p === '.')) throw new Error('unsafe relative path');
+  let cur = root;
+  for (const part of parts) {
+    cur = join(cur, part);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch {
+      mkdirSync(cur);
+      continue;
+    }
+    if (!st.isDirectory()) {
+      rmSync(cur, { force: true });
+      mkdirSync(cur);
+    }
+  }
+  return cur;
+}

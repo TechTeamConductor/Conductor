@@ -5,7 +5,7 @@
  * Contract: see `.techteam/plans/conductor-v1.md` §2 (Isolation RC2/RC3, Verification integrity RC7, resume matrix,
  * carry-forwards C2 and C5). Erasable TypeScript only; node:* built-ins only; argv-only git calls.
  */
-import { safeWriteInside } from '../fsutil.ts';
+import { ensureRealDir, safeWriteInside } from '../fsutil.ts';
 import { access, appendFile, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { constants as fsc, existsSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -384,7 +384,7 @@ export async function createWorktree(opts: {
       }
     }
 
-    await mkdir(join(wtPath, '.conductor'), { recursive: true });
+    ensureRealDir(wtPath, '.conductor'); // a repo-tracked symlink here is replaced, never followed (B-1)
     const copy = await copyUntrackedFiles(repoRoot, wtPath, copyList);
     await addToSharedExclude(repoRoot, ['/.conductor/', 'node_modules', ...copy.present.map((f) => '/' + f)]);
     return { path: wtPath, branch, baseSha, created, copied: copy.copied, skipped: copy.skipped };
@@ -845,12 +845,34 @@ export async function resetToBase(worktree: string, baseSha: string): Promise<vo
 
 // ───────────────────────────── removal ─────────────────────────────
 
+/** The folder `createWorktree` derives for a card — the only place a v2 run may work. */
+export function expectedWorktreePath(repo: { name: string; path: string }, key: string, worktreeRoot?: string): string {
+  return join(worktreeRoot ?? join(dirname(repo.path), DEFAULT_WORKTREE_DIR), repo.name, key);
+}
+
+/**
+ * A run's `worktree` field is only trusted when it is exactly where v2 would have created it AND that checkout is on v2's branch for
+ * the key (security review B-2: a run record carrying a v1 checkout path must never make v2 plan/build/reset/delete inside it).
+ * Throws a human-readable error otherwise.
+ */
+export async function assertOwnedWorktree(repo: { name: string; path: string }, key: string, worktreePath: string, worktreeRoot?: string): Promise<void> {
+  const want = await realpathLoose(expectedWorktreePath(repo, key, worktreeRoot));
+  const have = await realpathLoose(worktreePath);
+  if (have !== want) throw new Error(`the recorded worktree is not the one Conductor v2 created for this card (${worktreePath}); refusing to touch it`);
+  if (existsSync(worktreePath)) {
+    const head = await git(worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (head.code === 0 && head.stdout.trim() !== branchFor(key)) throw new Error(`the checkout at ${worktreePath} is on branch ${head.stdout.trim()}, not ${branchFor(key)}; refusing to touch it`);
+  }
+}
+
 export async function removeWorktree(
   repoRoot: string,
   worktreePath: string,
   branch: string,
   o: { deleteBranch?: boolean; force?: boolean } = {},
 ): Promise<{ branchKept: boolean }> {
+  // validate the branch name BEFORE anything is removed: a foreign branch must never cost the user a checkout (B-2)
+  if (o.deleteBranch && !branch.startsWith(BRANCH_PREFIX)) throw new Error(`refusing to delete non-conductor branch ${JSON.stringify(branch)}`);
   const root = await realpath(repoRoot);
   let branchKept = false;
   await withRepoLock(root, async () => {

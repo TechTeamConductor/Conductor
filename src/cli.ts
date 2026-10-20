@@ -248,9 +248,18 @@ async function service(): Promise<void> {
 }
 
 async function uninstall(): Promise<void> {
+  // refuse to purge anything that is not a v2 data folder BEFORE touching the service or the disk (security review B-8)
+  if (flag('--purge') && !existsSync(join(paths.home(), 'home.json'))) {
+    console.error(`Refusing to delete ${paths.home()}: it is not a Conductor v2 data folder (no home.json marker).`);
+    process.exit(2);
+  }
   await uninstallService();
   console.log('Removed the background service.');
   if (flag('--purge')) {
+    if (!existsSync(join(paths.home(), 'home.json'))) {
+      console.error(`Refusing to delete ${paths.home()}: it is not a Conductor v2 data folder (no home.json marker).`);
+      process.exit(2);
+    }
     rmSync(paths.home(), { recursive: true, force: true });
     console.log(`Deleted ${paths.home()}.`);
   } else console.log(`Your settings and run history are still in ${paths.home()} (use --purge to delete them).`);

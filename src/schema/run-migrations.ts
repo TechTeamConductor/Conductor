@@ -6,9 +6,14 @@
  *  - pending Linear effects are dropped (they cannot be applied to a board) and recorded under `legacy.effects`.
  */
 export function migrateRunV1ToV2(raw: any): any {
-  const { issueId, teamId, url, assignedPickup, effects, expected, bugs, ...rest } = raw ?? {};
+  const { issueId, teamId, url, assignedPickup, effects, expected, bugs, worktree, branch, baseSha, commitSha, ...rest } = raw ?? {};
   return {
     ...rest,
+    // v1's checkout/branch/commits live in v1's namespace: v2 never inherits them (security review B-2) — kept only as information
+    worktree: '',
+    branch: '',
+    baseSha: '',
+    commitSha: undefined,
     itemId: typeof raw?.itemId === 'string' ? raw.itemId : '',
     untrusted: assignedPickup === true ? true : rest.untrusted,
     expected: { written: !!expected?.stateId || !!expected?.written, stage: expected?.stage },
@@ -19,7 +24,7 @@ export function migrateRunV1ToV2(raw: any): any {
           return { ...bug, itemId: undefined, itemKey: undefined, legacy: linearId || linearKey ? { linearId, linearKey } : undefined };
         })
       : [],
-    legacy: { ...(raw?.legacy ?? {}), ...Object.fromEntries(Object.entries({ issueId, teamId, url, effects }).filter(([, v]) => v !== undefined && !(v && typeof v === 'object' && Object.keys(v as object).length === 0))) },
+    legacy: { ...(raw?.legacy ?? {}), ...Object.fromEntries(Object.entries({ issueId, teamId, url, effects, v1Worktree: worktree, v1Branch: branch, v1BaseSha: baseSha, v1CommitSha: commitSha }).filter(([, v]) => v !== undefined && !(v && typeof v === 'object' && Object.keys(v as object).length === 0))) },
     schemaVersion: 2,
   };
 }

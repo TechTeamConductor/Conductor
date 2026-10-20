@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { redact as defaultRedact } from '../redact.ts';
 import { paths } from '../paths.ts';
+import { logger } from '../log.ts';
+import { validateEntity } from './validate.ts';
 import { truncate } from '../util.ts';
 import { Journal, type FaultHook } from './journal.ts';
 import {
@@ -23,6 +25,7 @@ import {
   type ExternalLink,
 } from './types.ts';
 
+const log = logger('board');
 export const LIMITS = { title: 200, description: 50_000, comment: 100_000, decisionBody: 50_000, maxDepth: 6, maxDeps: 50, maxItems: 50_000, maxCommentsPerItem: 2_000, maxBytes: 120_000_000 };
 const PROJECT_KEY_RE = /^[A-Z]{2,6}$/;
 /** Same shape the HTTP API and the run store accept (api.ts KEY_RE ∩ store.ts KEY_RE ∩ branch naming). */
@@ -233,18 +236,23 @@ export class Board {
   private requireWritable(): void {
     if (this.readOnly) throw new BoardError('read_only', 'This board was opened read-only.');
     if (this.closed) throw new BoardError('closed', 'This board is closed.');
-    if (this.journal.failed) throw new BoardError('storage_failed', `The board stopped accepting writes after a storage error (${this.journal.failed}). Restart Conductor to recover.`);
+    if (this.journal.failed) throw new BoardError('storage_failed', 'The board stopped accepting writes after a storage error. Restart Conductor to recover.');
   }
 
   /** Durable first, memory second: a failed append leaves memory untouched. */
   private commit<T extends JournalOp>(build: (seq: number, ts: number) => T, change: BoardChange): T {
     this.requireWritable();
     const op = build(this.seq + 1, this.now());
+    // never write what the loader would refuse (B-4): a 400-char idemKey must fail NOW, not brick the next start
+    const bad = validateEntity(op.t, op.e);
+    if (bad) throw new BoardError('bad_input', `That ${op.t} is not valid (${bad}).`);
     try {
       this.journal.append(op);
     } catch (e) {
       // the journal rolled itself back and is now failed: nothing was acknowledged, nothing changed in memory
-      throw new BoardError('storage_failed', `The board could not be written: ${(e as Error).message}`);
+      // the raw message can carry a filesystem path: keep the detail in the log, not in anything an API/UI client sees
+      log.warn(`board write failed: ${(e as Error).message}`);
+      throw new BoardError('storage_failed', 'The board could not be written (see the Conductor log for the system error).');
     }
     this.seq = op.seq;
     this.applyOp(op);
@@ -628,7 +636,7 @@ export class UserBoard {
   }
   setFields(itemId: string, input: unknown): WorkItem {
     const o = this.obj(input);
-    return this.#b.setFields(itemId, { title: o.title === undefined ? undefined : asString(o.title, 'title'), description: o.description === undefined ? undefined : asString(o.description, 'description'), milestoneId: o.milestoneId === null ? null : typeof o.milestoneId === 'string' ? o.milestoneId : undefined }, 'user');
+    return this.#b.setFields(itemId, { title: o.title == null ? undefined : asString(o.title, 'title'), description: o.description == null ? undefined : asString(o.description, 'description'), milestoneId: o.milestoneId === null ? null : typeof o.milestoneId === 'string' ? o.milestoneId : undefined }, 'user');
   }
   /** Plain lane change for items WITHOUT a run. (The HTTP layer routes items that have a run through the engine's commands first.) */
   moveLane(itemId: string, lane: unknown): WorkItem {

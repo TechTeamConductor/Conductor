@@ -282,7 +282,7 @@ export class Api {
         this.d.engine.tickSoon();
         return { status: 201, json: { ok: true, comment: c } };
       }
-      const it = this.d.board.user.setFields(key, { title: body.title === undefined ? undefined : str(body.title, 'title', 200), description: body.description === undefined ? undefined : str(body.description, 'description', 10_000, false) });
+      const it = this.d.board.user.setFields(key, { title: body.title == null ? undefined : str(body.title, 'title', 200), description: body.description == null ? undefined : str(body.description, 'description', 10_000, false) });
       return { json: { ok: true, item: it } };
     }
 

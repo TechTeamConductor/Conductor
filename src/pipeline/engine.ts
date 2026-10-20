@@ -275,6 +275,7 @@ export class Engine {
         log.warn(`${item.key}: claim failed: ${errMsg(e)}`);
       }
     }
+    for (const k of this.d.store.tombstoned()) ignored.push({ key: k, reason: 'This run\'s record was unreadable and has been set aside; the card will not be started again by itself. Check the data folder.' });
     this.ignored = ignored;
     this.changed();
   }
@@ -387,7 +388,9 @@ export class Engine {
     const retryStage = was === 'needs_human' && origin && ['build', 'verify', 'plan_review'].includes(origin) ? origin : null;
     const keepCommits = retryStage !== null || was === 'ready' || was === 'finished' || was === 'aborted';
     if (run0.worktree) {
+      const repo0 = cfg.repos.find((r) => r.name === run0.repo);
       try {
+        if (repo0) await W.assertOwnedWorktree(repo0, run0.key, run0.worktree, cfg.worktreeRoot); // never back up / reset a foreign checkout (B-2)
         await W.backupRefs(run0.worktree, run0.key, run0.rev); // recoverable copy first, always
         if (!keepCommits) await W.resetToBase(run0.worktree, run0.baseSha);
       } catch (e) {
@@ -704,6 +707,9 @@ export class Engine {
     if (!['ready', 'finished', 'aborted'].includes(run.status)) throw new EngineError('bad_state', 'Only finished runs can be cleaned up.');
     const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
     if (repo && run.worktree) {
+      await W.assertOwnedWorktree(repo, run.key, run.worktree, this.d.getConfig().worktreeRoot).catch((e) => {
+        throw new EngineError('foreign_worktree', errMsg(e));
+      });
       const { branchKept } = await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: true }); // git refuses to delete an unmerged branch: the work is kept
       this.d.store.update(key, (r) => {
         r.worktree = '';

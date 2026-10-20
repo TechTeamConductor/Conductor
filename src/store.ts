@@ -89,7 +89,7 @@ export class RunStore {
       mkdirSync(dir, { recursive: false, mode: 0o700 }); // EEXIST = already claimed
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-        if (existsSync(this.runFile(run.key))) throw new RunStoreError('exists', `run ${run.key} already exists`);
+        if (this.has(run.key)) throw new RunStoreError('exists', `run ${run.key} already exists`);
       } else if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
         mkdirSync(this.root, { recursive: true, mode: 0o700 });
         mkdirSync(dir, { recursive: false, mode: 0o700 });
@@ -120,6 +120,7 @@ export class RunStore {
       if (raw.schemaVersion !== undefined && !(Number.isInteger(raw.schemaVersion) && raw.schemaVersion >= 1)) throw new Error('schemaVersion is not a positive integer');
     } catch (e) {
       const kept = this.readOnly ? null : quarantine(f);
+      if (kept) writeFileSync(`${f}.tombstone`, JSON.stringify({ at: Date.now(), keptAs: kept, why: (e as Error).message }) + '\n', { mode: 0o600 }); // the key stays TAKEN: it can never be re-claimed over stale artifacts (B-5)
       log.warn(`${key}: run.json is unreadable (${(e as Error).message})${kept ? ` — kept as ${kept}` : ' — left in place'} and ignored`);
       return null;
     }
@@ -129,7 +130,18 @@ export class RunStore {
   }
 
   has(key: string): boolean {
-    return existsSync(this.runFile(key));
+    return existsSync(this.runFile(key)) || existsSync(`${this.runFile(key)}.tombstone`);
+  }
+
+  /** Keys whose run.json was unreadable and set aside (never re-claimable; surfaced to the user). */
+  tombstoned(): string[] {
+    let names: string[] = [];
+    try {
+      names = readdirSync(this.root);
+    } catch {
+      return [];
+    }
+    return names.filter((n) => KEY_RE.test(n) && existsSync(`${this.runFile(n)}.tombstone`));
   }
 
   get(key: string): Run | null {
