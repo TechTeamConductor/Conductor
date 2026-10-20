@@ -16,6 +16,12 @@ The v2 contract (board-native; no Linear). Types live in [`src/types.ts`](../src
 ### `GET /api/state` → `ApiState`
 Everything the dashboard needs in one call (see `ApiState`): `setup` (wizard steps `agents`, `repo`; `complete:false` ⇒ show the setup wizard), `health` (claude/cursor + warnings), `quota.claude`, `engine` (incl. `storageProblem`, `ignored`), `settings`, `repos`, `runs` (`ApiRunSummary[]`, newest first, includes closed runs), **`cards`** (cards that have no run yet — Backlog / To do — each `{key,title,lane,kind,note?}`), `csrf`.
 
+### `GET /api/providers` → `{ providers: ApiProvider[] }`
+Every registry provider (`claude`, `cursor`, later `codex`): `state` (`ok | missing | broken-install | not-logged-in | attention`), `version`/`detail` (what the CLI said — redacted and truncated; render with `textContent`), a **static** `hint` (never CLI text; Conductor shows it and never runs it), `capabilities {readOnly, build, buildIsolationVerified}` — **derived from code, never from config** — the read-only `tier` (`verified | partial | unverified | blocked`), `inUse` (appears in a role chain) and `pausedUntil`. The same list is `ApiState.providers`.
+
+### `GET /api/roles` → `ApiRoles`
+`{ roles, choices, needs }`: the configured chain per role, for each role × provider whether it may be assigned (`ok`, a human `reason` when not, `needsAck` for an `unverified` provider) and what each role requires (`build` for implementation / debugging / documentation, `research` for research).
+
 ### `GET /api/runs/:key` → `ApiRunDetail`  (`404` if unknown)
 Summary plus `notes[]` (the card's conversation: your notes and Conductor's), `plan`, `planMarkdown`, `planReview`, `verdicts[]` (per loop), `gates` (baseline + per-loop `GateRun` and `GateComparison`), `bugs[]`, `sessions[]` (each with a copyable `resumeCommand`), `timeline[]`, `diffStat`, `description`, `worktree`, `baseSha`, `commitSha`.
 
@@ -53,7 +59,9 @@ On reconnect the UI should refetch `GET /api/state` and the open run's `GET …/
 | `POST /api/runs/:key/cleanup` | — | remove the worktree (and local branch if merged) of a `ready`/`finished`/`aborted` run |
 | `POST /api/runs/:key/open` | `{ target }` | `target`: `cursor` (open worktree in Cursor), `terminal-claude` / `terminal-cursor` (new Terminal window resuming the latest session of that agent), `claude-desktop` (`claude --desktop --resume <id>`), `finder`. Server computes all paths/ids from the run record. |
 | `POST /api/engine/pause` | `{ paused: boolean }` | global pause/resume (no new claims; running stages finish) |
-| `PUT /api/settings` | partial `Settings` | validated server-side; returns `{ ok, settings }` |
+| `PUT /api/settings` | partial `Settings` | validated server-side; returns `{ ok, settings }`. `stages` / `onClaudeLimit` are **derived** from the role chains; a PUT changes only the first claude/cursor slot (or the cursor-follows-claude rule) and leaves every other chain entry alone |
+| `PUT /api/roles` | `{ roles: { <role>: { providers: ProviderId[1..4], autoByComplexity?: { S?\|M?\|L?: ProviderId } } }, acknowledge?: ProviderId[] }` | strict: plain objects only; role names are own-property checked; provider ids come from the registry; every pairing is checked against the capability/tier gate (`400 unsupported_pairing` with a human reason, e.g. "Claude cannot write code"); an `unverified` provider needs `acknowledge` (`409 needs_acknowledgement`); a `blocked` one is refused. Returns `{ ok, roles, notices }` — `notices` say where the text goes for a newly assigned provider |
+| `POST /api/providers/:id/test` | `{ level?: "cheap" \| "canary", confirm?: true }` | `:id` is checked against the registry first (`404`). `cheap` (default) is a zero-quota look (version / login status). `canary` calls the model: it needs `"confirm": true` **on every call** (`400 confirm_required`), runs one at a time per provider (`409 busy`), is refused while stages are running, and has a one-minute cool-down (`429 cooldown`) |
 | `POST /api/auth/logout` | — | clears the session cookie |
 
 ### Setup endpoints (used by the wizard; idempotent)

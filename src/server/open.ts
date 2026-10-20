@@ -1,3 +1,4 @@
+import { providerLabel } from '../agents/providers/registry.ts';
 import { execFile, spawn } from 'node:child_process';
 import type { Config, Run } from '../types.ts';
 import { resolveBin } from '../config.ts';
@@ -55,7 +56,7 @@ export async function openRun(run: Run, cfg: Config, target: string, exec: ExecF
   }
   const agent = t === 'terminal-cursor' ? 'cursor' : 'claude';
   const sess = [...run.sessions].reverse().find((s) => s.agent === agent && isUuid(s.id));
-  if (!sess) throw new OpenError('no_session', `No ${agent === 'claude' ? 'Claude' : 'Cursor'} session has been recorded for this run yet.`);
+  if (!sess) throw new OpenError('no_session', `No ${providerLabel(agent)} session has been recorded for this run yet.`);
   if (t === 'claude-desktop') {
     const bin = resolveBin(cfg.agents.claude.bin);
     if (!bin) throw new OpenError('no_claude', 'The Claude CLI was not found.');

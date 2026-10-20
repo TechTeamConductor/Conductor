@@ -324,6 +324,31 @@ export interface AgentHealth {
   ok: boolean;
   loggedIn?: boolean;
   detail?: string;
+  /** `broken-install`: the launcher exists but the program does not run (e.g. a shim whose native binary is missing). */
+  state?: 'missing' | 'broken-install' | 'ok';
+}
+export interface ApiProvider {
+  id: ProviderId;
+  label: string;
+  /** What the CLI said (redacted, truncated). */
+  state: 'ok' | 'missing' | 'broken-install' | 'not-logged-in' | 'attention';
+  version?: string;
+  detail?: string;
+  /** A fixed instruction per provider — never CLI-originated text. Conductor never runs it. */
+  hint: string;
+  capabilities: { readOnly: boolean; build: boolean; buildIsolationVerified: boolean };
+  /** Read-only isolation tier: how much to trust it for read-only roles. */
+  tier: 'verified' | 'partial' | 'unverified' | 'blocked';
+  /** The provider appears in at least one role chain. */
+  inUse: boolean;
+  /** Paused by a usage limit until this time (epoch ms). */
+  pausedUntil: number | null;
+}
+export interface ApiRoles {
+  roles: Roles;
+  /** For each role and provider: may it be assigned, and if not, why (human words). */
+  choices: Record<string, Record<string, { ok: boolean; reason?: string; needsAck?: boolean }>>;
+  needs: Record<string, { build?: true; research?: true }>;
 }
 export interface ApiRunSummary {
   key: string;
@@ -443,6 +468,7 @@ export interface ApiState {
     cursor: AgentHealth;
     warnings: string[];
   };
+  providers: ApiProvider[];
   quota: ApiQuota;
   engine: ApiEngine;
   settings: Settings;

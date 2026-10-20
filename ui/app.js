@@ -312,6 +312,9 @@ function normalizeState(d) {
   d.health.claude = d.health.claude || { found: false, ok: false };
   d.health.cursor = d.health.cursor || { found: false, ok: false };
   d.cards = Array.isArray(d.cards) ? d.cards : [];
+  // providers beyond the two built-in names (e.g. Codex): labels and icons come from the server, never from a hard-coded list
+  d.providers = Array.isArray(d.providers) ? d.providers : [];
+  for (const p of d.providers) { if (p && typeof p.id === 'string') { if (!AGENT_LABEL[p.id]) AGENT_LABEL[p.id] = String(p.label || p.id); if (!AGENT_ICON[p.id]) AGENT_ICON[p.id] = 'diamond'; } }
   d.health.warnings = Array.isArray(d.health.warnings) ? d.health.warnings : [];
   d.quota = d.quota || {};
   d.engine = Object.assign({ paused: false, providerPause: {}, running: 0, maxParallel: 0, lastPollAt: null, lastPollError: null, storageProblem: null, pollSeconds: 5 }, d.engine || {});
@@ -480,12 +483,12 @@ function buildHeader() {
 }
 function engineView(eng) {
   const pp = eng.providerPause || {};
-  const waiting = ['claude', 'cursor'].filter((a) => pp[a]);
+  const waiting = Object.keys(pp).filter((a) => pp[a]);
   if (eng.paused) {
     return { cls: 'st-paused', icon: 'pause', label: 'Paused', title: eng.pauseReason || 'No new work starts. Running stages finish.' };
   }
   if (waiting.length) {
-    const names = waiting.map((a) => AGENT_LABEL[a]).join(' and ');
+    const names = waiting.map((a) => AGENT_LABEL[a] || a).join(' and ');
     return { cls: 'st-planning', icon: 'clock', label: 'Waiting for ' + names, title: waiting.map((a) => pp[a].reason).filter(Boolean).join('\n') || 'Usage limit reached' };
   }
   const busy = eng.maxParallel ? ` · ${eng.running || 0}/${eng.maxParallel} busy` : '';
@@ -570,15 +573,15 @@ function computeBanners(wizard) {
   const st = S.state; const out = [];
   if (wizard) return out;
   const eng = st.engine; const pp = eng.providerPause || {};
-  for (const a of ['claude', 'cursor']) {
+  for (const a of Object.keys(pp)) {
     const p = pp[a];
     if (!p) continue;
     const lines = [];
     if (p.reason) lines.push(p.reason);
     lines.push(a === 'claude' && st.settings && st.settings.onClaudeLimit === 'cursor'
       ? 'Read-only stages run on Cursor meanwhile. Everything else continues.'
-      : `Stages that need ${AGENT_LABEL[a]} wait. Nothing is lost, runs resume by themselves.`);
-    out.push({ id: 'pp-' + a, cls: 'b-limit', icon: 'clock', title: `${AGENT_LABEL[a]} usage limit`, text: ' — resuming automatically at ' + fmtWhen(p.until), until: p.until, lines });
+      : `Stages that need ${AGENT_LABEL[a] || a} wait. Nothing is lost, runs resume by themselves.`);
+    out.push({ id: 'pp-' + a, cls: 'b-limit', icon: 'clock', title: `${AGENT_LABEL[a] || a} usage limit`, text: ' — resuming automatically at ' + fmtWhen(p.until), until: p.until, lines });
   }
   const cardKeys = new Set((st.cards || []).map((c) => c.key));
   const hidden = (eng.ignored || []).filter((i) => !cardKeys.has(i.key));
@@ -595,6 +598,11 @@ function computeBanners(wizard) {
     if (a && !a.ok) {
       out.push({ id: 'h-' + id, cls: 'b-error', icon: 'warn', title: `${name} needs attention`, text: ' ' + (a.detail || (a.found === false ? 'Not found on your PATH.' : a.loggedIn === false ? 'Not signed in.' : 'The last health check failed.')), action: { label: 'Open setup', href: '#/setup' } });
     }
+  }
+  // any other provider that is actually assigned to a role and is not healthy (Codex, …): shown with the server's label and its fixed hint
+  for (const p of st.providers || []) {
+    if (!p || p.id === 'claude' || p.id === 'cursor' || !p.inUse || p.state === 'ok') continue;
+    out.push({ id: 'h-' + p.id, cls: 'b-error', icon: 'warn', title: `${p.label} needs attention`, text: ' ' + (p.detail || p.state), lines: p.hint ? [p.hint] : [] });
   }
   if (Array.isArray(hl.warnings) && hl.warnings.length) {
     const key = 'warn:' + hl.warnings.join('\n');
@@ -1047,7 +1055,7 @@ function updateDrawerHead() {
   const sig = [r.status, r.column, r.agent, r.repo, r.branch, r.loop, r.maxLoops, r.rev].join('|');
   if (sig !== D.headSig) {
     D.headSig = sig;
-    D.badges.replaceChildren(...[h('span', { class: 'card-key' }, r.key), statusPill(r), r.agent ? agentChip(r.agent, AGENT_LABEL[r.agent] + ' working') : null].filter(Boolean));
+    D.badges.replaceChildren(...[h('span', { class: 'card-key' }, r.key), statusPill(r), r.agent ? agentChip(r.agent, (AGENT_LABEL[r.agent] || r.agent) + ' working') : null].filter(Boolean));
     D.sub.replaceChildren(...[
       r.repo ? h('span', { class: 'chip' }, icon('folder'), r.repo) : null,
       r.branch ? h('span', { class: 'chip chip-mono', title: 'Branch' }, icon('branch'), r.branch) : null,
@@ -1148,7 +1156,7 @@ function nextAction(r) {
     case 'paused': return r.pausedUntil ? `On hold by a usage limit. It resumes automatically at ${fmtWhen(r.pausedUntil)}, or press Resume now to try immediately.` : 'On hold by a usage limit. It resumes automatically.';
     case 'parked': return 'Parked in Backlog: nothing runs. Press Move to To do to restart it (it re-plans and keeps the work so far).';
     case 'queued': return 'Waiting for a free worker slot. Nothing for you to do.';
-    case 'running': return r.agent ? `${AGENT_LABEL[r.agent]} is working. Nothing for you to do.` : 'Working. Nothing for you to do.';
+    case 'running': return r.agent ? `${AGENT_LABEL[r.agent] || r.agent} is working. Nothing for you to do.` : 'Working. Nothing for you to do.';
     case 'failed': return 'Infrastructure failure. Conductor retries automatically, or press Retry to try now.';
     case 'aborted': return r.canCleanup ? 'This run was stopped. The worktree is kept until you remove it.' : 'This run was stopped.';
     case 'finished': return r.canCleanup ? 'Marked done. You can remove the worktree.' : 'Marked done.';
