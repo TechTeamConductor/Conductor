@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, writeSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export interface Clock {
@@ -47,9 +47,31 @@ export function slug(s: string): string {
 }
 
 /** Write atomically (temp file + rename). Creates parent directories. */
-export function atomicWriteFile(path: string, data: string | Buffer, mode = 0o644): void {
+export function atomicWriteFile(path: string, data: string | Buffer, mode = 0o644, opts: { durable?: boolean } = {}): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  if (opts.durable) {
+    // data on disk BEFORE the rename, and the rename itself on disk after: a power cut leaves the old file or the new one, never an empty one
+    const fd = openSync(tmp, 'w', mode);
+    try {
+      writeSync(fd, typeof data === 'string' ? Buffer.from(data) : data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
+    try {
+      const dfd = openSync(dirname(path), 'r');
+      try {
+        fsyncSync(dfd);
+      } finally {
+        closeSync(dfd);
+      }
+    } catch {
+      /* some filesystems cannot fsync a directory: the file itself is already durable */
+    }
+    return;
+  }
   writeFileSync(tmp, data, { mode });
   renameSync(tmp, path);
 }

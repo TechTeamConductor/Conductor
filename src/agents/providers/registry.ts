@@ -5,8 +5,30 @@ import { isBuildIsolationVerified } from './verification.ts';
 import { isProviderId } from './static.ts';
 
 
+/** Every provider object that came out of `createProviders` — the envelope refuses any other object, whatever `id` it claims (Security M2-2). */
+const REGISTERED = new WeakSet<object>();
+export const isRegisteredProvider = (p: unknown): p is Provider => !!p && typeof p === 'object' && REGISTERED.has(p);
+
+function seal(p: Provider): Provider {
+  if (p.build) Object.freeze(p.build);
+  Object.freeze(p);
+  REGISTERED.add(p);
+  return p;
+}
+
 export function createProviders(d: ProviderDeps): Record<ProviderId, Provider> {
-  return { claude: claudeProvider(d), cursor: cursorProvider(d) };
+  return Object.freeze({ claude: seal(claudeProvider(d)), cursor: seal(cursorProvider(d)) });
+}
+
+/**
+ * TEST SEAM ONLY (throws outside a test run): a sealed, registered COPY of `p` after `mutate` has edited a draft. Production code can never
+ * alter a registry provider; tests that need a misbehaving adapter go through here.
+ */
+export function mutatedProviderForTests(p: Provider, mutate: (draft: Provider) => void): Provider {
+  if (!process.env.NODE_TEST_CONTEXT) throw new Error('mutatedProviderForTests is available only inside a test run');
+  const draft: Provider = { ...p, build: p.build ? { ...p.build } : undefined };
+  mutate(draft);
+  return seal(draft);
 }
 
 export { PROVIDER_IDS, isProviderId } from './static.ts';

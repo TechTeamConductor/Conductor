@@ -44,7 +44,7 @@ export interface MigrateOptions {
   now?: () => number;
   backupRoot?: string;
   /** Test seam: called at named points (a test can throw, mutate v1 or SIGKILL the process here). */
-  hooks?: { at?: (point: 'read' | 'staged' | 'validated' | 'before-publish') => void };
+  hooks?: { at?: (point: 'read' | 'staged' | 'validated' | 'before-publish' | 'parsed', detail?: string) => void };
 }
 export interface MigratedRun {
   oldKey: string;
@@ -80,7 +80,7 @@ export class MigrateError extends Error {
 }
 
 function fsyncFile(p: string): void {
-  const fd = openSync(p, 'r');
+  const fd = openSync(p, 'r'); // works for directories too on POSIX
   try {
     fsyncSync(fd);
   } finally {
@@ -226,7 +226,7 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
     try {
       v1Config = JSON.parse(readText(cfgPath, JSON_CAP));
     } catch (e) {
-      throw new MigrateError('bad_config', `${cfgPath} is not valid JSON (${(e as Error).message}); nothing was changed.`);
+      throw new MigrateError('bad_config', `${cfgPath} cannot be read as JSON (${(e as Error).message}); nothing was changed.`);
     }
     if (!v1Config || typeof v1Config !== 'object' || Array.isArray(v1Config)) throw new MigrateError('bad_config', `${cfgPath} is not a JSON object; nothing was changed.`);
   }
@@ -265,6 +265,7 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
       report.warnings.push(`skipped run ${name}: run.json is not valid JSON`);
       continue;
     }
+    opts.hooks?.at?.('parsed', name);
     const run = coerceV1Run(raw, name, report);
     if (!run) continue;
     v1Runs.push(run);
@@ -276,7 +277,12 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
         report.warnings.push(`run ${name}: artifact ${n} was not imported (${a.why})`);
         continue;
       }
-      remember(join(dir, n), readFileSync(join(dir, n)));
+      try {
+        remember(join(dir, n), readFileSync(join(dir, n)));
+      } catch (e) {
+        report.warnings.push(`run ${name}: artifact ${n} was not imported (${(e as NodeJS.ErrnoException).code ?? 'unreadable'})`);
+        continue;
+      }
       names.push(n);
     }
     artifactDirs.set(run.key, names);
@@ -303,14 +309,14 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
   try {
     mkdirSync(staging, { recursive: true, mode: 0o700 });
     for (const d of ['runs', 'logs', 'run']) mkdirSync(join(staging, d), { recursive: true, mode: 0o700 });
-    writeFileSync(join(staging, 'home.json'), JSON.stringify({ kind: 'conductor-home', generation: 2, createdAt: now(), importedFrom: from }) + '\n', { mode: 0o600 });
+    atomicWriteFile(join(staging, 'home.json'), JSON.stringify({ kind: 'conductor-home', generation: 2, createdAt: now(), importedFrom: from }) + '\n', 0o600, { durable: true });
 
     // config v3 (legacy.linear preserved) + state
     const outCfg = { ...cfg, ui: { ...cfg.ui, port: cfg.ui.port === 4317 ? 4327 : cfg.ui.port } }; // v1's default port is v1's: v2 and v1 run side by side
-    atomicWriteFile(join(staging, 'config.json'), JSON.stringify({ ...(cfg.extra ?? {}), ...stripExtra(outCfg) }, null, 2) + '\n', 0o600);
+    atomicWriteFile(join(staging, 'config.json'), JSON.stringify({ ...(cfg.extra ?? {}), ...stripExtra(outCfg) }, null, 2) + '\n', 0o600, { durable: true });
     const repos: Record<string, { approvedPlans: number }> = {};
     for (const [k, v] of Object.entries((v1State?.repos ?? {}) as Record<string, any>)) if (REPO_NAME_RE.test(k) && Number.isFinite(v?.approvedPlans)) repos[k] = { approvedPlans: Math.max(0, Math.floor(v.approvedPlans)) };
-    atomicWriteFile(join(staging, 'state.json'), JSON.stringify({ repos, schemaVersion: 1 }, null, 2) + '\n', 0o600);
+    atomicWriteFile(join(staging, 'state.json'), JSON.stringify({ repos, schemaVersion: 1 }, null, 2) + '\n', 0o600, { durable: true });
 
     // board + runs
     const board = Board.open({ dir: join(staging, 'board') });
@@ -357,7 +363,9 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
           untrusted: true,
           planApproved: false,
           approvedBy: undefined,
-          needsHuman: e.status === 'needs_human' ? { reason: e.reset ? e.note ?? 'Imported while in progress' : e.run.needsHuman?.reason ?? 'Imported from v1', origin: 'plan', at: now() } : e.run.needsHuman,
+          // …and whatever the status (a v1 "Park in Backlog" keeps the old needsHuman + parkedFrom), no import can resume at a later stage (R-1)
+          needsHuman: e.status === 'needs_human' ? { reason: e.reset ? e.note ?? 'Imported while in progress' : e.run.needsHuman?.reason ?? 'Imported from v1', origin: 'plan', at: now() } : e.run.needsHuman ? { ...e.run.needsHuman, origin: 'plan' } : undefined,
+          parkedFrom: undefined,
           legacy: { ...(e.run.legacy ?? {}), v1Key: e.run.key }, // v1Branch / v1Worktree / v1BaseSha / v1CommitSha were set aside by the run migration
         };
         store.create(migrated);
@@ -399,6 +407,22 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
     if (listRunsDir(runsDir, { warnings: [] } as unknown as MigrateReport).join('\0') !== runsListing.join('\0')) report.changedDuringImport.push(`${runsDir} (a run was added or removed)`);
     if (report.changedDuringImport.length) {
       throw new MigrateError('changed_during_import', `${report.changedDuringImport.length} v1 file(s) changed while importing (v1 is probably running). Nothing was published — run migrate again.`);
+    }
+
+    // make the staged tree itself durable before the rename that publishes it
+    for (const d of [join(staging, 'runs'), join(staging, 'board'), join(staging, 'logs'), join(staging, 'run'), staging]) {
+      try {
+        fsyncFile(d);
+      } catch {
+        /* a filesystem that cannot fsync a directory: the files are durable on their own */
+      }
+    }
+    for (const n of readdirSync(join(staging, 'runs'))) {
+      try {
+        fsyncFile(join(staging, 'runs', n));
+      } catch {
+        /* same */
+      }
     }
 
     opts.hooks?.at?.('before-publish');
@@ -553,7 +577,8 @@ function coerceV1Run(raw: unknown, dirName: string, report: MigrateReport): Run 
     status: status as RunStatus,
     next,
     sessions: Array.isArray(m.sessions) ? m.sessions : [],
-    bugs: Array.isArray(m.bugs) ? m.bugs : [],
+    // a v1 record must never aim Conductor's own board effects at another card: bug→card links are dropped whatever the record's version (R-2)
+    bugs: Array.isArray(m.bugs) ? m.bugs.filter(isPlain).map((b: any) => ({ ...b, itemId: undefined, itemKey: undefined })) : [],
     legacy: isPlain(m.legacy) ? { ...m.legacy, ...(unknownStatus ? { v1Status: String(raw.status).slice(0, 40) } : {}) } : unknownStatus ? { v1Status: String(raw.status).slice(0, 40) } : undefined,
   } as Run;
 }

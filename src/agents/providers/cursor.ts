@@ -27,6 +27,7 @@ export function cursorProvider(d: ProviderDeps): Provider {
     },
     build: {
       guard: true,
+      envAllow: ['CURSOR_*'],
       async prepare({ worktree }): Promise<BuildPrep> {
         const g = await W.writeCursorGuard(worktree);
         return { guardSha: g.sha256, envOnly: g.envOnly, note: g.envOnly ? CURSOR_ENV_ONLY_NOTE : undefined };

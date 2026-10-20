@@ -144,6 +144,13 @@ export class Effects {
     return run ? Object.values(run.effects).filter((e) => e.status === 'pending').length : 0;
   }
 
+  /** A run's board effects may touch ONLY its own card and that card's children (never an id that came from a stored record). */
+  private assertOwnChild(run: { itemId: string }, target: string): void {
+    const t = this.deps.board.item(target);
+    if (!t) throw new BoardError('not_found', 'That card no longer exists.');
+    if (t.parentId !== run.itemId) throw new BoardError('forbidden', 'A run may only act on its own bug cards.');
+  }
+
   private apply(key: string, effKey: string): void {
     const run = this.deps.store.get(key);
     const rec = run?.effects[effKey];
@@ -154,6 +161,7 @@ export class Effects {
       let refId: string | undefined = rec.refId;
       if (rec.kind === 'comment') {
         const p = rec.payload as { body: string; itemId?: string };
+        if (p.itemId && p.itemId !== run.itemId) this.assertOwnChild(run, p.itemId);
         refId = board.addComment(p.itemId ?? run.itemId, String(p.body), 'conductor', { idemKey: mk }).id;
       } else if (rec.kind === 'state') {
         const p = rec.payload as { stage?: string };
@@ -177,6 +185,7 @@ export class Effects {
         });
       } else if (rec.kind === 'close') {
         const p = rec.payload as { itemId: string; lane: 'done' | 'todo' };
+        this.assertOwnChild(run, p.itemId);
         board.setLane(p.itemId, p.lane, 'conductor');
       }
       this.nextTry.delete(`${key}|${effKey}`);

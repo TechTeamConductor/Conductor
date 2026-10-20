@@ -15,6 +15,7 @@ import { atomicWriteFile, deepClone } from './util.ts';
 import { NewerVersionError } from './schema/errors.ts';
 import { assertNotNewer, quarantine, type VersionSpec } from './schema/version.ts';
 import { migrateRunV1ToV2, migrateRunV2ToV3 } from './schema/run-migrations.ts';
+import { backupPaths } from './schema/backup.ts';
 import { logger } from './log.ts';
 
 /** Version of the run.json shape this build reads and writes. (Shape-changing migrations are registered with the code that consumes them — M1b.) */
@@ -45,6 +46,7 @@ export class RunStore {
   private seq = new Map<string, number>();
   private listeners = new Set<StoreListener>();
   private cache = new Map<string, Run>();
+  private needsUpgradeBackup = new Set<string>();
 
   constructor(root: string = paths.runs(), opts: { readOnly?: boolean } = {}) {
     this.root = root;
@@ -96,7 +98,7 @@ export class RunStore {
       } else throw e;
     }
     run.schemaVersion = RUN_SCHEMA_VERSION;
-    atomicWriteFile(this.runFile(run.key), JSON.stringify(run, null, 2) + '\n', 0o600);
+    atomicWriteFile(this.runFile(run.key), JSON.stringify(run, null, 2) + '\n', 0o600, { durable: true });
     this.cache.set(run.key, deepClone(run));
     this.emit({ type: 'run', key: run.key });
   }
@@ -126,6 +128,7 @@ export class RunStore {
     }
     const v = typeof raw.schemaVersion === 'number' ? raw.schemaVersion : 1;
     if (v > RUN_SCHEMA_VERSION) throw new NewerVersionError('run record', f, v, RUN_SCHEMA_VERSION);
+    if (v < RUN_SCHEMA_VERSION && !this.readOnly) this.needsUpgradeBackup.add(key); // the original is copied aside before the FIRST write in the new shape
     let m = raw;
     if (v < 2) m = migrateRunV1ToV2(m);
     if (v < 3) m = migrateRunV2ToV3(m);
@@ -164,7 +167,12 @@ export class RunStore {
     cur.updatedAt = Date.now();
     cur.schemaVersion = RUN_SCHEMA_VERSION;
     assertNotNewer(this.runFile(key), RUN_SPEC); // a newer build wrote this record meanwhile: do not overwrite it (S-9)
-    atomicWriteFile(this.runFile(key), JSON.stringify(cur, null, 2) + '\n', 0o600);
+    if (this.needsUpgradeBackup.has(key)) {
+      // an older record is about to be rewritten in the new shape: keep the original first; if that fails the write is refused (like config)
+      backupPaths([this.runFile(key)], { label: `pre-upgrade-run-${key}` });
+      this.needsUpgradeBackup.delete(key);
+    }
+    atomicWriteFile(this.runFile(key), JSON.stringify(cur, null, 2) + '\n', 0o600, { durable: true });
     this.cache.set(key, deepClone(cur));
     this.emit({ type: 'run', key });
     return deepClone(cur);

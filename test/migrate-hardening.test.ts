@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { chmodSync, chmodSync as chmodS, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { migrate, MigrateError } from '../src/migrate.ts';
@@ -258,4 +258,103 @@ test('Reviewer non-blocking: v1\'s default port is not carried over; a stale sta
   assert.deepEqual(readdirSync(base).sort(), ['v2', 'v2.staging-mine']);
   assert.equal(readFileSync(join(base, 'v2.staging-mine', 'precious.txt'), 'utf8'), 'keep');
   assert.equal(JSON.parse(readFileSync(join(to, 'config.json'), 'utf8')).ui.port, 4327);
+});
+
+// ───────────── Security R-1 / R-2 ─────────────
+import { makeHarness } from './helpers/harness.ts';
+
+test('R-1: no import can resume at a later stage — parked/failed/paused/needs_human with a build origin all normalise to the PLAN, parkedFrom is cleared', async () => {
+  const from = makeV1({
+    'ENG-1': { status: 'parked', next: 'none', parkedFrom: 'needs_human', needsHuman: { reason: 'blocked', origin: 'build', at: 1 }, planApproved: true, approvedBy: 'human' },
+    'ENG-2': { status: 'failed', next: 'build', needsHuman: { reason: 'x', origin: 'verify', at: 1 }, planApproved: true, approvedBy: 'human' },
+    'ENG-3': { status: 'paused', next: 'build', needsHuman: { reason: 'x', origin: 'build', at: 1 }, planApproved: true, approvedBy: 'human' },
+    'ENG-4': { status: 'needs_human', next: 'none', needsHuman: { reason: 'blocked', origin: 'build', at: 1 }, planApproved: true },
+    'ENG-5': { status: 'ready', next: 'none', needsHuman: { reason: 'old', origin: 'plan_review', at: 1 } },
+  });
+  const r = await migrate({ from, to: join(tmp(), 'v2'), apply: true, backupRoot: tmp() });
+  const store = new RunStore(join(r.to, 'runs'), { readOnly: true });
+  for (const k of ['ENG-1', 'ENG-2', 'ENG-3', 'ENG-4', 'ENG-5']) {
+    const run = store.get(k)!;
+    assert.equal(run.untrusted, true, k);
+    assert.equal(run.parkedFrom, undefined, `${k}: parkedFrom cleared`);
+    assert.ok(!run.needsHuman || run.needsHuman.origin === 'plan', `${k}: origin is plan (was ${run.needsHuman?.origin})`);
+    assert.equal(run.approvedBy, undefined, k);
+  }
+});
+
+test('R-1 (engine rule): an UNTRUSTED run no human has approved in v2 always re-plans — a Retry never resumes at the build', async () => {
+  const h = await makeHarness();
+  try {
+    const key = h.issue('Imported-looking card');
+    await h.settle();
+    assert.equal(h.run(key).status, 'ready');
+    const buildsBefore = h.calls().filter((c) => c.stage === 'build').length;
+    h.store.update(key, (r) => {
+      r.status = 'needs_human';
+      r.needsHuman = { reason: 'from before', origin: 'build', at: 1 };
+      r.untrusted = true;
+      r.approvedBy = undefined;
+      r.planApproved = false;
+    });
+    await h.engine.applyHumanMove(key, 'todo');
+    await h.settle();
+    assert.equal(h.run(key).status, 'awaiting_approval', 're-planned and waiting for approval');
+    assert.equal(h.calls().filter((c) => c.stage === 'build').length, buildsBefore, 'no builder started');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('R-2: bug→card links are scrubbed on import whatever the record version, and board effects refuse any card that is not the run\'s own child', async () => {
+  const from = makeV1({ 'ENG-1': { status: 'needs_human', next: 'none', needsHuman: { reason: 'x', origin: 'build', at: 1 } } });
+  const rec = JSON.parse(readFileSync(join(from, 'runs', 'ENG-1', 'run.json'), 'utf8'));
+  rec.schemaVersion = 3;
+  rec.bugs = [{ fp: 'f', status: 'open', title: 't', severity: 'major', detail: 'd', itemId: 'IMP-5', itemKey: 'IMP-5' }];
+  writeFileSync(join(from, 'runs', 'ENG-1', 'run.json'), JSON.stringify(rec));
+  const r = await migrate({ from, to: join(tmp(), 'v2'), apply: true, backupRoot: tmp() });
+  const store = new RunStore(join(r.to, 'runs'), { readOnly: true });
+  assert.equal(store.get('ENG-1')!.bugs[0]!.itemId, undefined);
+  assert.equal(store.get('ENG-1')!.bugs[0]!.itemKey, undefined);
+
+  // the effects layer itself refuses foreign targets
+  const h = await makeHarness();
+  try {
+    const key = h.issue('Owner card');
+    await h.settle();
+    const other = h.board.user.createItem({ projectId: h.projectId, title: 'Somebody else\'s card', description: 'x', lane: 'backlog' });
+    await h.engine.effects.close(key, 'evil-close', other.id, 'done');
+    await h.engine.effects.commentOn(key, 'evil-comment', other.id, 'injected');
+    assert.equal(h.board.item(other.id)!.lane, 'backlog', 'the foreign card was not moved');
+    assert.equal(h.board.comments(other.id).length, 0, 'and was not commented on');
+    assert.equal(h.run(key).effects['evil-close']!.status, 'done', 'the refused effect is not retried forever');
+    assert.match(h.run(key).effects['evil-close']!.lastError ?? '', /own bug cards/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ───────────── Reviewer residuals A-1, A-2, M-1 ─────────────
+
+test('A-1: an unreadable artifact (chmod 000) is skipped with a warning — the import still completes', async () => {
+  const from = makeV1();
+  writeRun(from, 'ENG-8', { status: 'ready', next: 'none' }, { 'plan-1.json': '{}', 'verdict-1.json': '{}' });
+  chmodS(join(from, 'runs', 'ENG-8', 'verdict-1.json'), 0o000);
+  try {
+    const r = await migrate({ from, to: join(tmp(), 'v2'), apply: true, backupRoot: tmp() });
+    assert.equal(r.published, true);
+    assert.ok(r.warnings.some((w) => /ENG-8: artifact verdict-1\.json was not imported/.test(w)));
+    assert.ok(existsSync(join(r.to, 'runs', 'ENG-8', 'plan-1.json')));
+  } finally {
+    chmodS(join(from, 'runs', 'ENG-8', 'verdict-1.json'), 0o600);
+  }
+});
+
+test('A-2 / K7(i): a run.json rewritten between its PARSE and the final check is detected (the hash is of the parsed bytes, not a second read)', async () => {
+  const from = makeV1();
+  const base = tmp();
+  await assert.rejects(
+    () => migrate({ from, to: join(base, 'v2'), apply: true, backupRoot: tmp(), hooks: { at: (p, d) => { if (p === 'parsed' && d === 'ENG-1') writeRun(from, 'ENG-1', { status: 'finished', next: 'none', title: 'rewritten right after it was parsed' }); } } }),
+    (e: any) => e instanceof MigrateError && e.code === 'changed_during_import',
+  );
+  assert.deepEqual(readdirSync(base), []);
 });

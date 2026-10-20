@@ -418,7 +418,9 @@ export class Engine {
     const was = run0.status === 'parked' ? (run0.parkedFrom ?? 'running') : run0.status;
     const origin: NextStep | undefined = run0.needsHuman?.origin;
     // needs_human on a later stage retries that stage; everything else re-runs from plan
-    const retryStage = was === 'needs_human' && origin && ['build', 'verify', 'plan_review'].includes(origin) ? origin : null;
+    // …except for an unverified (untrusted) run that no human has approved in v2: it always re-plans, so approval is asked for first
+    const unapproved = run0.untrusted === true && !run0.approvedBy;
+    const retryStage = !unapproved && was === 'needs_human' && origin && ['build', 'verify', 'plan_review'].includes(origin) ? origin : null;
     const keepCommits = retryStage !== null || was === 'ready' || was === 'finished' || was === 'aborted';
     if (run0.worktree) {
       const repo0 = cfg.repos.find((r) => r.name === run0.repo);

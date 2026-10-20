@@ -190,7 +190,7 @@ export function saveConfig(cfg: Config): void {
     backupBeforeNextSave = false;
   }
   const { extra, ...known } = cfg;
-  atomicWriteFile(paths.config(), JSON.stringify({ ...(extra ?? {}), ...known }, null, 2) + '\n', 0o600);
+  atomicWriteFile(paths.config(), JSON.stringify({ ...(extra ?? {}), ...known }, null, 2) + '\n', 0o600, { durable: true });
   try {
     chmodSync(paths.config(), 0o600);
   } catch {
@@ -297,5 +297,5 @@ export function loadState(): PersistentState {
 export function saveState(s: PersistentState): void {
   ensureHome();
   assertNotNewer(paths.state(), STATE_SPEC);
-  atomicWriteFile(paths.state(), JSON.stringify({ ...s, schemaVersion: STATE_SPEC.current }, null, 2) + '\n', 0o600);
+  atomicWriteFile(paths.state(), JSON.stringify({ ...s, schemaVersion: STATE_SPEC.current }, null, 2) + '\n', 0o600, { durable: true });
 }

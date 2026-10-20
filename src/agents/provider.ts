@@ -6,7 +6,7 @@ import { claudeEnv, cursorEnv } from './env.ts';
 import { describeSchema, type Schema } from './json.ts';
 import type { EmitEvent } from './claude.ts';
 import { runProcess } from './spawn.ts';
-import { createProviders, providerLabel } from './providers/registry.ts';
+import { createProviders, mutatedProviderForTests, providerLabel } from './providers/registry.ts';
 import type { Provider, ProviderId } from './providers/types.ts';
 import type { Complexity, Role } from './roles.ts';
 import { advances, route, type States } from './routing.ts';
@@ -59,9 +59,14 @@ export class Agents {
     this.providers = createProviders({ getConfig, clock: this.clock, extraEnv: this.extraEnv });
   }
 
-  /** A registry provider. Builds are started only by pipeline/envelope.ts (static test) — not through this class. */
+  /** A registry provider (sealed). Builds are started only by pipeline/envelope.ts (static test) — not through this class. */
   provider(id: ProviderId): Provider {
     return this.providers[id];
+  }
+
+  /** TEST SEAM: replace a provider with a sealed, edited copy (throws outside a test run). */
+  _testMutate(id: ProviderId, mutate: (draft: Provider) => void): void {
+    this.providers = { ...this.providers, [id]: mutatedProviderForTests(this.providers[id], mutate) };
   }
 
   /** `<bin> --version`, cached per binary. */

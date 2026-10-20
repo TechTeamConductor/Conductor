@@ -91,7 +91,13 @@ export function backupPaths(
       const rel = isDir ? join(top, f.rel) : top;
       const target = join(dir, rel);
       mkdirSync(join(target, '..'), { recursive: true, mode: 0o700 });
-      const before = readFileSync(f.abs);
+      let before: Buffer;
+      try {
+        before = readFileSync(f.abs);
+      } catch (e) {
+        skipped.push({ path: f.abs, why: `unreadable (${(e as NodeJS.ErrnoException).code ?? 'error'})` });
+        continue;
+      }
       copyFileSync(f.abs, target);
       try {
         chmodSync(target, 0o600);

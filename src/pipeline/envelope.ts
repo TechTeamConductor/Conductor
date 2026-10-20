@@ -5,20 +5,27 @@
 // Extracted from stages.build() — the one intentional behaviour difference is that the git-meta restore now also runs when the provider throws.
 import type { AgentResult } from '../types.ts';
 import type { BuildPrep, Provider, ProviderId } from '../agents/providers/types.ts';
-import { capabilitiesOf } from '../agents/providers/registry.ts';
+import { capabilitiesOf, isRegisteredProvider } from '../agents/providers/registry.ts';
+import { buildBaseline } from '../agents/providers/verification.ts';
 import type { EmitEvent } from '../agents/claude.ts';
 import * as W from '../git/worktree.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
 import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
 import { errMsg, truncate } from '../util.ts';
 
-/** Keys a provider's `prepare` may never inject into the builder's environment (the envelope's own env also always wins). */
+/** Keys NO provider may ever set through `prepare`, even if its allow-list says so (the envelope's own env also always wins). */
 const FORBIDDEN_PREP_ENV = /^(GIT_[A-Z0-9_]*|HOME|PATH|USERPROFILE|CODEX_[A-Z0-9_]*|XDG_[A-Z0-9_]*|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|NODE_OPTIONS)$/i;
 
-export function sanitizePrepEnv(env: Record<string, string> | undefined): Record<string, string> {
+const allowed = (k: string, allow: readonly string[]): boolean => allow.some((a) => (a.endsWith('*') ? k.startsWith(a.slice(0, -1)) && a.length > 1 : k === a));
+
+/**
+ * An ALLOW-list: `prepare` may add only the keys its adapter declared (`envAllow`: exact names or `PREFIX_*`), minus the never-list above.
+ * Tokens, interpreter startup files, agent sockets and the like are therefore dropped by default (Security M2-3).
+ */
+export function sanitizePrepEnv(env: Record<string, string> | undefined, allow: readonly string[] = []): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env ?? {})) {
-    if (typeof v === 'string' && !FORBIDDEN_PREP_ENV.test(k)) out[k] = v;
+    if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && !FORBIDDEN_PREP_ENV.test(k) && allowed(k, allow)) out[k] = v;
   }
   return out;
 }
@@ -27,9 +34,15 @@ export type BuildEligibility = { ok: true } | { ok: false; why: string };
 
 /** Re-asserted INSIDE runBuild against the registry's derived capabilities — never against config or anything an adapter reports. */
 export function buildEligibility(p: Provider): BuildEligibility {
+  // only objects that came out of the registry count — an object that merely says `id: 'cursor'` is nobody (Security M2-2)
+  if (!isRegisteredProvider(p)) return { ok: false, why: 'That provider is not from the registry, so it cannot build.' };
   const caps = capabilitiesOf(p);
   if (!caps.build) return { ok: false, why: `${p.label} has no build capability.` };
   if (!caps.buildIsolationVerified) return { ok: false, why: `${p.label}'s build isolation has not been verified, so Conductor will not let it write code.` };
+  // the guard the verification depends on cannot be opted out of by an adapter flag (Security M2-1)
+  const base = buildBaseline(p.id);
+  const wantsFileGuard = base?.guard === 'file';
+  if (!base || !p.build || p.build.guard !== wantsFileGuard) return { ok: false, why: `${p.label} must keep the guard its isolation check depends on.` };
   return { ok: true };
 }
 
@@ -78,16 +91,26 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
     if (b.guard && (typeof b.prepare !== 'function' || typeof b.verifyGuard !== 'function')) return { kind: 'held', reason: HELD_NO_GUARD(label, 'it declares a guard but does not provide both prepare and verify') };
     prep = typeof b.prepare === 'function' ? await b.prepare({ worktree: i.worktree }) : { guardSha: null, envOnly: true };
     if (!prep || typeof prep !== 'object') throw new Error('prepare returned nothing');
+    // consistency: a file guard that was written must have a hash, and env-only protection cannot come with one
+    if (b.guard && prep.envOnly === false && !prep.guardSha) throw new Error('prepare reported a guard but no hash for it');
+    if (prep.envOnly === true && prep.guardSha) throw new Error('prepare reported env-only protection together with a guard hash');
   } catch (e) {
     return { kind: 'held', reason: HELD_NO_GUARD(label, truncate(errMsg(e), 160)) };
   }
   i.onPrepared(prep);
 
-  // 3 — the envelope's env: the git no-push env always wins over anything `prepare` supplied
-  const env = { ...sanitizePrepEnv(prep.env), ...(await W.agentGitEnv(i.repoPath)) };
+  // 3 — the envelope's env: the git no-push env always wins over anything `prepare` supplied. The git settings/hooks must also be
+  //     snapshottable BEFORE a builder runs: no env or no snapshot ⇒ no tamper detection ⇒ nothing is started (Security M2-4).
+  let env: Record<string, string>;
+  let snap: Awaited<ReturnType<typeof snapshotGitMeta>>;
+  try {
+    env = { ...sanitizePrepEnv(prep.env, b.envAllow), ...(await W.agentGitEnv(i.repoPath)) };
+    snap = await snapshotGitMeta(i.repoPath);
+  } catch (e) {
+    return { kind: 'held', reason: `Conductor could not read the repository's git settings (${truncate(errMsg(e), 120)}), so it did not start the builder. Check the repository, then move the card to To do.` };
+  }
 
   // 4 — run, with the git-meta restore guaranteed (also when the provider throws, times out or is aborted)
-  const snap = await snapshotGitMeta(i.repoPath).catch(() => null);
   let res: AgentResult | undefined;
   let thrown: { e: unknown } | undefined;
   try {
@@ -95,7 +118,7 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
   } catch (e) {
     thrown = { e };
   }
-  const tampered = snap ? await revertGitMeta(snap).catch(() => []) : [];
+  const tampered = await revertGitMeta(snap).catch(() => []);
   if (thrown) {
     if (tampered.length) i.onEvent({ agent: 'conductor', stage: 'build', kind: 'note', text: `${label} crashed after changing git settings/hooks (${tampered.slice(0, 4).join(', ')}) — Conductor restored them.` });
     throw thrown.e;

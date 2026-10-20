@@ -58,6 +58,8 @@ export interface BuildPrep {
 export interface BuildCapability {
   /** true ⇒ the provider declares a guard of its own: `prepare` AND `verifyGuard` MUST exist, otherwise the envelope refuses (fail closed). */
   guard: boolean;
+  /** Exact names or `PREFIX_*` patterns of the env keys `prepare` may add. Everything else is dropped (the envelope's own env always wins, and the GIT_ family, HOME, PATH and similar are never allowed). */
+  envAllow: readonly string[];
   prepare?(ctx: { worktree: string }): Promise<BuildPrep>;
   /** Only the envelope calls this (static test). */
   run(req: BuildRunReq, prep: BuildPrep): Promise<AgentResult>;

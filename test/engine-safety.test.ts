@@ -288,3 +288,36 @@ test('a REAL storage failure (the journal cannot be written) keeps every effect 
     await h.cleanup();
   }
 });
+
+// ───────────── Reviewer M-1: an older run.json is backed up before its first rewrite ─────────────
+test('M-1: the first write of an older run.json copies the original aside (once); later writes do not', async () => {
+  const { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { RunStore, newRun } = await import('../src/store.ts');
+  const { _resetBackupMemory } = await import('../src/schema/version.ts');
+  _resetBackupMemory();
+  const root = mkdtempSync(join(tmpdir(), 'cond-runup-'));
+  const bk = process.env.CONDUCTOR_BACKUP_DIR!;
+  const run: any = { ...newRun({ key: 'UP-1', itemId: 'i', title: 't', description: 'd', descHash: 'h', repo: 'r', branch: 'b', worktree: '' } as any), schemaVersion: 2 };
+  delete run.guardEnvOnly;
+  run.noPushEnvOnly = true;
+  run.cursorGuardSha = 'abc';
+  mkdirSync(join(root, 'UP-1'), { recursive: true });
+  writeFileSync(join(root, 'UP-1', 'run.json'), JSON.stringify(run));
+  const { existsSync } = await import('node:fs');
+  const list = () => (existsSync(bk) ? readdirSync(bk) : []).filter((n) => /pre-upgrade-run-UP-1/.test(n));
+  const before = list().length;
+  const store = new RunStore(root);
+  assert.equal(store.get('UP-1')!.guardSha, 'abc', 'migrated in memory');
+  assert.equal(list().length, before, 'reading never backs up');
+  store.update('UP-1', (r) => void (r.title = 'one'));
+  store.update('UP-1', (r) => void (r.title = 'two'));
+  const made = list();
+  assert.equal(made.length, before + 1, 'exactly one backup');
+  const saved = JSON.parse(readFileSync(join(root, 'UP-1', 'run.json'), 'utf8'));
+  assert.equal(saved.schemaVersion, 3);
+  const orig = JSON.parse(readFileSync(join(bk, made[made.length - 1]!, 'run.json'), 'utf8').toString());
+  assert.equal(orig.schemaVersion, 2, 'the backup holds the ORIGINAL (v2) record');
+  assert.equal(orig.cursorGuardSha, 'abc');
+  void store;
+});

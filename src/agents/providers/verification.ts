@@ -8,10 +8,12 @@ export interface BuildBaseline {
   /** Proven by the repo's live adversarial suite (test/live/cursor-nopush.test.ts) on that version; honoured only because this constant says so. */
   readonly grandfathered: boolean;
   readonly source: 'bundled-repo-suite';
+  /** What the verification depends on: 'file' = the provider's own guard artefact must be written and intact; 'sandbox' = an OS/CLI sandbox verified by a canary instead (no file guard). A provider cannot opt out of a guard its verification relies on. */
+  readonly guard: 'file' | 'sandbox';
 }
 
 const BASELINES: Readonly<Partial<Record<ProviderId, BuildBaseline>>> = Object.freeze({
-  cursor: Object.freeze({ cliVersion: '2026.10.19', grandfathered: true, source: 'bundled-repo-suite' } as const),
+  cursor: Object.freeze({ cliVersion: '2026.10.19', grandfathered: true, source: 'bundled-repo-suite', guard: 'file' } as const),
 });
 
 export function buildBaseline(id: ProviderId): BuildBaseline | undefined {
