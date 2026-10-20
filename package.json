@@ -5,8 +5,12 @@
   "description": "Local master UI that runs Linear issues through Claude (plan) -> Cursor (build) -> Claude (verify) with bug loops.",
   "type": "module",
   "license": "UNLICENSED",
-  "engines": { "node": ">=22.18" },
-  "bin": { "conductor": "bin/conductor.mjs" },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "conductor": "bin/conductor.mjs"
+  },
   "scripts": {
     "start": "node bin/conductor.mjs start",
     "demo": "node bin/conductor.mjs demo",
@@ -18,7 +22,6 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "graphql": "^16.9.0",
     "typescript": "^5.9.0"
   }
 }

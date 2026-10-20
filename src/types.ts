@@ -313,9 +313,6 @@ export interface AgentResult {
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
 }
 
-// Linear types live in src/linear/types.ts (legacy, removed in M1d); re-exported so the Linear modules and their tests keep compiling until then.
-export type * from './linear/types.ts';
-
 // ───────────────────────────── HTTP API shapes (see docs/API.md) ─────────────────────────────
 export interface AgentHealth {
   found: boolean;

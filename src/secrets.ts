@@ -117,8 +117,11 @@ export function defaultSecretStore(): SecretStore {
   return new KeychainStore();
 }
 
-export const SECRET_LINEAR = 'linear-api-key';
-const ENV_OVERRIDE: Record<string, string> = { [SECRET_LINEAR]: 'LINEAR_API_KEY' };
+/** Secret name → environment variable that overrides the stored value (registered by the code that owns the secret, e.g. a provider API key). */
+const ENV_OVERRIDE: Record<string, string> = {};
+export function registerSecretEnv(name: string, envVar: string): void {
+  ENV_OVERRIDE[name] = envVar;
+}
 
 /** Env var wins; then the configured store (Keychain by default, file fallback if Keychain rejects the value). */
 export async function getSecret(store: SecretStore, name: string): Promise<string | null> {

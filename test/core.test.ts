@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applySettings, defaultConfig, normalizeConfig, toSettings } from '../src/config.ts';
-import { FileStore, MemoryStore, getSecret, putSecret, SECRET_LINEAR, KeychainStore } from '../src/secrets.ts';
+import { FileStore, MemoryStore, getSecret, putSecret, registerSecretEnv, KeychainStore } from '../src/secrets.ts';
 import { RunStore, newRun } from '../src/store.ts';
 import { acquireLock, LockHeldError } from '../src/lock.ts';
 import { loadEnvSecrets, looksSecret, redact } from '../src/redact.ts';
@@ -60,11 +60,13 @@ test('secrets: FileStore is 0600, MemoryStore works, env var overrides, put/get/
   assert.equal(await f.get('a'), null);
   assert.equal(existsSync(join(dir, 'secrets.json')), false);
   const m = new MemoryStore();
-  assert.equal(await putSecret(m, SECRET_LINEAR, 'lin_api_' + 'x'.repeat(30)), 'memory');
-  process.env.LINEAR_API_KEY = 'lin_api_fromenv_' + 'y'.repeat(20);
-  assert.match((await getSecret(m, SECRET_LINEAR))!, /fromenv/, 'env wins');
-  delete process.env.LINEAR_API_KEY;
-  assert.match((await getSecret(m, SECRET_LINEAR))!, /^lin_api_x/);
+  const NAME = 'example-secret';
+  registerSecretEnv(NAME, 'CONDUCTOR_EXAMPLE_SECRET');
+  assert.equal(await putSecret(m, NAME, 'tok_' + 'x'.repeat(30)), 'memory');
+  process.env.CONDUCTOR_EXAMPLE_SECRET = 'tok_fromenv_' + 'y'.repeat(20);
+  assert.match((await getSecret(m, NAME))!, /fromenv/, 'env wins');
+  delete process.env.CONDUCTOR_EXAMPLE_SECRET;
+  assert.match((await getSecret(m, NAME))!, /^tok_x/);
   rmSync(dir, { recursive: true, force: true });
 });
 test('Keychain smoke (opt-in, dummy item, cleaned up): value goes via stdin and round-trips', { skip: !(process.env.KEYCHAIN_SMOKE === '1' && KeychainStore.available()) }, async () => {
