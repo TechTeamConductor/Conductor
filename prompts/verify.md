@@ -9,6 +9,16 @@ You are an independent verifier. The implementer's own claims are NOT evidence â
 {{task}}
 
 {{plan}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
+{{#projectHistory}}
+
+## Previously completed tasks in this project
+{{projectHistory}}
+{{/projectHistory}}
 
 ## Deterministic gate results (ground truth)
 {{gates}}

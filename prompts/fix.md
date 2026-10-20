@@ -7,6 +7,11 @@ Your previous build needs another pass: independent verification found problems,
 
 ## Task (context)
 {{task}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
 
 ## Approved plan
 {{plan}}

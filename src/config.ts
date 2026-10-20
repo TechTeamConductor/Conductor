@@ -1,7 +1,7 @@
 import { chmodSync, existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { Config, RepoConfig, Settings } from './types.ts';
+import type { Config, ProjectSettings, RepoConfig, Settings } from './types.ts';
 import { paths, ensureHome } from './paths.ts';
 import { atomicWriteFile, deepClone, readJsonFile } from './util.ts';
 import { CorruptFileError } from './schema/errors.ts';
@@ -38,12 +38,18 @@ export function migrateConfigV3ToV4(raw: any): any {
 }
 /** A Codex model name: letters/digits first, then letters, digits and . _ : / - (max 64). Anything else is dropped. */
 export const CODEX_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
-export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 4, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4 } };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'pipeline', 'worktreeRoot', 'extra', 'legacy']);
+/** v4 → v5 (M4): per-project settings (`projects`, keyed by board project key) join the config; an older file simply has none. */
+export function migrateConfigV4ToV5(raw: any): any {
+  return { ...(raw ?? {}), projects: raw && typeof raw.projects === 'object' && raw.projects !== null && !Array.isArray(raw.projects) ? raw.projects : {} };
+}
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 5, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5 } };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
+/** Board project keys (also the context store directory names): 2–6 capital letters. */
+export const PROJECT_SETTINGS_KEY_RE = /^[A-Z]{2,6}$/;
 
 export function defaultConfig(): Config {
   return {
-    version: 4,
+    version: 5,
     ui: { port: 4327, openBrowser: true }, // v1 uses 4317: both can run side by side
     repos: [],
     agents: {
@@ -52,6 +58,7 @@ export function defaultConfig(): Config {
       codex: { bin: 'codex' },
     },
     roles: defaultRoles(),
+    projects: Object.create(null),
     pipeline: {
       maxParallel: 2,
       maxLoops: 3,
@@ -91,7 +98,7 @@ export function normalizeConfig(input: unknown): Config {
   const withRoles = i.roles === undefined && (i.stages !== undefined || pl.onClaudeLimit !== undefined) ? migrateConfigV3ToV4(i) : i;
   if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 4,
+    version: 5,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
@@ -119,6 +126,7 @@ export function normalizeConfig(input: unknown): Config {
       },
     },
     roles: normalizeRoles((withRoles as any).roles, (m) => log.warn(`config roles: ${m}`)),
+    projects: normalizeProjects((withRoles as any).projects),
     pipeline: {
       maxParallel: clamp(pl.maxParallel, 1, 6, d.pipeline.maxParallel),
       maxLoops: clamp(pl.maxLoops, 1, 8, d.pipeline.maxLoops),
@@ -157,6 +165,24 @@ export function normalizeConfig(input: unknown): Config {
   if (Object.keys(legacy).length) cfg.legacy = { ...legacy };
   if (!cfg.pipeline.failOn.length) cfg.pipeline.failOn = d.pipeline.failOn;
   return cfg;
+}
+
+/** Per-project settings from untrusted input: own-property reads, null-prototype result, keys that are valid project keys, every value clamped. */
+export function normalizeProjects(raw: unknown): Record<string, ProjectSettings> {
+  const out: Record<string, ProjectSettings> = Object.create(null);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const key of Object.keys(raw)) {
+    if (!Object.hasOwn(raw, key) || !PROJECT_SETTINGS_KEY_RE.test(key)) continue;
+    const entry = (raw as Record<string, unknown>)[key];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const ctx = Object.hasOwn(entry, 'context') ? (entry as Record<string, unknown>).context : undefined;
+    const c = (ctx && typeof ctx === 'object' && !Array.isArray(ctx) ? ctx : {}) as Record<string, unknown>;
+    const own = (k: string): unknown => (Object.hasOwn(c, k) ? c[k] : undefined);
+    out[key] = {
+      context: { summaries: own('summaries') === true, staleDays: clamp(own('staleDays'), 1, 365, 14), packBytes: clamp(own('packBytes'), 1024, 32 * 1024, 8 * 1024) },
+    };
+  }
+  return out;
 }
 
 function validRepo(r: unknown): boolean {

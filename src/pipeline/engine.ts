@@ -18,6 +18,7 @@ import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
 import { graphBudgets, nextBuildRole, projectItemLane } from './graph.ts';
 import { Semaphore } from './semaphore.ts';
+import { ContextService, type ContextLike } from '../context/service.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
 import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers/registry.ts';
@@ -47,6 +48,8 @@ export interface EngineDeps {
   persistent?: { load(): PersistentState; save(s: PersistentState): void };
   /** Extra redaction secrets (e.g. provider API keys). */
   secrets?: () => string[];
+  /** The project context engine; the real one is created when omitted (tests may pass a stub). */
+  context?: ContextLike;
 }
 
 type Job = { ac: AbortController; promise: Promise<void> };
@@ -90,6 +93,7 @@ export class Engine {
   private unsubBoard: (() => void) | null = null;
   /** The ONE cap on concurrent read-only analysis calls across all runs (task graphs). */
   private analysisSem = new Semaphore(() => this.d.getConfig().pipeline.readOnlyParallel);
+  private context!: ContextLike;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
   private healthRefresh: (() => Promise<void>) | null = null;
   private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>) | null = null;
@@ -101,6 +105,7 @@ export class Engine {
     this.clock = deps.clock ?? systemClock;
     this.persistentDeps = deps.persistent ?? { load: loadState, save: saveState };
     this.effects = new Effects({ store: deps.store, board: deps.board, secrets: (r) => this.secretsFor(r), now: () => this.clock.now() });
+    this.context = deps.context ?? new ContextService({ board: deps.board, getConfig: deps.getConfig, now: () => this.clock.now() });
     this.stages = new Stages(this.makeCtx());
   }
 
@@ -129,6 +134,7 @@ export class Engine {
       pausedUntil: (agent) => this.activePause(agent),
       tickSoon: () => this.tickSoon(),
       analysisSlot: (signal) => this.analysisSem.acquire(signal),
+      context: this.context,
       recordQuota: (agent, q) => {
         this.quotaMap.set(agent, { utilization7d: q.utilization7d, utilization5h: q.utilization5h, resetsAt: q.resetsAt, rejected: q.status === 'rejected' });
         this.changed();
@@ -306,6 +312,7 @@ export class Engine {
       } catch (e) {
         log.warn(`${run.key}: projection failed: ${errMsg(e)}`);
       }
+      await this.digestRun(run);
     }
     // 3. claims
     const runKeys = new Set(this.d.store.list().map((r) => r.key));
@@ -335,6 +342,20 @@ export class Engine {
     for (const k of this.d.store.tombstoned()) ignored.push({ key: k, reason: 'This run\'s record was unreadable and has been set aside; the card will not be started again by itself. Check the data folder.' });
     this.ignored = ignored;
     this.changed();
+  }
+
+  /** A run at rest gets one outcome line in its project's history (level-triggered, idempotent, never an error for the run). */
+  private async digestRun(run: Run): Promise<void> {
+    if (!['ready', 'finished', 'needs_human', 'aborted'].includes(run.status)) return;
+    if (run.digestMark === `${run.status}:${run.rev}:${run.loop}`) return;
+    try {
+      const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
+      if (!repo) return;
+      const mark = await this.context.digest(run, repo);
+      if (mark) this.d.store.update(run.key, (r) => void (r.digestMark = mark));
+    } catch (e) {
+      log.warn(`${run.key}: outcome digest failed: ${errMsg(e)}`);
+    }
   }
 
   /** Converge the card's lane/stage to the run's state (level-triggered; idempotent). A run whose card vanished is an orphan. */

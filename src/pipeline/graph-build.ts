@@ -63,6 +63,8 @@ export interface GraphHost {
    */
   callAnalysis(key: string, prompt: string, role: Role, label: string): Promise<{ kind: 'ok'; json: unknown } | { kind: 'stop'; hold?: Hold }>;
   applyHold(key: string, hold: Hold | undefined): Promise<void>;
+  /** Fenced project-context blocks for a prompt (builder: facts only; read-only: facts + history). */
+  projectBlocks(key: string, consumer: 'builder' | 'readonly', files?: string[]): Promise<{ projectFacts: string; projectHistory: string }>;
   /** One slot of the engine's single cap on concurrent analysis calls (null = the run was stopped while waiting). */
   analysisSlot(key: string): Promise<(() => void) | null>;
   protectedPaths: string;
@@ -276,6 +278,7 @@ export class GraphBuilder {
       const run = h.run(key);
       const it = this.item(key, id);
       const prompt = render(loadTemplate('item-analysis'), {
+        ...(await h.projectBlocks(key, 'readonly', it.files)),
         preamble: preamble('plan'),
         key: run.key,
         itemId: it.id,
@@ -359,6 +362,7 @@ export class GraphBuilder {
     const baseline = h.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
     const prompt = render(loadTemplate('build-item'), {
+      ...(await h.projectBlocks(key, 'builder', cur.files)),
       preamble: preamble('build'),
       key: run.key,
       itemId: cur.id,

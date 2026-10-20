@@ -23,7 +23,7 @@ const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHas
 test('config: defaults are safe; hostile/garbage input is clamped, never trusted', () => {
   const d = defaultConfig();
   assert.equal((d as any).linear, undefined, 'config v3 has no Linear section');
-  assert.equal(d.version, 4);
+  assert.equal(d.version, 5);
   assert.equal(d.pipeline.planApproval, 'auto', 'hands-off by default');
   assert.equal(toSettings(d).onClaudeLimit, 'cursor', 'a rate-limited Claude must not stall the pipeline (derived from the claude → cursor planning chain)');
   assert.deepEqual(d.roles.planning.providers, ['claude', 'cursor']);

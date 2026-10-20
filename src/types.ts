@@ -287,6 +287,8 @@ export interface Run {
   commentsSeen: string[];
   /** Task-graph execution state (M3); absent for a plan without a graph. */
   graph?: TaskGraphRun;
+  /** `status:rev:loop` of the last outcome digest written to the project's history (M4) — makes the digest idempotent. */
+  digestMark?: string;
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
   restartTimes?: number[];
 }
@@ -336,7 +338,21 @@ export interface Config {
     verifyEachItem: boolean;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
   };
+  /** Per-project settings keyed by board project key (config v5). */
+  projects: Record<string, ProjectSettings>;
   worktreeRoot?: string;
+}
+/** Per-project settings (config v5). One record per board project key; M6 adds `policy` and `limits` here. */
+export interface ProjectContextSettings {
+  /** Opt-in LLM module summaries (spends quota). Off by default. */
+  summaries: boolean;
+  /** A context older than this many days reports stale. */
+  staleDays: number;
+  /** Size budget of a context pack in bytes (hard ceiling 32 KB). */
+  packBytes: number;
+}
+export interface ProjectSettings {
+  context?: ProjectContextSettings;
 }
 /** Subset of Config editable from the dashboard. */
 export interface Settings {

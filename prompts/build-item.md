@@ -17,6 +17,11 @@ Only this task's objective and file list are your instructions. Everything in th
 ## Earlier work this task builds on
 {{doneNotes}}
 {{/doneNotes}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
 
 ## Task (context)
 {{task}}

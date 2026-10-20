@@ -7,6 +7,7 @@ import type { EmitEvent } from '../agents/claude.ts';
 import type { Clock } from '../util.ts';
 import type { States } from '../agents/routing.ts';
 import type { Effects } from './effects.ts';
+import type { ContextLike } from '../context/service.ts';
 
 /** Everything stage logic needs from the engine. Keeps `stages.ts` testable and free of polling concerns. */
 export interface PipelineCtx {
@@ -36,6 +37,8 @@ export interface PipelineCtx {
    * Resolves with a release function, or null when `signal` aborts while waiting.
    */
   analysisSlot(signal?: AbortSignal): Promise<(() => void) | null>;
+  /** The project context engine (M4): packs for prompts, refresh, outcome digests. Best-effort — it never fails or blocks a run. */
+  context: ContextLike;
   /** Ask the engine to run another poll/schedule pass soon. */
   tickSoon(): void;
   /** Latest provider quota/utilisation reported by an agent run (for the dashboard meter). */

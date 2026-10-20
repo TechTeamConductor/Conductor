@@ -12,6 +12,16 @@ You are the planning engineer. Produce an implementation plan precise enough tha
 ## Feedback to address (plan revision {{rev}})
 {{feedback}}
 {{/feedback}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
+{{#projectHistory}}
+
+## Previously completed tasks in this project
+{{projectHistory}}
+{{/projectHistory}}
 
 ## Repository
 - Your working directory is a dedicated git worktree at base commit `{{baseSha}}` (branch `{{branch}}`).

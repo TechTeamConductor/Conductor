@@ -10,6 +10,16 @@ You are an independent reviewer of an implementation plan. You did not write it.
 
 ## Plan under review
 {{plan}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
+{{#projectHistory}}
+
+## Previously completed tasks in this project
+{{projectHistory}}
+{{/projectHistory}}
 
 ## Repository
 Working directory = git worktree at base commit `{{baseSha}}`. Quality gates: {{gates}}

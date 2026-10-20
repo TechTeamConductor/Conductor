@@ -7,6 +7,11 @@ The implementation plan below has been **approved by the Conductor pipeline** (p
 
 ## Task (context)
 {{task}}
+{{#projectFacts}}
+
+## Project facts
+{{projectFacts}}
+{{/projectFacts}}
 
 ## Approved plan
 {{plan}}

@@ -25,6 +25,7 @@ import { postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
 import type { Role } from '../agents/roles.ts';
+import type { Consumer } from '../context/pack.ts';
 import { route } from '../agents/routing.ts';
 import type { PipelineCtx } from './context.ts';
 import { ITEM_NOTE_SCHEMA, PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
@@ -108,8 +109,29 @@ export class Stages {
       },
       applyHold: (k, hold) => this.applyHold(k, hold),
       analysisSlot: (k) => ctx.analysisSlot(ctx.signal(k)),
+      projectBlocks: (k, consumer, files) => this.projectBlocks(k, consumer, files),
       protectedPaths: PROTECTED,
     });
+  }
+
+  /**
+   * The project-context blocks of a prompt, fenced as data: deterministic facts recomputed from git at the run's base commit (and, for
+   * read-only stages only, previously completed tasks). A builder never receives history, summaries or anything an agent wrote.
+   */
+  async projectBlocks(key: string, consumer: Consumer, files: string[] = []): Promise<{ projectFacts: string; projectHistory: string }> {
+    const run = this.run(key);
+    let b: { facts: string; history: string };
+    try {
+      b = await this.c.context.blocks(run, this.repo(run), consumer, files);
+    } catch (e) {
+      // the context engine is an aid: whatever goes wrong inside it, the stage simply runs without the block
+      log.warn(`${key}: project context unavailable: ${errMsg(e)}`);
+      b = { facts: '', history: '' };
+    }
+    return {
+      projectFacts: b.facts ? fence('project-facts', b.facts, 40_000) : '',
+      projectHistory: consumer === 'readonly' && b.history ? fence('project-history', b.history, 8_000) : '',
+    };
   }
 
   /** The agent-run budget of a run: a task graph scales it with the amount of work (never past the hard ceiling). */
@@ -488,7 +510,10 @@ export class Stages {
     if (problem) return this.toNeedsHuman(key, problem, 'plan');
     const repo = this.repo(run);
     const comments = item ? this.c.board.comments(item.id).filter((c) => c.author === 'user').slice(-20).map((c) => truncate(c.body, 2000)) : [];
+    // keep the stored project context fresh without ever holding the run up (cheap no-op when nothing changed)
+    void Promise.resolve().then(() => this.c.context.refresh(run, repo)).catch(() => undefined);
     const prompt = render(loadTemplate('plan'), {
+      ...(await this.projectBlocks(key, 'readonly')),
       preamble: preamble('plan'),
       key: run.key,
       task: taskBlock({ key: run.key, title: run.title, description: run.description, comments }),
@@ -567,6 +592,7 @@ export class Stages {
     if (!plan) return this.toNeedsHuman(key, 'Plan artifact is missing; re-planning is needed.', 'plan');
     const repo = this.repo(run);
     const prompt = render(loadTemplate('plan-review'), {
+      ...(await this.projectBlocks(key, 'readonly', plan.filesToChange.map((f) => f.path))),
       preamble: preamble('plan_review'),
       key: run.key,
       task: taskBlock({ key: run.key, title: run.title, description: run.description }),
@@ -692,6 +718,7 @@ export class Stages {
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
     const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open');
     const commonVars = {
+      ...(await this.projectBlocks(key, 'builder', plan.filesToChange.map((f) => f.path))),
       preamble: preamble(isFix ? 'fix' : 'build'),
       key: run.key,
       task: taskBlock({ key: run.key, title: run.title, description: run.description }),
@@ -957,6 +984,7 @@ export class Stages {
     }
     run = this.run(key);
     const prompt = render(loadTemplate('verify'), {
+      ...(await this.projectBlocks(key, 'readonly', plan.filesToChange.map((f) => f.path))),
       preamble: preamble('verify'),
       key: run.key,
       task: taskBlock({ key: run.key, title: run.title, description: run.description }),
