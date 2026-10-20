@@ -17,6 +17,7 @@ import * as W from '../git/worktree.ts';
 import { BRANCH_PREFIX } from '../git/worktree.ts';
 import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
+import { TAINTED_ACTORS } from '../board/types.ts';
 import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
 import { graphBudgets, nextBuildRole, projectItemLane } from './graph.ts';
@@ -448,7 +449,7 @@ export class Engine {
       loopBudget: cfg.pipeline.maxLoops,
     };
     try {
-      this.d.store.create({ ...newRun(seed), untrusted: item.createdBy === 'import' ? true : undefined });
+      this.d.store.create({ ...newRun(seed), untrusted: TAINTED_ACTORS.includes(item.createdBy) ? true : undefined, fastPath: item.createdBy === 'user-ask' ? true : undefined });
     } catch (e) {
       if ((e as { code?: string }).code === 'exists') return;
       throw e;
@@ -555,6 +556,7 @@ export class Engine {
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
       r.restartTimes = [...recent, nowT];
+      r.offline = undefined; // a human restart is a fresh start for the offline caps
       r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-card cap becomes a dead end)
       r.buildFails = 0;
       r.limitStreak = 0;

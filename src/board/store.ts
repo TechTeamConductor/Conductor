@@ -73,7 +73,7 @@ const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 function cloneItem(i: WorkItem): WorkItem {
   return { ...i, dependsOn: [...i.dependsOn], external: i.external ? { ...i.external } : undefined };
 }
-const clean = (s: string): string => s.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+const clean = (s: string): string => s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}\u034F\u115F\u1160\u3164\uFFA0\u2800]+/gu, ' ').trim();
 const asString = (v: unknown, name: string): string => {
   if (typeof v !== 'string') throw new BoardError('bad_input', `"${name}" must be a string.`);
   return v;
@@ -298,7 +298,7 @@ export class Board {
   // ─────────────────────────── text hygiene ───────────────────────────
   private text(actor: Actor, v: string, max: number, name: string, opts: { oneLine?: boolean; allowEmpty?: boolean } = {}): string {
     let s = opts.oneLine ? clean(v) : v;
-    if (actor === 'conductor') s = this.redactFn(s); // agent-derived text never reaches the board unredacted (H3)
+    if (actor === 'conductor' || actor === 'ask-convert' || actor === 'research') s = this.redactFn(s); // agent-derived text never reaches the board unredacted (H3)
     if (!opts.allowEmpty && s.trim().length === 0) throw new BoardError('bad_input', `"${name}" cannot be empty.`);
     if (s.length > max) {
       if (actor === 'user') throw new BoardError('too_long', `"${name}" is too long (max ${max} characters).`);

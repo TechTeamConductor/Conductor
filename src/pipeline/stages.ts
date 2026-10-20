@@ -40,6 +40,15 @@ type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
 export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo } | { type: 'offline'; message: string };
 type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop'; hold?: Hold };
 
+/** Eligibility for the Quick Ask fast path is decided on the PLANNER's plan: small, ≤ 3 files, plain relative paths, nothing protected or secret-looking. */
+export function fastPathEligible(plan: Plan): boolean {
+  if (plan.complexity !== 'S' || plan.deliverable === 'answer' || isGraphPlan(plan)) return false;
+  const files = plan.filesToChange.map((f) => f.path);
+  if (files.length === 0 || files.length > 3) return false;
+  if (files.some((f) => !/^[A-Za-z0-9._@+\-][A-Za-z0-9._@+/\- ]{0,300}$/.test(f) || f.startsWith('/') || f.split('/').some((x) => x === '..' || x === '.' || x === '' || /^\.git/i.test(x)) || /(^|\/)\.env|\.(pem|key)$|id_rsa|credentials/i.test(f))) return false;
+  return W.diffScopeViolations(files, []).length === 0;
+}
+
 /** More tasks than this in one plan always waits for a human (even with automatic approval). */
 const GRAPH_BIG_ITEMS = 8;
 
@@ -608,7 +617,12 @@ export class Stages {
     }
     await this.c.effects.comment(key, `plan:${run.rev}`, `🤖 **Conductor plan** (revision ${run.rev}, complexity ${plan.complexity})\n\n${truncate(md, 24_000)}`);
     const cfg = this.c.cfg();
-    const wantsReview = cfg.pipeline.planReview === 'always' || (cfg.pipeline.planReview === 'auto' && plan.complexity !== 'S');
+    // a fast-path run (Quick Ask, user opted in) skips plan REVIEW only — and only when the planner's own plan is small and unremarkable;
+    // approval, holds and policies are untouched. A plan that is not eligible takes the normal path.
+    if (run.fastPath && !fastPathEligible(plan)) {
+      this.patch(key, (r) => { r.fastPath = false; r.history.push({ ts: this.c.clock.now(), text: 'The plan is not small enough for the fast path — normal review applies' }); });
+    }
+    const wantsReview = !this.run(key).fastPath && (cfg.pipeline.planReview === 'always' || (cfg.pipeline.planReview === 'auto' && plan.complexity !== 'S'));
     if (wantsReview) {
       this.patch(key, (r) => {
         r.next = 'plan_review';
@@ -864,6 +878,12 @@ export class Stages {
         return this.toNeedsHuman(key, 'The builder made no changes in response to the reported problems.', 'build');
       }
       case 'committed':
+        if (run.fastPath) {
+          // no plan review happened: the build may touch ONLY the files the plan listed, for every path
+          const planSet = new Set(plan.filesToChange.map((f) => f.path.replace(/^\.\//, '')));
+          const extra = out.files.filter((f) => !planSet.has(f));
+          if (extra.length) return this.toNeedsHuman(key, `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. Review them (they are committed on the branch), then continue.`, 'build');
+        }
         this.patch(key, (r) => {
           r.commitSha = out.sha;
           r.commitNote = undefined;

@@ -391,6 +391,11 @@ export class Api {
       if (body.allowChange !== undefined && typeof body.allowChange !== 'boolean') throw new ApiFail(400, 'bad_request', '"allowChange" must be true or false.');
       return { status: 202, json: this.asksSvc().start({ question: body.question, repo: body.repo, allowChange: body.allowChange }) };
     }
+    if ((m = /^\/api\/asks\/([^/]+)\/convert$/.exec(path)) && method === 'POST') {
+      const id = safeDecode(m[1]!);
+      if (!ASK_ID_RE.test(id)) throw new ApiFail(404, 'not_found', 'Unknown question.');
+      return { status: 201, json: this.asksSvc().convert(id) };
+    }
     if ((m = /^\/api\/asks\/([^/]+)\/cancel$/.exec(path)) && method === 'POST') {
       const id = safeDecode(m[1]!);
       const rec = ASK_ID_RE.test(id) ? this.asksSvc().cancel(id) : null;

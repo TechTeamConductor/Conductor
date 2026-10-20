@@ -280,7 +280,7 @@ test('versions: a newer snapshot or journal op is refused (nothing written); leg
   mk(w);
   w.close();
   const snap = JSON.parse(readFileSync(join(dir, 'snapshot.json'), 'utf8'));
-  writeFileSync(join(dir, 'snapshot.json'), JSON.stringify({ ...snap, schemaVersion: 2 }));
+  writeFileSync(join(dir, 'snapshot.json'), JSON.stringify({ ...snap, schemaVersion: 3 }));
   assert.throws(() => open(dir), (e: any) => e instanceof NewerVersionError);
   delete snap.schemaVersion;
   writeFileSync(join(dir, 'snapshot.json'), JSON.stringify(snap));

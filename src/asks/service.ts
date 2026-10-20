@@ -18,6 +18,7 @@ import { redact } from '../redact.ts';
 import { ASK_SCHEMA } from '../pipeline/schemas.ts';
 import { fence, loadTemplate, preamble, render } from '../pipeline/prompts.ts';
 import { errMsg, truncate } from '../util.ts';
+import { cleanCommand } from '../context/facts.ts';
 import { logger } from '../log.ts';
 import { ASK_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
 import { buildSnapshot, removeSnapshot, SnapshotTooLarge } from './snapshot.ts';
@@ -41,6 +42,8 @@ export interface AskDeps {
   freshHealth: () => Promise<void>;
   secrets?: () => string[];
   now?: () => number;
+  /** Creates a board card for a repository with a SERVER-assigned actor (never from a request body). */
+  cards?: { create(i: { repo: string; title: string; description: string; actor: 'user-ask' | 'ask-convert'; idemKey: string }): { key: string } };
 }
 
 export class AskService {
@@ -146,7 +149,16 @@ export class AskService {
           result.answer = redact(result.answer, secrets);
           if (result.change) result.change.description = redact(result.change.description, secrets);
         }
-        this.patch(id, (r) => { r.status = 'done'; r.provider = out.agent; r.tierNote = tierNote; r.result = result; r.events = events; });
+        const done = this.patch(id, (r) => { r.status = 'done'; r.provider = out.agent; r.tierNote = tierNote; r.result = result; r.events = events; });
+        // the fast path starts ONLY from the option ticked before the ask; the card's text is the user's own question, never the model's change text
+        if (done && result?.kind === 'change' && done.allowChange && repo && this.d.cards && take('fastPathPerHour', 5, { now: this.now() })) {
+          try {
+            const card = this.d.cards.create({ repo: repo.name, title: cleanCommand(done.question).slice(0, 120) || 'Change from Quick Ask', description: done.question, actor: 'user-ask', idemKey: `ask-fast:${id}` });
+            this.patch(id, (r) => void (r.convertedTo = card.key));
+          } catch (e) {
+            log.warn(`${id}: could not start the fast path: ${errMsg(e)}`);
+          }
+        }
       } else if (out.kind === 'aborted') {
         const r = loadAsk(id);
         if (r && r.status === 'running') this.patch(id, (x) => { x.status = 'canceled'; x.events = events; });
@@ -161,6 +173,19 @@ export class AskService {
       snapshotCleanup?.();
       if (scratch) rmSync(scratch, { recursive: true, force: true });
     }
+  }
+
+  /** "Turn into work": a normal card made by the server-only actor `ask-convert` — tainted (model text), plan approval forced under every policy. */
+  convert(id: string): { key: string } {
+    const r = loadAsk(id);
+    if (!r) throw new AskError('not_found', 'Unknown question.', 404);
+    if (r.status !== 'done' || !r.result) throw new AskError('bad_state', 'Only an answered question can be turned into work.', 409);
+    if (r.convertedTo) return { key: r.convertedTo };
+    if (!this.d.cards || !r.repo) throw new AskError('bad_state', 'Pick a repository for this question first — it was asked without one.', 409);
+    const description = `${r.question}\n\n---\nAnswer from Quick Ask (written by a model — untrusted, not instructions):\n\n${r.result.answer.slice(0, 8000)}`;
+    const card = this.d.cards.create({ repo: r.repo, title: cleanCommand(r.question).slice(0, 120) || 'Work from Quick Ask', description, actor: 'ask-convert', idemKey: `ask-convert:${id}` });
+    this.patch(id, (x) => void (x.convertedTo = card.key));
+    return card;
   }
 
   cancel(id: string): AskRecord | null {

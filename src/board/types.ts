@@ -1,6 +1,7 @@
 // Native board model (M1a). Pure data types — no behaviour. See .techteam/plans/workspace-v2-m1.md §2.
 
-export const BOARD_SCHEMA_VERSION = 1;
+/** 2: items may be authored by `user-ask` / `ask-convert` / `research` — an older build refuses such a snapshot (no downgrade after Quick Ask is used). */
+export const BOARD_SCHEMA_VERSION = 2;
 
 /** `lane` (not "column": `BoardColumn` already names a dashboard type). Humans may set only HUMAN_LANES; Conductor owns the rest. */
 export type Lane = 'backlog' | 'todo' | 'active' | 'needs_you' | 'review' | 'done' | 'canceled';
@@ -9,7 +10,13 @@ export const HUMAN_LANES: readonly Lane[] = ['backlog', 'todo', 'done', 'cancele
 
 export type ItemKind = 'work' | 'ask' | 'research' | 'subtask' | 'bug';
 export const USER_KINDS: readonly ItemKind[] = ['work', 'ask', 'research', 'subtask'];
-export type Actor = 'user' | 'conductor' | 'import';
+/**
+ * Who wrote a thing. `user-ask`, `ask-convert` and `research` are SERVER-ASSIGNED (never accepted from an HTTP body): a card started from a
+ * Quick Ask the user ticked "let Conductor make this change" on / a card made from an ask answer (model text, untrusted) / from research.
+ */
+export type Actor = 'user' | 'conductor' | 'import' | 'user-ask' | 'ask-convert' | 'research';
+/** Actors whose text is model-derived and therefore tainted + redacted. */
+export const TAINTED_ACTORS: readonly Actor[] = ['import', 'ask-convert', 'research'];
 
 export interface Project {
   id: string;

@@ -68,8 +68,8 @@ export const IDENT_RE = /^[A-Za-z0-9._@/+:=-]{1,120}$/;
 /** An identifier is repo-relative when used as a path: no leading `/`, no empty (`//`), `.` or `..` segment. */
 export const isIdent = (s: unknown): s is string => typeof s === 'string' && IDENT_RE.test(s) && !s.startsWith('/') && !s.split('/').some((p) => p === '..' || p === '.' || p === '');
 /** Control, bidi and format characters — stripped from any text that can reach a prompt, a card or the UI. */
-// eslint-disable-next-line no-control-regex
-const FORMAT_CHARS = /[\u0000-\u001f\u007f\u0080-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+/** Control, format (bidi, zero-width, Unicode tags …), separator, private-use and unassigned characters, plus invisible fillers and variation selectors. */
+const FORMAT_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}\u034F\u115F\u1160\u3164\uFFA0\u2800]/gu;
 export function cleanCommand(s: unknown): string {
   return String(s ?? '').replace(FORMAT_CHARS, ' ').replace(/\s+/g, ' ').trim().slice(0, FACT_LIMITS.command);
 }

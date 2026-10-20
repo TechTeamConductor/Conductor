@@ -289,6 +289,8 @@ export interface Run {
   graph?: TaskGraphRun;
   /** `status:rev:loop` of the last outcome digest written to the project's history (M4) — makes the digest idempotent. */
   digestMark?: string;
+  /** Started from a Quick Ask with "make this change if it is small" ticked (M5): plan review is skipped, approval is NOT (see Stages.approvalGate). Assigned by server code only. */
+  fastPath?: boolean;
   /** Offline bookkeeping (M4): pause episodes and the cumulative time spent offline. */
   offline?: { episodes: number; streak: number; totalMs: number; pausedAt?: number };
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */

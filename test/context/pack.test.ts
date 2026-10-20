@@ -200,3 +200,11 @@ test('config v5: per-project settings are validated — keys are project keys, o
   assert.deepEqual({ ...normalizeProjects('nope') }, {});
 });
 
+
+test('C4-1: invisible/format characters (tags, variation selectors, soft hyphen, bidi) never reach a pack or a history line', () => {
+  const evil = `a­\u{E0041}️‮b`;
+  const p = buildPack({ ...base, consumer: 'builder', board: { milestones: [], cards: [{ key: 'ENG-2', title: evil, lane: 'todo', user: true, kind: 'work' }], decisions: [], bugs: [] } });
+  assert.match(p.text, /ENG-2 "a b"|ENG-2 "a\s+b"/);
+  assert.ok(!/[­️‮]|\u{E0041}/u.test(p.text));
+  assert.equal(parseHistoryLine({ key: 'ENG-1', title: evil, status: 'ready', at: 1, mark: 'ready:1:1' })!.title, 'a b');
+});

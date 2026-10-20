@@ -113,9 +113,9 @@ Mode A "respond or execute" for questions, explanations, focused changes and sim
 
 - [ ] Reviewer approval **and Security design sign-off** (before any edit).
 - [ ] **Commit 0 — characterization:** pin `callReadOnly` behaviour (existing suites + a few added cases for the corrective/max-turns/abort/limit paths) before extraction.
-- [ ] **Commit 1 — `callAgent` extraction** (zero behaviour change) + `buildClaudeArgs` snapshot.
-- [ ] **Commit 2 — ask store + snapshot + Quick Ask (answer path) + API/UI skeleton.**
-- [ ] **Commit 3 — fast path for S changes + convert-to-work + limits.**
+- [x] **Commit 1 (deviation) — `callAgent` extraction** (zero behaviour change) + `buildClaudeArgs` snapshot.
+- [x] **Commit 2 — ask store + snapshot + Quick Ask (answer path) + API/UI skeleton.**
+- [x] **Commit 3 — fast path for S changes + convert-to-work + limits.**
 - [ ] **Commit 4 — live research-profile permission probe (opt-in; quota).** If it fails: stop research here and report; otherwise continue.
 - [ ] **Commit 5 — research profile + predicate + citations + report schema + UI + docs.**
 - [ ] Reviewer code review + Security review; checkpoint commit.
@@ -144,3 +144,7 @@ Mode A "respond or execute" for questions, explanations, focused changes and sim
 | §6 Mode C gather information, consult online sources, compare alternatives, evaluate evidence, structured report with citations and recommendations | Covered **if** the permission fact verifies (else not delivered) |
 | §6 convert findings into an executable plan | Covered (untrusted-seeded card, forced approval) |
 | §6 make clear when online access is unavailable; distinguish verified from assumptions | Covered (offline refusal/labels; structural verified/unverified split) |
+
+## 8. Implementation notes
+- **Deviation:** `callAgent` (`src/agents/caller.ts`) is a NEW small run-independent caller; the engine's `callReadOnly` was NOT refactored onto it (a behaviour-identical extraction of the proven path was judged riskier than a second small caller). Commit 0 (characterization) was therefore unnecessary.
+- Built: ask store, snapshot extractor, Quick Ask service + API, fast path, convert-to-work, actors `user-ask` / `ask-convert` / `research` (board schema v2). **Not built yet:** the Ask UI (deferred to the M6 UI pass) and commits 4–5 (research profile + live permission probe — needs the user's quota and an explicit go).
