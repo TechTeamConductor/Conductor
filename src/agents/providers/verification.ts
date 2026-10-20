@@ -21,3 +21,13 @@ export function buildBaseline(id: ProviderId): BuildBaseline | undefined {
 export function isBuildIsolationVerified(id: ProviderId): boolean {
   return buildBaseline(id)?.grandfathered === true;
 }
+
+/** The read-only isolation tier each provider ships with (code constants; a later commit adds the add-only canary result for Codex). */
+export type ReadOnlyTier = 'verified' | 'partial' | 'unverified' | 'blocked';
+const TIERS: Readonly<Partial<Record<ProviderId, ReadOnlyTier>>> = Object.freeze({
+  claude: 'verified', // fail-closed init predicate on every run
+  cursor: 'partial', // `--mode ask`: a knowingly weaker, accepted tier
+});
+export function readOnlyTier(id: ProviderId): ReadOnlyTier {
+  return Object.hasOwn(TIERS, id) ? TIERS[id]! : 'unverified';
+}

@@ -8,6 +8,8 @@ import { CorruptFileError } from './schema/errors.ts';
 import { assertNotNewer, loadVersioned, quarantine, type VersionSpec } from './schema/version.ts';
 import { backupPaths } from './schema/backup.ts';
 import { logger } from './log.ts';
+import { ROLES, cursorFollowsClaude, defaultRoles, firstReadOnlyProvider, normalizeRoles, type Roles } from './agents/roles.ts';
+import type { ProviderId } from './agents/providers/types.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
@@ -16,28 +18,45 @@ export function migrateConfigV2ToV3(raw: any): any {
   const { linear, ...rest } = raw ?? {};
   return linear === undefined ? rest : { ...rest, legacy: { ...(rest.legacy ?? {}), linear } };
 }
-export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 3, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3 } };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'pipeline', 'worktreeRoot', 'extra', 'legacy']);
+/**
+ * v3 → v4 (M2): `stages{plan,review,verify}` + `pipeline.onClaudeLimit` become `roles` (planning/review/verification chains; the
+ * implementation/debugging/documentation roles keep Cursor, the rest Claude). The old keys are kept verbatim under `legacy.v3`.
+ * v1 files get v1's default upgrade first (`wait` was friction, not a choice → `cursor`), exactly as normalizeConfig always did.
+ */
+export function migrateConfigV3ToV4(raw: any): any {
+  const { stages, pipeline, ...rest } = raw ?? {};
+  const v1 = !(typeof raw?.version === 'number' && raw.version >= 2);
+  const { onClaudeLimit, ...pl } = pipeline && typeof pipeline === 'object' ? pipeline : ({} as Record<string, unknown>);
+  const takeover = (v1 && onClaudeLimit === 'wait') || onClaudeLimit !== 'wait';
+  const chain = (p: unknown): ProviderId[] => {
+    const first: ProviderId = p === 'cursor' ? 'cursor' : 'claude';
+    return first === 'claude' && takeover ? ['claude', 'cursor'] : [first];
+  };
+  const roles = rest.roles ?? { planning: { providers: chain(stages?.plan) }, review: { providers: chain(stages?.review) }, verification: { providers: chain(stages?.verify) } };
+  const legacy = stages !== undefined || onClaudeLimit !== undefined ? { ...(rest.legacy ?? {}), v3: { stages, onClaudeLimit } } : rest.legacy;
+  return { ...rest, ...(pipeline !== undefined ? { pipeline: pl } : {}), roles, ...(legacy !== undefined ? { legacy } : {}) };
+}
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 4, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4 } };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'pipeline', 'worktreeRoot', 'extra', 'legacy']);
 
 export function defaultConfig(): Config {
   return {
-    version: 3,
+    version: 4,
     ui: { port: 4327, openBrowser: true }, // v1 uses 4317: both can run side by side
     repos: [],
     agents: {
       claude: { bin: 'claude', isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } },
       cursor: { bin: 'agent' },
     },
-    stages: { plan: 'claude', review: 'claude', verify: 'claude' },
+    roles: defaultRoles(),
     pipeline: {
       maxParallel: 2,
       maxLoops: 3,
       maxAgentRunsPerIssue: 10,
       // Hands-off defaults: plans only wait for you when they are large or touch protected files; when Claude is
-      // rate-limited Cursor takes over the read-only stages instead of everything stalling until the reset.
+      // rate-limited Cursor takes over the read-only stages (the default planning/review/verification chains are claude → cursor).
       planApproval: 'auto',
       planReview: 'auto',
-      onClaudeLimit: 'cursor',
       failOn: ['blocker', 'major'],
       noGates: 'warn',
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
@@ -58,15 +77,15 @@ export function normalizeConfig(input: unknown): Config {
   const i = (input && typeof input === 'object' ? input : {}) as Partial<Config> & Record<string, any>;
   const ag = (i.agents ?? {}) as any;
   const pl = (i.pipeline ?? {}) as any;
-  const st = (i.stages ?? {}) as any;
   const to = (pl.timeoutsMin ?? {}) as any;
   // v1 → v2: the v1 defaults ('first' approval, 'wait' on limit, 10-min idle) were friction, not choices — upgrade them once.
   const v1 = !(typeof i.version === 'number' && i.version >= 2);
   if (v1 && pl.planApproval === 'first') pl.planApproval = 'auto';
-  if (v1 && pl.onClaudeLimit === 'wait') pl.onClaudeLimit = 'cursor';
+  // a config that still has the v3 `stages` / `onClaudeLimit` keys (or no roles yet) gets its roles derived from them (idempotent)
+  const withRoles = i.roles === undefined && (i.stages !== undefined || pl.onClaudeLimit !== undefined) ? migrateConfigV3ToV4(i) : i;
   if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 3,
+    version: 4,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
@@ -88,18 +107,13 @@ export function normalizeConfig(input: unknown): Config {
         model: typeof ag.cursor?.model === 'string' && ag.cursor.model ? ag.cursor.model : undefined,
       },
     },
-    stages: {
-      plan: oneOf(st.plan, ['claude', 'cursor'] as const, 'claude'),
-      review: oneOf(st.review, ['claude', 'cursor'] as const, 'claude'),
-      verify: oneOf(st.verify, ['claude', 'cursor'] as const, 'claude'),
-    },
+    roles: normalizeRoles((withRoles as any).roles, (m) => log.warn(`config roles: ${m}`)),
     pipeline: {
       maxParallel: clamp(pl.maxParallel, 1, 6, d.pipeline.maxParallel),
       maxLoops: clamp(pl.maxLoops, 1, 8, d.pipeline.maxLoops),
       maxAgentRunsPerIssue: clamp(pl.maxAgentRunsPerIssue, 2, 60, d.pipeline.maxAgentRunsPerIssue),
       planApproval: oneOf(pl.planApproval, ['auto', 'manual', 'first'] as const, d.pipeline.planApproval),
       planReview: oneOf(pl.planReview, ['off', 'auto', 'always'] as const, d.pipeline.planReview),
-      onClaudeLimit: oneOf(pl.onClaudeLimit, ['wait', 'cursor'] as const, d.pipeline.onClaudeLimit),
       failOn: Array.isArray(pl.failOn) && pl.failOn.length
         ? (pl.failOn.filter((s: unknown) => ['blocker', 'major', 'minor', 'nit'].includes(String(s))) as Config['pipeline']['failOn'])
         : d.pipeline.failOn,
@@ -123,7 +137,8 @@ export function normalizeConfig(input: unknown): Config {
   if (Object.keys(extra).length) cfg.extra = { ...extra };
   // the old `linear` block (a config that skipped the migration) and any `legacy` content are carried verbatim, never interpreted
   const legacy: Record<string, unknown> = Object.create(null);
-  if (i.legacy && typeof i.legacy === 'object' && !Array.isArray(i.legacy)) for (const [k, v] of Object.entries(i.legacy as Record<string, unknown>)) if (!BAD.has(k)) legacy[k] = v;
+  const legacySrc = (withRoles as any).legacy;
+  if (legacySrc && typeof legacySrc === 'object' && !Array.isArray(legacySrc)) for (const [k, v] of Object.entries(legacySrc as Record<string, unknown>)) if (!BAD.has(k)) legacy[k] = v;
   if ((i as any).linear !== undefined && legacy.linear === undefined) legacy.linear = (i as any).linear;
   if (Object.keys(legacy).length) cfg.legacy = { ...legacy };
   if (!cfg.pipeline.failOn.length) cfg.pipeline.failOn = d.pipeline.failOn;
@@ -189,29 +204,61 @@ export function toSettings(cfg: Config): Settings {
     planReview: cfg.pipeline.planReview,
     maxLoops: cfg.pipeline.maxLoops,
     maxParallel: cfg.pipeline.maxParallel,
-    onClaudeLimit: cfg.pipeline.onClaudeLimit,
+    // compat layer (the dashboard still speaks stages/onClaudeLimit): derived from roles
+    onClaudeLimit: cursorFollowsClaude(cfg.roles.planning.providers) ? 'cursor' : 'wait',
     noGates: cfg.pipeline.noGates,
-    stages: { ...cfg.stages },
+    stages: {
+      plan: firstReadOnlyProvider(cfg.roles.planning.providers),
+      review: firstReadOnlyProvider(cfg.roles.review.providers),
+      verify: firstReadOnlyProvider(cfg.roles.verification.providers),
+    },
   };
+}
+
+const isReadOnlyChoice = (x: unknown): x is 'claude' | 'cursor' => x === 'claude' || x === 'cursor';
+
+/**
+ * Map the dashboard's `stages.*` value back onto a chain: ONLY the first claude|cursor slot changes; every other entry (e.g. a
+ * Codex entry) stays where it is. Duplicates are removed afterwards (the first occurrence wins).
+ */
+function setFirstReadOnlySlot(chain: readonly ProviderId[], to: 'claude' | 'cursor'): ProviderId[] {
+  const i = chain.findIndex((p) => p === 'claude' || p === 'cursor');
+  const next = [...chain];
+  if (i < 0) next.unshift(to);
+  else next[i] = to;
+  return next.filter((p, k) => next.indexOf(p) === k);
+}
+/** `onClaudeLimit: 'cursor'` ⇒ a Cursor follows Claude (appended when missing); `'wait'` ⇒ no Cursor follows a Claude. Other entries are untouched. */
+function setCursorFallback(chain: readonly ProviderId[], on: boolean): ProviderId[] {
+  const c = chain.indexOf('claude');
+  if (c < 0) return [...chain];
+  if (on) return cursorFollowsClaude(chain) ? [...chain] : [...chain.filter((p) => p !== 'cursor'), 'cursor'];
+  return chain.filter((p, k) => !(p === 'cursor' && k > c));
 }
 
 /** Apply a (partial, untrusted) settings patch; unknown keys are ignored; values are clamped. */
 export function applySettings(cfg: Config, patch: Partial<Settings>): Config {
   const next = deepClone(cfg);
-  const merged = normalizeConfig({
+  const roles: Roles = next.roles;
+  const st = patch.stages && typeof patch.stages === 'object' ? (patch.stages as Record<string, unknown>) : {};
+  if (isReadOnlyChoice(st.plan)) roles.planning.providers = setFirstReadOnlySlot(roles.planning.providers, st.plan);
+  if (isReadOnlyChoice(st.review)) roles.review.providers = setFirstReadOnlySlot(roles.review.providers, st.review);
+  if (isReadOnlyChoice(st.verify)) roles.verification.providers = setFirstReadOnlySlot(roles.verification.providers, st.verify);
+  if (patch.onClaudeLimit === 'cursor' || patch.onClaudeLimit === 'wait') {
+    for (const r of ['planning', 'review', 'verification'] as const) roles[r].providers = setCursorFallback(roles[r].providers, patch.onClaudeLimit === 'cursor');
+  }
+  return normalizeConfig({
     ...next,
+    roles,
     pipeline: {
       ...next.pipeline,
       ...(patch.planApproval !== undefined ? { planApproval: patch.planApproval } : {}),
       ...(patch.planReview !== undefined ? { planReview: patch.planReview } : {}),
       ...(patch.maxLoops !== undefined ? { maxLoops: patch.maxLoops } : {}),
       ...(patch.maxParallel !== undefined ? { maxParallel: patch.maxParallel } : {}),
-      ...(patch.onClaudeLimit !== undefined ? { onClaudeLimit: patch.onClaudeLimit } : {}),
       ...(patch.noGates !== undefined ? { noGates: patch.noGates } : {}),
     },
-    stages: { ...next.stages, ...(patch.stages ?? {}) },
   });
-  return merged;
 }
 
 // ───────────── executable resolution (launchd has a minimal PATH) ─────────────

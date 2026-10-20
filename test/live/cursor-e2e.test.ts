@@ -16,7 +16,7 @@ test('LIVE real Cursor: plan → build → verify on a tiny repo; diff is exactl
     repoFiles,
     config: (c) => {
       c.agents.cursor.bin = 'agent';
-      c.stages = { plan: 'cursor', review: 'cursor', verify: 'cursor' };
+      for (const r of ['planning', 'review', 'verification'] as const) c.roles[r].providers = ['cursor'];
       c.pipeline.planReview = 'off';
       c.pipeline.timeoutsMin = { plan: 8, review: 5, build: 15, verify: 8, idle: 5, gate: 3 };
     },

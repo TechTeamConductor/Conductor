@@ -7,7 +7,7 @@ import { git, makeHarness, TestClock, type Harness } from './helpers/harness.ts'
 import { comments, laneOf, stageOf } from './helpers/util.ts';
 import { Effects } from '../src/pipeline/effects.ts';
 import { looksSecret, redact } from '../src/redact.ts';
-import { defaultConfig, normalizeConfig } from '../src/config.ts';
+import { defaultConfig, normalizeConfig, toSettings } from '../src/config.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(h: Harness, fn: () => boolean, ms = 20_000): Promise<void> {
@@ -314,12 +314,14 @@ test('m6: a builder that commits by itself is accepted (not reported as "no chan
 // ───────────── config migration ─────────────
 test('config: an old v1 config gets the hands-off defaults once; explicit v2 choices are kept', () => {
   const old = normalizeConfig({ version: 1, pipeline: { planApproval: 'first', onClaudeLimit: 'wait', timeoutsMin: { idle: 10 } } });
-  assert.equal(old.version, 3);
+  assert.equal(old.version, 4);
   assert.equal(old.pipeline.planApproval, 'auto');
-  assert.equal(old.pipeline.onClaudeLimit, 'cursor');
+  assert.deepEqual(old.roles.planning.providers, ['claude', 'cursor'], 'v1 `wait` was upgraded to Cursor taking over read-only stages');
+  assert.equal(toSettings(old).onClaudeLimit, 'cursor');
   assert.equal(old.pipeline.timeoutsMin.idle, 15);
   const chosen = normalizeConfig({ version: 2, pipeline: { planApproval: 'first', onClaudeLimit: 'wait' } });
   assert.equal(chosen.pipeline.planApproval, 'first', 'a v2 choice is respected');
-  assert.equal(chosen.pipeline.onClaudeLimit, 'wait');
-  assert.equal(normalizeConfig(defaultConfig()).version, 3);
+  assert.deepEqual(chosen.roles.planning.providers, ['claude'], 'a v2 `wait` is respected');
+  assert.equal(toSettings(chosen).onClaudeLimit, 'wait');
+  assert.equal(normalizeConfig(defaultConfig()).version, 4);
 });

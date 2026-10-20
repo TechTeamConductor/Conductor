@@ -1,16 +1,19 @@
-import type { AgentName, AgentResult, Config, StageName } from '../types.ts';
+import type { AgentResult, Config, LimitInfo, StageName } from '../types.ts';
 import { resolveBin } from '../config.ts';
 import type { Clock } from '../util.ts';
 import { systemClock } from '../util.ts';
 import { claudeEnv, cursorEnv } from './env.ts';
 import { describeSchema, type Schema } from './json.ts';
-import { runClaude, type EmitEvent } from './claude.ts';
-import { runCursor } from './cursor.ts';
+import type { EmitEvent } from './claude.ts';
 import { runProcess } from './spawn.ts';
-import { createProviders } from './providers/registry.ts';
+import { createProviders, providerLabel } from './providers/registry.ts';
 import type { Provider, ProviderId } from './providers/types.ts';
+import type { Complexity, Role } from './roles.ts';
+import { advances, route, type States } from './routing.ts';
 
 export interface ReadOnlyReq {
+  /** Which job this is — the router resolves the provider chain from the configured roles. */
+  role: Role;
   stage: Extract<StageName, 'plan' | 'plan_review' | 'verify'>;
   cwd: string;
   prompt: string;
@@ -19,12 +22,16 @@ export interface ReadOnlyReq {
   onEvent: (ev: EmitEvent) => void;
   signal?: AbortSignal;
   secrets?: string[];
-  /** Force a specific agent (otherwise from config.stages). */
-  agent?: AgentName;
   /** Multiply the Claude --max-turns cap (retry after error_max_turns). */
   maxTurnsFactor?: number;
+  /** Plan complexity once known (drives `autoByComplexity`, post-plan roles only). */
+  complexity?: Complexity;
+  /** Provider health/pause/capability snapshot (the engine builds it). */
+  states: States;
+  /** Called when a candidate hits a usage limit — even when the chain advances — so the engine records the pause. */
+  onLimit?: (info: LimitInfo) => void;
 }
-export type AgentOutcome = AgentResult & { agent: AgentName; fellBack?: boolean };
+export type AgentOutcome = AgentResult & { agent: ProviderId; fellBack?: boolean };
 
 /** Appended to read-only prompts: works for every provider, and is the Claude fallback when structured_output is absent. */
 export function jsonInstruction(schema: Schema): string {
@@ -58,7 +65,7 @@ export class Agents {
   }
 
   /** `<bin> --version`, cached per binary. */
-  cliVersion(agent: AgentName): Promise<string> {
+  cliVersion(agent: ProviderId): Promise<string> {
     const cfg = this.getConfig();
     const bin = resolveBin(agent === 'claude' ? cfg.agents.claude.bin : cfg.agents.cursor.bin);
     if (!bin) return Promise.resolve('not found');
@@ -77,41 +84,41 @@ export class Agents {
     return p;
   }
 
+  /**
+   * One read-only stage: resolve the provider chain for the role (pure routing), run the first candidate and advance ONLY on
+   * limit / spawn / auth errors (never on an isolation failure), with a visible note at every hop.
+   */
   async readOnly(req: ReadOnlyReq): Promise<AgentOutcome> {
     const cfg = this.getConfig();
-    const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
-    const agent: AgentName = req.agent ?? cfg.stages[key];
-    const hardMin = req.stage === 'plan' ? cfg.pipeline.timeoutsMin.plan : req.stage === 'plan_review' ? cfg.pipeline.timeoutsMin.review : cfg.pipeline.timeoutsMin.verify;
     const prompt = req.prompt + '\n' + jsonInstruction(req.schema);
-
-    const runOn = async (which: AgentName): Promise<AgentResult> => {
-      if (which === 'claude') {
-        const bin = resolveBin(cfg.agents.claude.bin);
-        if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn', error: `Claude CLI "${cfg.agents.claude.bin}" not found. Install Claude Code or set agents.claude.bin.` };
-        const baseTurns = key === 'plan' ? cfg.agents.claude.maxTurns.plan : key === 'review' ? cfg.agents.claude.maxTurns.review : cfg.agents.claude.maxTurns.verify;
-        const maxTurns = Math.round(baseTurns * (req.maxTurnsFactor ?? 1));
-        return runClaude({
-          bin, cwd: req.cwd, prompt, stage: req.stage, name: req.name, schema: req.schema,
-          maxTurns, isolation: cfg.agents.claude.isolation, model: cfg.agents.claude.model,
-          env: claudeEnv(this.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(hardMin),
-          signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: this.clock,
-        });
-      }
-      const bin = resolveBin(cfg.agents.cursor.bin);
-      if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn', error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.` };
-      return runCursor({
-        bin, cwd: req.cwd, prompt, stage: req.stage, name: req.name, schema: req.schema, mode: 'ask',
-        model: cfg.agents.cursor.model, env: cursorEnv(this.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(hardMin),
-        signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: this.clock,
-      });
-    };
-
-    const first = await runOn(agent);
-    if (!first.ok && first.errorKind === 'limit' && agent === 'claude' && cfg.pipeline.onClaudeLimit === 'cursor') {
-      req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: 'Claude usage limit reached — falling back to Cursor (read-only) for this stage.' });
-      const second = await runOn('cursor');
-      return { ...second, agent: 'cursor', fellBack: true };
+    const head: ProviderId = cfg.roles[req.role].providers[0] ?? 'claude';
+    const r = route({ role: req.role, complexity: req.complexity, roles: cfg.roles, states: req.states, now: this.clock.now(), label: providerLabel });
+    if (!r.ok) {
+      const none = { text: '', exitCode: null, agent: head } as const;
+      if (r.kind === 'paused') return { ok: false, ...none, agent: r.provider, errorKind: 'limit', error: r.reason, limit: { provider: r.provider, resetsAt: r.pauseUntil, message: r.reason } };
+      return { ok: false, ...none, errorKind: 'spawn', error: r.reason };
     }
-    return { ...first, agent };
+    for (let i = 0; i < r.candidates.length; i++) {
+      const cand = r.candidates[i]!;
+      const provider = this.providers[cand.id];
+      if (i === 0 && cand.id !== head) {
+        const why = r.skipped.find((s) => s.id === head)?.why ?? `${providerLabel(head)} is unavailable`;
+        req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: `${why} — ${provider.label} is doing this read-only step${tierNote(cand.tier)}.` });
+      }
+      const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor });
+      const last = i === r.candidates.length - 1;
+      if (res.ok || last || !advances(res.errorKind)) return { ...res, agent: cand.id, fellBack: i > 0 || cand.id !== head };
+      if (res.errorKind === 'limit') req.onLimit?.(res.limit ?? { provider: cand.id, resetsAt: null, message: res.error ?? 'limit' });
+      const next = this.providers[r.candidates[i + 1]!.id];
+      const what = res.errorKind === 'limit' ? 'usage limit reached' : res.errorKind === 'auth' ? 'is not signed in' : 'could not start';
+      req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: `${provider.label} ${what} — falling back to ${next.label} (read-only${tierNote(r.candidates[i + 1]!.tier)}) for this stage.` });
+    }
+    /* unreachable: the loop always returns on the last candidate */
+    return { ok: false, text: '', exitCode: null, errorKind: 'spawn', error: 'no provider ran', agent: head };
   }
+}
+
+/** A visible reminder when the stage runs on a provider with a weaker read-only isolation than Claude's fail-closed lock-down. */
+function tierNote(tier: string): string {
+  return tier === 'partial' ? ' — ask mode, without Claude\'s tool lock-down' : tier === 'unverified' ? ' — isolation not verified' : '';
 }

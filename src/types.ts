@@ -4,7 +4,9 @@
  */
 
 // ───────────────────────────── primitives ─────────────────────────────
-export type AgentName = 'claude' | 'cursor';
+import type { ProviderId } from './agents/providers/types.ts';
+import type { Roles } from './agents/roles.ts';
+export type { ProviderId };
 export type StageName = 'plan' | 'plan_review' | 'build' | 'verify';
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit';
 export type Complexity = 'S' | 'M' | 'L';
@@ -129,7 +131,7 @@ export type LogKind = 'system' | 'text' | 'thinking' | 'tool' | 'tool_result' | 
 export interface LogEvent {
   seq: number; // per-run monotonically increasing
   ts: number;
-  agent: AgentName | 'conductor';
+  agent: ProviderId | 'conductor';
   stage: StageName | 'setup' | 'engine';
   kind: LogKind;
   text?: string; // redacted, truncated
@@ -141,7 +143,7 @@ export interface LogEvent {
 // ───────────────────────────── run record ─────────────────────────────
 export interface SessionRec {
   id: string; // agent session id (uuid) — used for resume commands
-  agent: AgentName;
+  agent: ProviderId;
   stage: StageName;
   loop: number;
   rev: number;
@@ -265,14 +267,14 @@ export interface Config {
     };
     cursor: { bin: string; model?: string };
   };
-  stages: { plan: AgentName; review: AgentName; verify: AgentName }; // build is always cursor
+  /** Roles → ordered provider chains (config v4). Replaces v3's `stages` + `pipeline.onClaudeLimit`, which are derived for the dashboard (see Settings). */
+  roles: Roles;
   pipeline: {
     maxParallel: number;
     maxLoops: number;
     maxAgentRunsPerIssue: number;
     planApproval: 'auto' | 'manual' | 'first'; // 'first' = manual for the first plan per repo
     planReview: 'off' | 'auto' | 'always'; // 'auto' = only complexity M/L
-    onClaudeLimit: 'wait' | 'cursor';
     failOn: Severity[];
     noGates: 'warn' | 'block';
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
@@ -285,14 +287,16 @@ export interface Settings {
   planReview: Config['pipeline']['planReview'];
   maxLoops: number;
   maxParallel: number;
-  onClaudeLimit: Config['pipeline']['onClaudeLimit'];
+  /** Derived from `roles` (compat layer): 'cursor' iff Cursor follows Claude in the planning chain. */
+  onClaudeLimit: 'wait' | 'cursor';
   noGates: Config['pipeline']['noGates'];
-  stages: Config['stages'];
+  /** Derived from `roles`: the first claude|cursor provider of the planning / review / verification chains. */
+  stages: { plan: 'claude' | 'cursor'; review: 'claude' | 'cursor'; verify: 'claude' | 'cursor' };
 }
 
 // ───────────────────────────── agents ─────────────────────────────
 export interface LimitInfo {
-  provider: AgentName;
+  provider: ProviderId;
   resetsAt: number | null; // epoch ms; null = unknown (use backoff)
   kind?: string; // 'seven_day' | 'five_hour' | 'unknown'
   message: string;
@@ -308,7 +312,7 @@ export interface AgentResult {
   turns?: number;
   exitCode: number | null;
   error?: string;
-  errorKind?: 'limit' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse';
+  errorKind?: 'limit' | 'auth' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse';
   limit?: LimitInfo;
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
 }
@@ -332,7 +336,7 @@ export interface ApiRunSummary {
   next: NextStep;
   /** Human sentence, e.g. "Claude is planning · 2m 14s". */
   activity: string;
-  agent: AgentName | null; // who is working right now
+  agent: ProviderId | null; // who is working right now
   loop: number;
   maxLoops: number;
   rev: number;
@@ -406,7 +410,7 @@ export interface ApiEngine {
   storageProblem?: string | null;
   paused: boolean;
   pauseReason?: string;
-  providerPause: Partial<Record<AgentName, { until: number; reason: string }>>;
+  providerPause: Partial<Record<ProviderId, { until: number; reason: string }>>;
   running: number;
   maxParallel: number;
   /** Last time the engine looked at the board. */

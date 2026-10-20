@@ -2,6 +2,8 @@
 import type { AgentResult, Config } from '../../types.ts';
 import type { EmitEvent } from '../claude.ts';
 import type { Clock } from '../../util.ts';
+import type { Schema } from '../json.ts';
+import type { StageName } from '../../types.ts';
 
 /** Registry-driven: add a provider by adding a registry entry; nothing else names providers in a ternary. */
 export type ProviderId = 'claude' | 'cursor';
@@ -14,6 +16,20 @@ export interface ProviderDeps {
   clock: Clock;
   /** Test/embedding hook: extra env merged UNDER the envelope's env (providerEnv < extraEnv < envelope env). */
   extraEnv: Record<string, string>;
+}
+
+export interface ReadOnlyRunReq {
+  stage: Extract<StageName, 'plan' | 'plan_review' | 'verify'>;
+  cwd: string;
+  /** Already carries the JSON-output instruction. */
+  prompt: string;
+  schema: Schema;
+  name: string;
+  onEvent: (ev: EmitEvent) => void;
+  signal?: AbortSignal;
+  secrets?: string[];
+  /** Multiplies the turn cap (retry after error_max_turns). */
+  maxTurnsFactor?: number;
 }
 
 export interface BuildRunReq {
@@ -59,5 +75,7 @@ export interface Provider {
   id: ProviderId;
   /** From PROVIDER_LABEL — used by the commit trailer, failure notes and the UI. */
   label: string;
+  /** Read-only structured run. Its presence IS the `readOnly` capability. */
+  runReadOnly?(req: ReadOnlyRunReq): Promise<AgentResult>;
   build?: BuildCapability;
 }

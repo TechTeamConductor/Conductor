@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
-  AgentName, AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, NextStep, Plan,
+  AgentResult, Bug, BugRec, GateComparison, GateDef, GateResult, GateRun, LimitInfo, NextStep, Plan,
   PlanReview, RepoConfig, Run, SessionRec, StageName, Verdict,
 } from '../types.ts';
 import type { EmitEvent } from '../agents/claude.ts';
@@ -22,17 +22,16 @@ import { Effects } from './effects.ts';
 import { postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
+import { route } from '../agents/routing.ts';
 import type { PipelineCtx } from './context.ts';
 import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
 
 const log = logger('stages');
-/** Until roles/routing (M2 commit 2) the implementation role is always Cursor — the only provider with a verified build isolation. */
-const BUILD_PROVIDER: ProviderId = 'cursor';
 const PROTECTED = '.claude/**, .cursor/**, .mcp.json, AGENTS.md, CLAUDE.md, GEMINI.md, .github/**, .husky/**, .git*, .techteam/**, .conductor/**';
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
-type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: AgentName } | { kind: 'stop' };
+type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop' };
 
 export function normalizeTitle(s: string): string {
   return s.toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N} ]/gu, '').trim();
@@ -126,6 +125,13 @@ export class Stages {
     this.c.notify(`${key} needs you`, truncate(reason, 160));
   }
 
+  /** A candidate hit a usage limit but the chain moved on: remember the pause so later stages skip that provider until it resets. */
+  recordLimitPause(limit: LimitInfo): void {
+    const now = this.c.clock.now();
+    const until = limit.resetsAt && limit.resetsAt > now ? limit.resetsAt : now + 15 * 60_000;
+    this.c.providerPause(limit.provider, until, limit.message);
+  }
+
   /**
    * Pause (never fail) on a provider usage limit. With a known reset time we wait for it; with an unknown one
    * (Cursor) we back off 15 m → 30 m → 1 h → 2 h → 4 h → 6 h. One board comment and one notification per limit
@@ -138,7 +144,7 @@ export class Stages {
     const episode = streak === 1 ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
     if (episode > 6) {
       // M12: a run that keeps getting rejected (or a provider that keeps faking limits) must not stall silently forever
-      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} plan limits, then move it to To do to retry.`, before.next);
+      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${providerLabel(limit.provider)} plan limits, then move it to To do to retry.`, before.next);
     }
     const known = !!limit.resetsAt && limit.resetsAt > now;
     const backoffMin = Math.min(360, 15 * 2 ** (streak - 1));
@@ -157,7 +163,7 @@ export class Stages {
       await this.c.effects.comment(
         key,
         `pause:ep${episode}`,
-        `🤖 **Paused — ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} usage limit reached.** Conductor will resume automatically${known ? ` after ${new Date(until).toLocaleString()}` : ' (it retries with growing gaps until the limit lifts)'}. Nothing is lost.`,
+        `🤖 **Paused — ${providerLabel(limit.provider)} usage limit reached.** Conductor will resume automatically${known ? ` after ${new Date(until).toLocaleString()}` : ' (it retries with growing gaps until the limit lifts)'}. Nothing is lost.`,
       );
       this.c.notify('Usage limit reached', `${limit.provider} — Conductor resumes automatically`);
     }
@@ -237,10 +243,11 @@ export class Stages {
         r.agentRuns += 1;
       });
       const cfg = this.c.cfg();
-      const stageCfg = stage === 'plan' ? cfg.stages.plan : stage === 'plan_review' ? cfg.stages.review : cfg.stages.verify;
-      const forced: AgentName | undefined = stageCfg === 'claude' && this.c.pausedUntil('claude') && cfg.pipeline.onClaudeLimit === 'cursor' ? 'cursor' : undefined;
-      if (forced && attempt === 0) this.note(key, stage, 'Claude is rate-limited, so Cursor is doing this read-only step (ask mode — it does not have Claude\'s tool lock-down).');
       const res = await this.c.agents.readOnly({
+        role: stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification',
+        complexity: run.complexity,
+        states: this.c.routeStates(),
+        onLimit: (info) => this.recordLimitPause(info),
         stage,
         cwd,
         prompt: prompt + corrective,
@@ -249,7 +256,6 @@ export class Stages {
         onEvent: this.emitter(key, stage, run.loop, run.rev),
         signal: this.c.signal(key),
         secrets: this.c.secretsFor(run),
-        agent: forced,
         maxTurnsFactor: turnsFactor,
       });
       this.finishSession(key, res);
@@ -617,7 +623,15 @@ export class Stages {
     }
     // Everything that makes a builder safe (eligibility, provider guard, no-push env, git-meta restore, guard check, commit guard,
     // branch scans) is the envelope's job; the stage only records facts and routes the outcome.
-    const builder = this.c.agents.provider(BUILD_PROVIDER);
+    const role = isFix ? 'debugging' : 'implementation';
+    const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: this.c.routeStates(), now: this.c.clock.now(), label: providerLabel });
+    if (!rt.ok) {
+      // nothing may build this card: either every eligible provider is at a limit (wait, v1 semantics) or none is eligible (zero spawns, a human decides)
+      this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
+      if (rt.kind === 'paused') return this.pauseForLimit(key, { provider: rt.provider, resetsAt: rt.pauseUntil, message: rt.reason });
+      return this.toNeedsHuman(key, rt.reason, 'build');
+    }
+    const builder = this.c.agents.provider(rt.candidates[0]!.id);
     const out = await runBuild({
       provider: builder,
       repoPath: repo.path,

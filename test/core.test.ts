@@ -23,19 +23,22 @@ const seed = { key: 'ENG-1', itemId: 'i1', title: 'T', description: 'D', descHas
 test('config: defaults are safe; hostile/garbage input is clamped, never trusted', () => {
   const d = defaultConfig();
   assert.equal((d as any).linear, undefined, 'config v3 has no Linear section');
-  assert.equal(d.version, 3);
+  assert.equal(d.version, 4);
   assert.equal(d.pipeline.planApproval, 'auto', 'hands-off by default');
-  assert.equal(d.pipeline.onClaudeLimit, 'cursor', 'a rate-limited Claude must not stall the pipeline');
+  assert.equal(toSettings(d).onClaudeLimit, 'cursor', 'a rate-limited Claude must not stall the pipeline (derived from the claude → cursor planning chain)');
+  assert.deepEqual(d.roles.planning.providers, ['claude', 'cursor']);
   const n = normalizeConfig({ ui: { port: 3 }, linear: { pollSeconds: 1, mode: 'weird' }, pipeline: { maxParallel: 999, maxLoops: -4, planApproval: 'sometimes', failOn: ['nope'] }, repos: [{ name: '../evil', path: 'relative' }, { name: 'ok', path: '/abs' }], stages: { plan: 'gpt' } });
   assert.equal(n.ui.port, 1024);
   assert.equal((n as any).linear, undefined);
-  assert.deepEqual(n.legacy, { linear: { pollSeconds: 1, mode: 'weird' } }, 'an un-migrated Linear block is carried verbatim under legacy, never interpreted');
+  assert.deepEqual((n.legacy as any).linear, { pollSeconds: 1, mode: 'weird' }, 'an un-migrated Linear block is carried verbatim under legacy, never interpreted');
+  assert.deepEqual((n.legacy as any).v3.stages, { plan: 'gpt' }, 'the old v3 `stages` value is kept verbatim under legacy.v3 (and never interpreted: an unknown provider falls back to the default chain)');
   assert.equal(n.pipeline.maxParallel, 6);
   assert.equal(n.pipeline.maxLoops, 1);
   assert.equal(n.pipeline.planApproval, 'auto');
   assert.deepEqual(n.pipeline.failOn, ['blocker', 'major']);
   assert.deepEqual(n.repos.map((r) => r.name), ['ok']);
-  assert.equal(n.stages.plan, 'claude');
+  assert.equal(toSettings(n).stages.plan, 'claude');
+  assert.deepEqual(n.roles, defaultConfig().roles, 'garbage in ⇒ default roles out');
   assert.deepEqual(normalizeConfig(null).repos, []);
 });
 test('config: applySettings only touches whitelisted settings', () => {

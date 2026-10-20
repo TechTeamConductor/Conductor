@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeHarness, TestClock } from './helpers/harness.ts';
 import { comments } from './helpers/util.ts';
+import { applySettings } from '../src/config.ts';
 
 test('Claude usage limit pauses (does not fail), comments once, notifies, and auto-resumes after the reset', async () => {
   const clock = new TestClock();
-  const h = await makeHarness({ clock, config: (c) => void (c.pipeline.onClaudeLimit = 'wait') });
+  const h = await makeHarness({ clock, config: (c) => void (c.roles = applySettings(c, { onClaudeLimit: 'wait' }).roles) });
   try {
     const resetsAt = Math.floor(clock.now() / 1000) + 2 * 3600;
     h.scenario({ claude: { '*': { plan: [{ limit: { resetsAt } }, {}] } } });
@@ -37,7 +38,7 @@ test('Claude usage limit pauses (does not fail), comments once, notifies, and au
 
 test('onClaudeLimit=cursor falls back to a read-only Cursor stage', async () => {
   const clock = new TestClock();
-  const h = await makeHarness({ clock, config: (c) => void (c.pipeline.onClaudeLimit = 'cursor') });
+  const h = await makeHarness({ clock, config: (c) => void (c.roles = applySettings(c, { onClaudeLimit: 'cursor' }).roles) });
   try {
     h.scenario({ claude: { '*': { plan: [{ limit: {} }], verify: [{ limit: {} }] } } });
     const key = h.issue('Fallback feature');

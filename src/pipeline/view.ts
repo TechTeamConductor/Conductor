@@ -1,5 +1,6 @@
+import { providerLabel } from '../agents/providers/registry.ts';
 import type {
-  AgentName, ApiRunDetail, ApiRunSummary, ApiSession, BoardColumn, Config, GateComparison, GateRun, Plan, PlanReview, Run, SessionRec, Verdict,
+  ProviderId, ApiRunDetail, ApiRunSummary, ApiSession, BoardColumn, Config, GateComparison, GateRun, Plan, PlanReview, Run, SessionRec, Verdict,
 } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { fmtDuration, isUuid, shellQuote, truncate } from '../util.ts';
@@ -25,25 +26,24 @@ export function columnOf(run: Run): BoardColumn {
   }
 }
 
-export function workingAgent(run: Run, cfg: Config): AgentName | null {
+export function workingAgent(run: Run, cfg: Config): ProviderId | null {
   if (run.status !== 'running') return null;
   const live = [...run.sessions].reverse().find((s) => s.status === 'running');
   if (live) return live.agent;
   switch (run.next) {
     case 'plan':
-      return cfg.stages.plan;
+      return cfg.roles.planning.providers[0] ?? null;
     case 'plan_review':
-      return cfg.stages.review;
+      return cfg.roles.review.providers[0] ?? null;
     case 'verify':
-      return cfg.stages.verify;
+      return cfg.roles.verification.providers[0] ?? null;
     case 'build':
-      return 'cursor';
+      return cfg.roles[run.loop > 1 || run.bugs.some((b) => b.status === 'open') ? 'debugging' : 'implementation'].providers[0] ?? null;
     default:
       return null;
   }
 }
 
-const AGENT_NAME: Record<AgentName, string> = { claude: 'Claude', cursor: 'Cursor' };
 const STAGE_VERB: Record<string, string> = { plan: 'planning', plan_review: 'reviewing the plan', build: 'building', verify: 'verifying' };
 
 export function activityOf(run: Run, cfg: Config, now: number): string {
@@ -54,7 +54,7 @@ export function activityOf(run: Run, cfg: Config, now: number): string {
     case 'running': {
       const a = workingAgent(run, cfg);
       const stage = run.stage ?? 'plan';
-      return a ? `${AGENT_NAME[a]} is ${STAGE_VERB[stage] ?? stage}${since}` : `Preparing the workspace${since}`;
+      return a ? `${providerLabel(a)} is ${STAGE_VERB[stage] ?? stage}${since}` : `Preparing the workspace${since}`;
     }
     case 'awaiting_approval':
       return 'Plan ready — waiting for your approval';

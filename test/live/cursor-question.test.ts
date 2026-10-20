@@ -11,7 +11,7 @@ test('LIVE real Cursor: "what does this project export?" → answered in Linear,
     repoFiles: { 'src/math.mjs': 'export const add = (a, b) => a + b;\nexport const mul = (a, b) => a * b;\n' },
     config: (c) => {
       c.agents.cursor.bin = 'agent';
-      c.stages = { plan: 'cursor', review: 'cursor', verify: 'cursor' };
+      for (const r of ['planning', 'review', 'verification'] as const) c.roles[r].providers = ['cursor'];
       c.pipeline.timeoutsMin = { plan: 8, review: 5, build: 15, verify: 8, idle: 5, gate: 3 };
     },
   });

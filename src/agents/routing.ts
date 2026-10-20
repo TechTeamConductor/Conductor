@@ -34,7 +34,7 @@ export interface Skipped {
 export type Route =
   | { ok: true; candidates: Candidate[]; skipped: Skipped[]; usedComplexityPick: ProviderId | null }
   /** `paused`: every eligible provider is at a usage limit ⇒ wait (v1 semantics). `ineligible`: nothing may run this role ⇒ zero spawns. */
-  | { ok: false; kind: 'paused'; reason: string; pauseUntil: number; skipped: Skipped[] }
+  | { ok: false; kind: 'paused'; reason: string; pauseUntil: number; provider: ProviderId; skipped: Skipped[] }
   | { ok: false; kind: 'ineligible'; reason: string; skipped: Skipped[] };
 
 /** Roles whose complexity-based pick applies: only stages that run AFTER the plan (and so its complexity) exists. */
@@ -110,8 +110,8 @@ export function route(input: { role: Role; complexity?: Complexity; roles: Roles
 
   // nothing healthy: every eligible provider is limited ⇒ wait (v1); otherwise let the first eligible one run and report its own precise error
   if (sick.every((s) => s.paused !== null)) {
-    const pauseUntil = Math.min(...sick.map((s) => s.paused as number));
-    return { ok: false, kind: 'paused', reason: sick.map((s) => `${label(s.id)} ${s.why}`).join('; '), pauseUntil, skipped };
+    const soonest = sick.reduce((a, b) => ((b.paused as number) < (a.paused as number) ? b : a));
+    return { ok: false, kind: 'paused', reason: sick.map((s) => `${label(s.id)} ${s.why}`).join('; '), pauseUntil: soonest.paused as number, provider: soonest.id, skipped };
   }
   const first = sick.find((s) => s.paused === null)!;
   return { ok: true, candidates: [{ id: first.id, tier: states[first.id].tier }], skipped, usedComplexityPick: pick };

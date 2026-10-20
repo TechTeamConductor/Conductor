@@ -371,8 +371,8 @@ test('E20: static — only the Cursor adapter starts a Cursor run, and only the 
   };
   walk(ROOT);
   const runCursorUsers = files.filter((f) => /\brunCursor\(/.test(readF(f, 'utf8'))).map((f) => relative(ROOT, f)).sort();
-  assert.deepEqual(runCursorUsers, ['agents/cursor.ts', 'agents/provider.ts', 'agents/providers/cursor.ts', 'doctor.ts'], 'runCursor( may appear only in its definition, the two read-only (ask-mode) callers and the Cursor adapter');
-  for (const f of ['agents/provider.ts', 'doctor.ts']) assert.doesNotMatch(readF(join(ROOT, f), 'utf8'), /mode:\s*'build'/, `${f} must never start a Cursor build`);
+  assert.deepEqual(runCursorUsers, ['agents/cursor.ts', 'agents/providers/cursor.ts', 'doctor.ts'], 'runCursor( may appear only in its definition, the doctor probe (ask mode) and the Cursor adapter');
+  for (const f of ['doctor.ts']) assert.doesNotMatch(readF(join(ROOT, f), 'utf8'), /mode:\s*'build'/, `${f} must never start a Cursor build`);
   const buildRunUsers = files.filter((f) => /\bb\.run\(|\.build(\?|!)?\.run\(/.test(readF(f, 'utf8'))).map((f) => relative(ROOT, f)).sort();
   assert.deepEqual(buildRunUsers, ['pipeline/envelope.ts'], 'build.run is called by the envelope only');
   assert.equal(providerLabel('cursor'), 'Cursor');

@@ -102,11 +102,12 @@ test('config: a v1-shaped file loads, is upgraded in memory, original is backed 
   raw.someFutureFeature = { enabled: true, n: [1, 2] };
   writeFileSync(paths.config(), JSON.stringify(raw));
   const cfg = loadConfig();
-  assert.equal(cfg.version, 3);
+  assert.equal(cfg.version, 4);
   assert.equal(cfg.pipeline.planApproval, 'auto', 'v1 default upgraded');
   assert.equal((cfg.legacy as any).linear.teamKey, 'ENG', 'the v1 Linear block was moved aside, verbatim');
   assert.equal((cfg as any).linear, undefined);
-  assert.equal(cfg.pipeline.onClaudeLimit, 'cursor');
+  assert.deepEqual(cfg.roles.planning.providers, ['claude', 'cursor']);
+  assert.equal((cfg.legacy as any).v3.onClaudeLimit, 'wait', 'the old v1 key is kept verbatim under legacy.v3');
   assert.deepEqual(cfg.extra, { someFutureFeature: { enabled: true, n: [1, 2] } });
   assert.equal(readdirSync(backups).length, 0, 'loading never writes or backs up');
   saveConfig(cfg);
@@ -114,7 +115,7 @@ test('config: a v1-shaped file loads, is upgraded in memory, original is backed 
   const saved = JSON.parse(readFileSync(paths.config(), 'utf8'));
   assert.deepEqual(saved.someFutureFeature, { enabled: true, n: [1, 2] }, 'unknown key preserved verbatim');
   assert.equal(saved.extra, undefined, 'extra is flattened back to top-level keys');
-  assert.equal(saved.version, 3);
+  assert.equal(saved.version, 4);
   assert.equal(saved.linear, undefined);
   assert.equal(saved.legacy.linear.teamKey, 'ENG');
   const dirs = readdirSync(backups);

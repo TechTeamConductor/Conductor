@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { AgentName, Config } from './types.ts';
+import type { ProviderId, Config } from './types.ts';
 import { defaultConfig, normalizeConfig } from './config.ts';
 import { ensureHome } from './paths.ts';
 import { Agents } from './agents/provider.ts';
@@ -111,5 +111,5 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
       board.close();
     },
   };
-  void port; void dirname; void (null as unknown as AgentName);
+  void port; void dirname; void (null as unknown as ProviderId);
 }

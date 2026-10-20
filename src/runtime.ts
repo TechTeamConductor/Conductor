@@ -68,8 +68,13 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     serverRef?.toast('info', `${t}: ${m}`);
   };
   const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [] });
+  // The last CLI health the dashboard computed (the router reads it: a provider that is not installed / not signed in is skipped, visibly).
+  // Older than 5 minutes it counts as unknown — a stale "not logged in" must never keep a provider out after the user signed in.
+  let lastHealth: { at: number; value: { claude: any; cursor: any } } | null = null;
+  engine.setHealthSource(() => (lastHealth && Date.now() - lastHealth.at < 5 * 60_000 ? lastHealth.value : null));
   const health = async () => {
     const base = opts.health ? await opts.health() : { claude: await agentHealth(getConfig(), 'claude'), cursor: await agentHealth(getConfig(), 'cursor') };
+    lastHealth = { at: Date.now(), value: { claude: base.claude, cursor: base.cursor } };
     const warnings: string[] = [];
     if (!opts.health) {
       for (const c of await runChecks(getConfig())) if (c.level === 'warn' && c.id !== 'repos' && c.id !== 'keychain') warnings.push(`${c.label}: ${c.detail}`);

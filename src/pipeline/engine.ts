@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import type { AgentName, Config, NextStep, RepoConfig, Run } from '../types.ts';
+import type { ProviderId, Config, NextStep, RepoConfig, Run } from '../types.ts';
 import type { RunStore } from '../store.ts';
 import { newRun } from '../store.ts';
 import type { PersistentState } from '../config.ts';
@@ -18,9 +18,15 @@ import { laneForRun } from '../board/lanes.ts';
 import { Effects } from './effects.ts';
 import type { PipelineCtx } from './context.ts';
 import { Stages } from './stages.ts';
+import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers/registry.ts';
+import { readOnlyTier } from '../agents/providers/verification.ts';
+import { route, type ProviderState, type States } from '../agents/routing.ts';
+import { resolveBin } from '../config.ts';
+import type { Role } from '../agents/roles.ts';
 
 const log = logger('engine');
 const TERMINAL = new Set(['finished', 'aborted']);
+const PAUSE_CEILING_MS = 24 * 60 * 60_000;
 /** Lanes a human may set (Conductor owns active / needs_you / review). */
 export const HUMAN_MOVES = ['backlog', 'todo', 'done', 'canceled'] as const;
 export type HumanMove = (typeof HUMAN_MOVES)[number];
@@ -64,7 +70,7 @@ export class Engine {
   private stages: Stages;
   readonly effects: Effects;
   private jobs = new Map<string, Job>();
-  private pauses = new Map<AgentName, { until: number; reason: string }>();
+  private pauses = new Map<ProviderId, { until: number; reason: string }>();
   private globalPaused = false;
   private pauseReason: string | undefined;
   private lastPollAt: number | null = null;
@@ -74,11 +80,12 @@ export class Engine {
   private tickAgain = false;
   private stopped = true;
   private failCounts = new Map<string, number>();
-  private quotaMap = new Map<AgentName, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
+  private quotaMap = new Map<ProviderId, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
+  private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean }> | null | undefined>) | null = null;
 
   constructor(deps: EngineDeps) {
     this.d = deps;
@@ -105,8 +112,10 @@ export class Engine {
       signal: (key) => this.jobs.get(key)?.ac.signal ?? new AbortController().signal,
       emit: (key, ev) => this.emit(key, ev),
       hist: (key, text) => this.d.store.update(key, (r) => void r.history.push({ ts: this.clock.now(), text })),
+      routeStates: () => this.routeStates(),
       providerPause: (agent, until, reason) => {
-        this.pauses.set(agent, { until, reason });
+        // a pause derived from a CLI limit message is capped at 24 h (a hostile or buggy message cannot park a provider for months); a human can resume any time
+        this.pauses.set(agent, { until: Math.min(until, this.clock.now() + PAUSE_CEILING_MS), reason });
         this.changed();
       },
       pausedUntil: (agent) => this.activePause(agent),
@@ -124,7 +133,31 @@ export class Engine {
     this.d.store.appendEvent(key, { ...ev, text });
   }
 
-  private activePause(agent: AgentName): { until: number; reason: string } | null {
+  /** Last known CLI health (the dashboard's cache). Without it every provider is assumed installed and auth unknown; spawn errors still name the real problem. */
+  setHealthSource(fn: () => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean }> | null | undefined>): void {
+    this.healthSource = fn;
+  }
+
+  /** The router's view of every provider: capabilities derived from code, tier, CLI-reported health/auth, CLI-reported pauses. */
+  routeStates(): States {
+    const cfg = this.d.getConfig();
+    const health = this.healthSource?.() ?? {};
+    const out = {} as Record<ProviderId, ProviderState>;
+    for (const id of PROVIDER_IDS) {
+      const bin = (cfg.agents as Record<string, { bin: string } | undefined>)[id]?.bin;
+      const h = Object.hasOwn(health, id) ? health[id] : undefined;
+      out[id] = {
+        caps: capabilitiesOf(this.d.agents.provider(id)),
+        tier: readOnlyTier(id),
+        installed: (bin ? resolveBin(bin) !== null : true) && h?.found !== false,
+        auth: h?.loggedIn === false ? 'not-logged-in' : h?.loggedIn === true ? 'ok' : 'unknown',
+        pausedUntil: this.activePause(id)?.until ?? null,
+      };
+    }
+    return out;
+  }
+
+  private activePause(agent: ProviderId): { until: number; reason: string } | null {
     const p = this.pauses.get(agent);
     if (!p) return null;
     if (p.until <= this.clock.now()) {
@@ -454,30 +487,27 @@ export class Engine {
   }
 
   // ───────────────────────── scheduling ─────────────────────────
-  private providerFor(next: NextStep): AgentName | null {
-    const s = this.d.getConfig().stages;
-    switch (next) {
+  private roleFor(run: Run): Role | null {
+    switch (run.next) {
       case 'plan':
-        return s.plan;
+        return 'planning';
       case 'plan_review':
-        return s.review;
+        return 'review';
       case 'verify':
-        return s.verify;
+        return 'verification';
       case 'build':
-        return 'cursor';
+        return run.loop > 1 || run.bugs.some((b) => b.status === 'open') ? 'debugging' : 'implementation';
       default:
         return null;
     }
   }
 
+  /** The run waits only when EVERY provider that may take its next step is at a usage limit (v1 semantics, now chain-aware). */
   private blockedByPause(run: Run): { until: number } | null {
-    const cfg = this.d.getConfig();
-    const p = this.providerFor(run.next);
-    if (!p) return null;
-    const pause = this.activePause(p);
-    if (!pause) return null;
-    if (p === 'claude' && cfg.pipeline.onClaudeLimit === 'cursor') return null; // will fall back to Cursor
-    return { until: pause.until };
+    const role = this.roleFor(run);
+    if (!role) return null;
+    const r = route({ role, complexity: run.complexity, roles: this.d.getConfig().roles, states: this.routeStates(), now: this.clock.now(), label: providerLabel });
+    return !r.ok && r.kind === 'paused' ? { until: r.pauseUntil } : null;
   }
 
   schedule(): void {
@@ -675,7 +705,7 @@ export class Engine {
     const run = this.d.store.get(key);
     if (!run) throw new EngineError('missing', 'Unknown run.');
     if (run.status === 'paused') {
-      for (const a of ['claude', 'cursor'] as AgentName[]) this.pauses.delete(a);
+      this.pauses.clear();
       this.d.store.update(key, (r) => {
         r.status = 'queued';
         r.pausedUntil = undefined;
@@ -747,8 +777,8 @@ export class Engine {
   // ───────────────────────── introspection ─────────────────────────
   status() {
     const now = this.clock.now();
-    const pp: Partial<Record<AgentName, { until: number; reason: string }>> = {};
-    for (const a of ['claude', 'cursor'] as AgentName[]) {
+    const pp: Partial<Record<ProviderId, { until: number; reason: string }>> = {};
+    for (const a of PROVIDER_IDS) {
       const p = this.activePause(a);
       if (p) pp[a] = p;
     }
