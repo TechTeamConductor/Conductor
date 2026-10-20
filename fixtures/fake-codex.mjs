@@ -34,9 +34,11 @@ if (argv[0] === '--version') {
   console.log(v === 'old' ? 'codex-cli 0.100.0' : 'codex-cli 0.128.0');
   process.exit(0);
 }
+// the credential lives in $CODEX_HOME/auth.json: a CLI that has none is not signed in (an explicit scenario `login` still wins)
+const signedIn = () => existsSync(join(process.env.CODEX_HOME ?? '/nonexistent', 'auth.json'));
 if (argv[0] === 'login' && argv[1] === 'status') {
   log({ cmd: 'login-status' });
-  if ((sc.login ?? 'ok') === 'ok') {
+  if ((sc.login ?? (signedIn() ? 'ok' : 'out')) === 'ok') {
     console.log('Logged in using ChatGPT');
     process.exit(0);
   }
@@ -50,6 +52,12 @@ if (argv[0] !== 'exec') {
 
 let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
+if (!signedIn()) {
+  // a real CLI cannot reach the model without a credential: this is what made an unauthenticated canary control impossible to pass
+  log({ cmd: 'exec-unauthenticated' });
+  out({ type: 'turn.failed', error: { message: 'Not logged in. Run `codex login`.' } });
+  process.exit(1);
+}
 const val = (n) => {
   const i = argv.indexOf(n);
   return i >= 0 ? argv[i + 1] : undefined;

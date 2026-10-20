@@ -218,8 +218,13 @@ test('demo scenarios: the bug-fix loop and the blocked question both surface', a
   const runs = async () => JSON.parse((await raw('/api/state', { headers: authed() })).text).runs as any[];
   const blocked = await waitFor(async () => (await runs()).find((r) => r.key === 'DEMO-3' && r.status === 'needs_human'), 40_000);
   assert.match(blocked.needsHuman.reason, /SQLite or Postgres/);
-  // DEMO-2 has a plan-approval gate only for the first plan (DEMO-1 consumed it) → it runs, fails verification once, fixes, passes
-  const two = await waitFor(async () => (await runs()).find((r) => r.key === 'DEMO-2' && r.status === 'ready'), 60_000);
+  // DEMO-2 runs, fails verification once, fixes, passes. Whether it waits for plan approval depends on whether DEMO-1's approval was already
+  // counted when DEMO-2's plan finished (they plan in parallel) — so the test approves it if it is waiting instead of relying on timing.
+  const two = await waitFor(async () => {
+    const r = (await runs()).find((x) => x.key === 'DEMO-2');
+    if (r?.canApprove) await raw('/api/runs/DEMO-2/approve', { method: 'POST', headers: mut(), body: JSON.stringify({ rev: r.rev }) });
+    return r && r.status === 'ready' ? r : null;
+  }, 60_000);
   assert.equal(two.loop, 2);
 });
 

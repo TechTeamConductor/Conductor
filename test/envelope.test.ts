@@ -332,7 +332,7 @@ test('E17b: the registry is sealed — production code cannot edit a provider, a
   assert.ok(Object.isFrozen(frozen) && Object.isFrozen(frozen.cursor) && Object.isFrozen(frozen.cursor.build));
   assert.throws(() => { (frozen.cursor.build as any).guard = false; }, TypeError);
   assert.throws(() => { (frozen.cursor as any).label = 'x'; }, TypeError);
-  const impostor = { id: 'cursor' as const, label: 'Cursor', build: { guard: true, envAllow: [], prepare: async () => ({ guardSha: 'a', envOnly: false }), verifyGuard: async () => ({ ok: true, detail: '' }), run: async () => ({ ok: true, text: '', exitCode: 0 }) } };
+  const impostor = { ...frozen.claude, id: 'cursor' as const, label: 'Cursor', build: { guard: true, envAllow: [], prepare: async () => ({ guardSha: 'a', envOnly: false }), verifyGuard: async () => ({ ok: true, detail: '' }), run: async () => ({ ok: true, text: '', exitCode: 0 }) } };
   const r = buildEligibility(impostor);
   assert.equal(r.ok, false);
   assert.match(r.ok ? '' : r.why, /not from the registry/);
@@ -396,7 +396,7 @@ test('E18: `prepare` cannot override the git no-push env or HOME/PATH/CODEX_HOME
 
 test('E19: eligibility is derived and re-asserted inside the envelope — no build function, or unverified isolation ⇒ held with zero spawns', async () => {
   // derived from code, never from config
-  assert.equal(capabilitiesOf({ id: 'claude', label: 'Claude' }).build, false);
+  assert.equal(capabilitiesOf({ id: 'claude', label: 'Claude' } as any).build, false);
   assert.equal(isBuildIsolationVerified('claude'), false);
   assert.equal(isBuildIsolationVerified('cursor'), true);
   const reg = createProviders({ getConfig: () => defaultConfig(), clock: { now: () => 0 } as any, extraEnv: {} });

@@ -17,7 +17,9 @@ import { extractJson, type Schema } from '../json.ts';
 import { runProcess, type SpawnResult } from '../spawn.ts';
 import type { EmitEvent } from '../claude.ts';
 import { CODEX_CONFIG_TOML, makeScratchHome, prepareCodexHome, scratchTmp, withCodexHomeLock, codexHomePath } from './codex-home.ts';
-import { PROVIDER_LABEL, type Provider, type ProviderDeps, type ReadOnlyRunReq } from './types.ts';
+import { PROVIDER_LABEL, type AuthResult, type DetectResult, type Provider, type ProviderDeps, type ReadOnlyRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
+import { BROKEN_RE, cheapSelfTest } from './probe.ts';
+import type { Config } from '../../types.ts';
 
 /** The oldest Codex CLI this adapter was written against (the version the author's machine has). Older ⇒ the adapter reports `unverified` and the canary refuses. */
 export const CODEX_MIN_VERSION = '0.128.0';
@@ -37,13 +39,14 @@ export function versionAtLeast(found: string, min: string): boolean {
 export interface CodexArgvOpts {
   /** Validated by CODEX_MODEL_RE; anything else is ignored. */
   model?: string;
-  schemaFile?: string;
   outFile: string;
 }
 /**
  * The ONLY way a Codex command line is built. No user-, repo- or config-derived string except the validated model name.
  * Absent on purpose (a test asserts it): the bypass/yolo/full-auto flags, --add-dir, --search, --profile, any other sandbox mode,
- * `--skip-git-repo-check` (only the canary's scratch directory may use it).
+ * `--skip-git-repo-check`, and `--output-schema`: Codex sends that schema as a strict structured-output format and Conductor's stage schemas
+ * (optional properties, no additionalProperties:false) are probably rejected by it — unverifiable without a real binary, so the JSON instruction in the
+ * prompt plus Conductor's own validate() carry the structure, and the first real run decides whether a strict schema is worth adding.
  */
 export function buildCodexArgs(o: CodexArgvOpts): string[] {
   const args = [
@@ -61,7 +64,6 @@ export function buildCodexArgs(o: CodexArgvOpts): string[] {
     '-c', 'shell_environment_policy.exclude=["CODEX_*","*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
   ];
   if (o.model && CODEX_MODEL_RE.test(o.model)) args.push(`--model=${o.model}`);
-  if (o.schemaFile) args.push('--output-schema', o.schemaFile);
   args.push('-o', o.outFile, '-'); // `-` = the prompt comes from stdin
   return args;
 }
@@ -164,7 +166,7 @@ export function normalizeCodexEvent(obj: unknown, ctx: { stage: StageName; secre
 const LIMIT_RE = /(usage|rate|spend)\s*limit|hit your (usage )?limit|quota (exceeded|reached)|exceeded (your|the) (plan|limit|usage|quota)|too many requests|out of (usage|credits)/i;
 const AUTH_RE = /not logged in|log ?in required|please (log ?in|sign in)|unauthori[sz]ed|authentication (failed|required)|invalid (api key|credentials)|401\b/i;
 
-export type CodexFailure = { kind: 'limit' | 'auth' | 'agent'; message: string };
+export type CodexFailure = { kind: 'limit' | 'auth' | 'agent' | 'spawn'; message: string };
 /**
  * Only AFTER a structural failure is established (non-zero exit, or a terminal turn.failed/error with no turn.completed) is any text consulted —
  * and then only the CLI-reported structured error messages (each capped at 500 chars), then stderr. A run that exited 0 with turn.completed is
@@ -174,6 +176,10 @@ export function classifyCodexFailure(fold: CodexFold, exitCode: number | null, s
   const nonZero = exitCode !== 0; // includes "killed by a signal" (null)
   if (!nonZero && fold.completed) return null; // success is never reclassified by prose
   if (!nonZero && fold.errors.length === 0) return null; // a quiet exit 0: not a failure (the parse step decides what the reply is worth)
+  // a launcher that cannot start its native program prints a shim error and no CLI events at all: that is a START failure (the chain advances),
+  // not an agent failure (which would retry once and then go to a human)
+  const noEvents = !fold.sessionId && fold.errors.length === 0 && fold.commands.length === 0 && fold.finalText === '';
+  if (nonZero && noEvents && BROKEN_RE.test(stderrTail)) return { kind: 'spawn', message: `Codex is installed but does not start: ${stderrTail.trim()}` };
   const probe = `${fold.errors.join('\n')}\n${truncate(stderrTail, 2000)}`;
   if (LIMIT_RE.test(probe)) return { kind: 'limit', message: probe.trim() };
   if (AUTH_RE.test(probe)) return { kind: 'auth', message: probe.trim() };
@@ -240,14 +246,9 @@ export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
     const tmp = scratchTmp();
     try {
       const outFile = join(tmp.dir, 'last-message.txt');
-      let schemaFile: string | undefined;
-      if (call.schema) {
-        schemaFile = join(tmp.dir, 'schema.json');
-        writeFileSync(schemaFile, JSON.stringify(call.schema), { mode: 0o600 });
-      }
       const { proc, fold } = await spawnCodex({
         bin: call.bin,
-        args: buildCodexArgs({ model: call.model, schemaFile, outFile }),
+        args: buildCodexArgs({ model: call.model, outFile }),
         cwd: call.cwd,
         env: codexEnv({ codexHome: home, home: scratchHome.dir }, call.extraEnv),
         prompt: call.prompt,
@@ -274,6 +275,7 @@ export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
       if (failure) {
         const msg = truncate(redact(failure.message, secrets), failure.kind === 'agent' ? 500 : 300);
         if (failure.kind === 'limit') return { ...base, errorKind: 'limit', error: msg, limit: { provider: 'codex', resetsAt: null, kind: 'unknown', message: msg } };
+        if (failure.kind === 'auth') return { ...base, errorKind: 'auth', error: `${msg} — Codex is not signed in to Conductor's private home. Run: CODEX_HOME=<your Conductor data folder>/providers/codex-home codex login` };
         return { ...base, errorKind: failure.kind, error: msg };
       }
       if (call.schema) {
@@ -295,7 +297,6 @@ export type CodexDetect =
   | { state: 'broken-install'; detail: string }
   | { state: 'ok'; version: string; belowMinimum: boolean };
 
-const BROKEN_RE = /cannot find module|native binary|enoent|vendor|no such file|not found|missing optional dependency/i;
 
 export async function detectCodex(bin: string, extraEnv: Record<string, string> = {}): Promise<CodexDetect> {
   const path = resolveBin(bin);
@@ -335,14 +336,33 @@ export async function codexAuth(bin: string, extraEnv: Record<string, string> = 
 
 const minutes = (n: number) => n * 60_000;
 
-export function codexProvider(d: ProviderDeps): Provider {
+export function codexProvider(d0: ProviderDeps): Provider {
+  const d = d0;
   return {
     id: 'codex',
     label: PROVIDER_LABEL.codex,
+    async detect(cfg: Config): Promise<DetectResult> {
+      const d = await detectCodex(cfg.agents.codex.bin, d0.extraEnv);
+      if (d.state === 'ok') return { state: 'ok', version: d.version, belowMinimum: d.belowMinimum };
+      return { state: d.state, detail: d.detail };
+    },
+    async auth(cfg: Config): Promise<AuthResult> {
+      const state = await codexAuth(cfg.agents.codex.bin, d0.extraEnv);
+      return { state, detail: state === 'ok' ? "Signed in (Conductor's private Codex home)" : state === 'not-logged-in' ? "Not signed in to Conductor's private Codex home." : 'Sign-in state unknown.' };
+    },
+    async selfTest(cfg: Config, level: SelfTestLevel): Promise<SelfTestResult> {
+      const d = await this.detect(cfg);
+      const a = d.state === 'ok' ? await this.auth(cfg) : null;
+      const cheap = cheapSelfTest(d, a);
+      if (level === 'cheap' || !cheap.ok) return { ...cheap, level };
+      const { runCodexCanary } = await import('./canary.ts'); // the isolation check (spends quota); loaded lazily — canary.ts imports this module
+      const rep = await runCodexCanary({ bin: cfg.agents.codex.bin, extraEnv: d0.extraEnv });
+      return { level, state: 'ok', ok: rep.verdict === 'pass', detail: `Isolation check: ${rep.verdict}` };
+    },
     async runReadOnly(req: ReadOnlyRunReq) {
       const cfg = d.getConfig();
       const bin = resolveBin(cfg.agents.codex.bin);
-      if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Codex CLI "${cfg.agents.codex.bin}" not found. Install it (npm i -g @openai/codex), then sign in with Conductor's private home — see the Providers panel.` };
+      if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Codex CLI "${cfg.agents.codex.bin}" not found. Install it (npm i -g @openai/codex), then sign in to Conductor's private home (see docs/TROUBLESHOOTING.md).` };
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
       return runCodexReadOnly({
         bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, schema: req.schema, model: cfg.agents.codex.model, extraEnv: d.extraEnv,

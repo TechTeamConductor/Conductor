@@ -11,6 +11,14 @@ if (argv.includes('--version')) {
   process.exit(0);
 }
 if (argv[0] === 'status' || argv[0] === 'whoami') {
+  let login = 'ok';
+  try {
+    login = JSON.parse(readFileSync(join(process.env.FAKE_DIR || '', 'scenario.json'), 'utf8')).login ?? 'ok';
+  } catch {}
+  if (login === 'out') {
+    console.log('Not logged in');
+    process.exit(1);
+  }
   console.log('✓ Logged in as fake@example.com');
   process.exit(0);
 }

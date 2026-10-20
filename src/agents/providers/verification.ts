@@ -55,7 +55,7 @@ export interface VerificationRecord {
   provider: ProviderId;
   kind: 'readOnly' | 'build';
   verdict: 'pass' | 'blocked' | 'inconclusive';
-  source: 'canary' | 'live-suite';
+  source: 'canary' | 'live-suite' | 'user-clear';
   suite?: string;
   suiteDigest?: string;
   binding: VerificationBinding;
@@ -74,7 +74,7 @@ function validBinding(b: unknown): b is VerificationBinding {
 function validRecord(id: ProviderId, r: unknown): r is VerificationRecord {
   const x = r as Record<string, unknown> | null;
   if (!x || typeof x !== 'object') return false;
-  return x.provider === id && (x.kind === 'readOnly' || x.kind === 'build') && (x.verdict === 'pass' || x.verdict === 'blocked' || x.verdict === 'inconclusive') && (x.source === 'canary' || x.source === 'live-suite') && validBinding(x.binding) && typeof x.at === 'number' && Number.isFinite(x.at);
+  return x.provider === id && (x.kind === 'readOnly' || x.kind === 'build') && (x.verdict === 'pass' || x.verdict === 'blocked' || x.verdict === 'inconclusive') && (x.source === 'canary' || x.source === 'live-suite' || x.source === 'user-clear') && validBinding(x.binding) && typeof x.at === 'number' && Number.isFinite(x.at);
 }
 
 /** Records for a provider; anything wrong with the file (type, owner, size, JSON, a bad entry) ⇒ no records at all. */
@@ -124,9 +124,9 @@ export function _setCanaryValidatedForTests(v: boolean): void {
 
 export function effectiveReadOnlyTier(id: ProviderId, current: VerificationBinding | null): ReadOnlyTier {
   const base = readOnlyTier(id);
-  const recs = loadRecords(id).filter((r) => r.kind === 'readOnly' && r.source === 'canary' && r.verdict !== 'inconclusive');
+  const recs = loadRecords(id).filter((r) => r.kind === 'readOnly' && ((r.source === 'canary' && r.verdict !== 'inconclusive') || r.source === 'user-clear'));
   const last = recs[recs.length - 1];
-  if (!last) return base;
+  if (!last || last.source === 'user-clear') return base; // a block the user deliberately cleared (`doctor --clear-block`) is gone; the code constant applies again
   if (last.verdict === 'blocked') return 'blocked';
   if (!current || !canaryValidatedAgainstRealCli) return base;
   const b = last.binding;

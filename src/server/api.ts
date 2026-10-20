@@ -91,7 +91,7 @@ function str(v: unknown, name: string, max: number, required = true): string {
 const PROVIDER_HINT: Record<ProviderId, string> = {
   claude: 'Install Claude Code from https://claude.com/claude-code, then run `claude` once to sign in.',
   cursor: 'Install the Cursor agent: curl https://cursor.com/install -fsS | bash — then run `agent login`.',
-  codex: 'Install Codex (npm i -g @openai/codex), then sign in with Conductor\'s private home: CODEX_HOME=~/.conductor-v2/providers/codex-home codex login — Conductor never runs either command for you.',
+  codex: 'Install Codex (npm i -g @openai/codex), then sign in with Conductor\'s private home: CODEX_HOME=~/.conductor-v2/providers/codex-home codex login — the credential is stored as a file in that folder, not in your OS keychain. Conductor never runs either command for you.',
 };
 /** Said once when a provider is first given a role: where the task text goes. */
 const EGRESS: Record<ProviderId, string> = {
@@ -198,7 +198,7 @@ export class Api {
     return PROVIDER_IDS.map((id) => {
       const h: AgentHealth | undefined = Object.hasOwn(health, id) ? (health as unknown as Record<string, AgentHealth>)[id] : undefined;
       const s: ProviderState = states[id];
-      const state: ApiProvider['state'] = !h ? 'ok' : h.state === 'broken-install' ? 'broken-install' : !h.found ? 'missing' : h.ok ? 'ok' : h.loggedIn === false ? 'not-logged-in' : 'attention';
+      const state: ApiProvider['state'] = !h ? 'ok' : h.state === 'broken-install' ? 'broken-install' : !h.found ? 'missing' : h.ok ? 'ok' : h.loggedIn === false ? 'not-logged-in' : 'unknown';
       return {
         id,
         label: providerLabel(id),
@@ -259,8 +259,9 @@ export class Api {
       if (!isPlain(raw)) throw new ApiFail(400, 'bad_request', `Role "${role}" must be an object.`);
       const entry: RoleConfig = { providers: [] };
       if (!Array.isArray(raw.providers) || raw.providers.length === 0 || raw.providers.length > 4) throw new ApiFail(400, 'bad_request', `Role "${role}" needs 1–4 providers.`);
-      const check = (id: unknown, what: string): ProviderId => {
+      const check = (id: unknown, what: string, unchanged = false): ProviderId => {
         if (!isProviderId(id)) throw new ApiFail(400, 'bad_request', `${what}: unknown provider.`);
+        if (unchanged) return id; // an entry that is already assigned is not re-judged (a GET→PUT round trip of the whole map must work); the router still refuses it at run time
         const v = validatePairing(role, id, states, providerLabel);
         if (!v.ok) throw new ApiFail(400, 'unsupported_pairing', v.reason);
         if (states[id].tier === 'unverified' && !cfg.roles[role].providers.includes(id) && !ack.has(id)) {
@@ -269,7 +270,7 @@ export class Api {
         return id;
       };
       for (const p of raw.providers) {
-        const id = check(p, `Role "${role}"`);
+        const id = check(p, `Role "${role}"`, isProviderId(p) && cfg.roles[role].providers.includes(p));
         if (!entry.providers.includes(id)) entry.providers.push(id);
       }
       if (raw.autoByComplexity !== undefined) {
@@ -277,7 +278,7 @@ export class Api {
         const picks: NonNullable<RoleConfig['autoByComplexity']> = {};
         for (const k of Object.keys(raw.autoByComplexity)) {
           if (!isComplexity(k)) throw new ApiFail(400, 'bad_request', `Role "${role}": complexity must be one of ${COMPLEXITIES.join(', ')}.`);
-          picks[k] = check(raw.autoByComplexity[k], `Role "${role}" (${k})`);
+          picks[k] = check(raw.autoByComplexity[k], `Role "${role}" (${k})`, cfg.roles[role].autoByComplexity?.[k] === raw.autoByComplexity[k]);
         }
         if (Object.keys(picks).length) entry.autoByComplexity = picks;
       }

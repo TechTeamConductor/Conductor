@@ -4,7 +4,9 @@ import { resolveBin } from '../../config.ts';
 import * as W from '../../git/worktree.ts';
 import { cursorEnv } from '../env.ts';
 import { runCursor } from '../cursor.ts';
-import { PROVIDER_LABEL, type BuildPrep, type BuildRunReq, type Provider, type ProviderDeps, type ReadOnlyRunReq } from './types.ts';
+import { PROVIDER_LABEL, type AuthResult, type BuildPrep, type BuildRunReq, type Provider, type ProviderDeps, type ReadOnlyRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
+import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
+import type { Config } from '../../types.ts';
 
 const minutes = (n: number) => n * 60_000;
 
@@ -14,6 +16,28 @@ export function cursorProvider(d: ProviderDeps): Provider {
   return {
     id: 'cursor',
     label: PROVIDER_LABEL.cursor,
+    async detect(cfg: Config) {
+      const bin = resolveBin(cfg.agents.cursor.bin);
+      if (!bin) return { state: 'missing' as const, detail: 'Cursor CLI not found. Install: curl https://cursor.com/install -fsS | bash — then run `agent login`.' };
+      return detectFromVersion(await cliOut(bin, ['--version'], cursorEnv(d.extraEnv)));
+    },
+    async auth(cfg: Config): Promise<AuthResult> {
+      const bin = resolveBin(cfg.agents.cursor.bin);
+      if (!bin) return { state: 'unknown' };
+      const a = await cliOut(bin, ['status'], cursorEnv(d.extraEnv));
+      if (a.spawnError) return { state: 'unknown', detail: a.spawnError };
+      if (/not logged/i.test(a.out)) return { state: 'not-logged-in', detail: 'Not signed in — run `agent login`.' };
+      if (/logged in/i.test(a.out)) return { state: 'ok', detail: a.out.split('\n')[0]!.replace(/^✓\s*/, '') };
+      return { state: 'unknown', detail: 'Could not read the sign-in state.' };
+    },
+    async selfTest(cfg: Config, level: SelfTestLevel): Promise<SelfTestResult> {
+      const d = await this.detect(cfg);
+      const a = d.state === 'ok' ? await this.auth(cfg) : null;
+      const cheap = cheapSelfTest(d, a);
+      if (level === 'cheap' || !cheap.ok) return { ...cheap, level };
+      const r = await this.runReadOnly!({ stage: 'plan', cwd: process.cwd(), prompt: 'Return the JSON object {"ok": true} in a fenced json block. Do not use tools.', schema: { type: 'object' }, name: 'conductor probe', onEvent: () => undefined });
+      return r.ok ? { level, state: 'ok', ok: true, detail: `Cursor answered (${r.model ?? 'model'})` } : { level, state: 'unknown', ok: false, detail: r.error ?? 'Cursor did not answer' };
+    },
     async runReadOnly(req: ReadOnlyRunReq) {
       const cfg = d.getConfig();
       const bin = resolveBin(cfg.agents.cursor.bin);

@@ -45,6 +45,16 @@ test('Settings compat layer: derived from roles; a PUT of the same values is a n
   assert.deepEqual(w.roles.implementation.providers, ['cursor']);
   assert.equal(toSettings(w).onClaudeLimit, 'wait');
   assert.deepEqual(applySettings(w, { onClaudeLimit: 'cursor' }).roles, c.roles, 'wait → cursor restores the default chains');
+  // Reviewer B5: a Cursor that leads the chain is never moved by an onClaudeLimit PUT
+  const lead = defaultConfig();
+  lead.roles.planning.providers = ['cursor', 'codex', 'claude'];
+  assert.deepEqual(applySettings(lead, { onClaudeLimit: 'cursor' }).roles.planning.providers, ['cursor', 'codex', 'claude'], 'the head stays Cursor');
+  assert.deepEqual(applySettings(lead, toSettings(lead)).roles.planning.providers, ['cursor', 'codex', 'claude'], 'a plain round trip is a no-op');
+  const mid = defaultConfig();
+  mid.roles.planning.providers = ['claude', 'codex'];
+  assert.deepEqual(applySettings(mid, { onClaudeLimit: 'cursor' }).roles.planning.providers, ['claude', 'codex', 'cursor']);
+  mid.roles.planning.providers = ['claude', 'codex', 'cursor'];
+  assert.deepEqual(applySettings(mid, { onClaudeLimit: 'wait' }).roles.planning.providers, ['claude', 'codex']);
   // garbage in a PUT is ignored, never trusted
   const g = applySettings(c, { stages: { plan: 'gpt' as any, review: 7 as any, verify: null as any }, onClaudeLimit: 'sometimes' as any });
   assert.deepEqual(g.roles, c.roles);
@@ -143,6 +153,46 @@ test('a provider pause derived from a limit message is capped at 24 hours', asyn
     const pp = h.engine.status().providerPause;
     assert.ok(pp.claude && pp.claude.until <= clock.now() + 24 * 3_600_000, 'a 90-day reset in a message becomes at most 24 h');
     assert.ok(key);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ───────────── Reviewer M2 blocker B4: engine-level routing tests ─────────────
+test('engine: plan complexity drives the router — an S plan is reviewed by the complexity pick, an M plan by the chain head', async () => {
+  const h = await makeHarness({ config: (c) => { c.roles.review = { providers: ['cursor', 'claude'], autoByComplexity: { S: 'claude' } }; c.pipeline.planReview = 'always'; } });
+  try {
+    h.scenario({ claude: { 'ENG-2': { plan: [{ json: { complexity: 'M' } }] } } });
+    const s = h.issue('Small change'); // ENG-1: the fake plans complexity S
+    const m = h.issue('Medium change'); // ENG-2: complexity M
+    await h.settle();
+    assert.equal(h.run(s).complexity, 'S');
+    assert.equal(h.run(m).complexity, 'M');
+    assert.equal(h.run(s).sessions.find((x) => x.stage === 'plan_review')?.agent, 'claude', 'S ⇒ the complexity pick (Claude) reviews although Cursor leads the chain');
+    assert.equal(h.run(m).sessions.find((x) => x.stage === 'plan_review')?.agent, 'cursor', 'M ⇒ no pick configured ⇒ the chain head (Cursor) reviews');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('engine: a usage limit on the first provider moves the stage to the second AND records the pause on the first (later stages skip it)', async () => {
+  const clock = new TestClock();
+  const h = await makeHarness({ clock, config: (c) => { c.roles.review = { providers: ['claude', 'cursor'] }; c.pipeline.planReview = 'always'; } });
+  try {
+    h.scenario({ claude: { '*': { plan_review: [{ limit: { resetsAt: Math.floor(clock.now() / 1000) + 3600 } }] } } });
+    const key = h.issue('Limit on the first provider');
+    await h.settle();
+    const run = h.run(key);
+    assert.equal(run.status, 'ready');
+    assert.equal(run.sessions.find((x) => x.stage === 'plan_review' && x.agent === 'cursor')?.status, 'ok', 'Cursor did the review');
+    assert.ok(h.engine.status().providerPause.claude, 'the pause is recorded on Claude although the stage succeeded on Cursor');
+    assert.ok((await comments(h, key)).some((t) => /Cursor did the plan review step instead of Claude/.test(t)), 'a durable board comment');
+    // the NEXT card does not even try Claude for review while it is paused
+    const callsBefore = h.calls().filter((c) => c.who === 'claude' && c.stage === 'plan_review').length;
+    const key2 = h.issue('Second card while Claude is paused');
+    await h.settle();
+    assert.equal(h.run(key2).status, 'ready');
+    assert.equal(h.calls().filter((c) => c.who === 'claude' && c.stage === 'plan_review').length, callsBefore, 'Claude was not asked to review again while paused');
   } finally {
     await h.cleanup();
   }

@@ -19,7 +19,7 @@ import { resolveBin } from '../../config.ts';
 import { sha256 } from '../../util.ts';
 import { codexEnv } from '../env.ts';
 import { CODEX_CONFIG_TOML, codexHomePath, makeScratchHome, prepareCodexHome, withCodexHomeLock } from './codex-home.ts';
-import { CODEX_MIN_VERSION, buildCodexArgs, detectCodex, spawnCodex, type CodexFold } from './codex.ts';
+import { CODEX_MIN_VERSION, buildCodexArgs, codexAuth, detectCodex, spawnCodex, type CodexFold } from './codex.ts';
 
 export const CANARY_VERSION = 1;
 
@@ -57,6 +57,8 @@ export interface CanaryEvidence {
 
 /** curl's own "could not connect" exits (resolve failure, refused, timeout, TLS, send/recv). 126/127 (not executable / not found) prove nothing. */
 const CURL_CONNECT_FAILURES: ReadonlySet<number> = new Set([6, 7, 28, 35, 52, 55, 56]);
+/** What a sandbox says when it refuses a write — anything else (command not found, no such directory …) proves nothing about the sandbox. */
+const WRITE_DENIED = /read-only file system|permission denied|operation not permitted|not permitted|EROFS|EACCES|sandbox|denied/i;
 /** `env` / `printenv` as a command OR anywhere inside a shell wrapper such as `/bin/zsh -lc 'env'`. */
 const ENV_CMD = /(^|[\s'";&|(])(env|printenv)(\s|$|['";&|)])/;
 export type ProbeResult = 'blocked' | 'executed' | 'not-attempted';
@@ -100,7 +102,8 @@ export function evaluateCanary(e: CanaryEvidence): { verdict: CanaryReport['verd
   const w = has(p.fold, `conductor-write-probe-${e.nonce}`);
   if (!p.ran || !w) add('sandbox-write', 'inconclusive', w ? 'The run did not complete.' : 'The agent never attempted the write, so the sandbox pin is unproven.');
   else if (p.writeFileExists) add('sandbox-write', 'fail', 'The read-only sandbox did not stop a write into the repository.');
-  else if (w.exitCode !== null && w.exitCode !== 0) add('sandbox-write', 'pass', 'An attempted write was denied and left no file.');
+  else if (w.exitCode !== null && w.exitCode !== 0 && WRITE_DENIED.test(w.output)) add('sandbox-write', 'pass', 'An attempted write was denied by the sandbox (read-only) and left no file.');
+  else if (w.exitCode !== null && w.exitCode !== 0) add('sandbox-write', 'inconclusive', 'The write failed, but not with a recognisable sandbox denial (missing shell? wrong directory?), so the sandbox pin is unproven.');
   else add('sandbox-write', 'inconclusive', 'The write command reported success but left no file.');
 
   const n = has(p.fold, `127.0.0.1:${e.port}`);
@@ -172,6 +175,8 @@ export async function runCodexCanary(o: { bin: string; extraEnv?: Record<string,
   const det = await detectCodex(o.bin, o.extraEnv);
   if (det.state !== 'ok') return inconclusive(det.state === 'missing' ? det.detail : `Codex is not working: ${det.detail}`);
   if (det.belowMinimum) return inconclusive(`Codex ${det.version} is older than the minimum this check was written for (${CODEX_MIN_VERSION}); it stays unverified.`);
+  const auth = await codexAuth(o.bin, o.extraEnv);
+  if (auth !== 'ok') return inconclusive(auth === 'not-logged-in' ? "Codex is not signed in to Conductor's private home, so the check cannot reach the model. Sign in first: CODEX_HOME=<Conductor data folder>/providers/codex-home codex login" : 'Codex sign-in could not be confirmed; nothing was run.');
   const binPath = resolveBin(o.bin);
   let binSha: string | null = null;
   try {

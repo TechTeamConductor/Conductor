@@ -2,7 +2,9 @@
 import { resolveBin } from '../../config.ts';
 import { claudeEnv } from '../env.ts';
 import { runClaude } from '../claude.ts';
-import { PROVIDER_LABEL, type Provider, type ProviderDeps, type ReadOnlyRunReq } from './types.ts';
+import { PROVIDER_LABEL, type AuthResult, type Provider, type ProviderDeps, type ReadOnlyRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
+import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
+import type { Config } from '../../types.ts';
 
 const minutes = (n: number) => n * 60_000;
 
@@ -10,6 +12,36 @@ export function claudeProvider(d: ProviderDeps): Provider {
   return {
     id: 'claude',
     label: PROVIDER_LABEL.claude,
+    async detect(cfg: Config) {
+      const bin = resolveBin(cfg.agents.claude.bin);
+      if (!bin) return { state: 'missing' as const, detail: 'Claude Code CLI not found. Install it from https://claude.com/claude-code, then run `claude` once to sign in.' };
+      return detectFromVersion(await cliOut(bin, ['--version'], claudeEnv(d.extraEnv)));
+    },
+    async auth(cfg: Config): Promise<AuthResult> {
+      const bin = resolveBin(cfg.agents.claude.bin);
+      if (!bin) return { state: 'unknown' };
+      const a = await cliOut(bin, ['auth', 'status'], claudeEnv(d.extraEnv));
+      if (a.spawnError) return { state: 'unknown', detail: a.spawnError };
+      try {
+        const j = JSON.parse(a.out.slice(a.out.indexOf('{')));
+        if (j.loggedIn === true) return { state: 'ok', detail: `Signed in as ${[j.email, j.orgName, j.subscriptionType ? `${j.subscriptionType} plan` : ''].filter(Boolean).join(' · ') || 'unknown account'}` };
+        if (j.loggedIn === false) return { state: 'not-logged-in', detail: 'Not signed in — run `claude auth login`.' };
+      } catch {
+        /* not JSON: fall through to the text reading */
+      }
+      if (/not logged/i.test(a.out)) return { state: 'not-logged-in', detail: 'Not signed in — run `claude auth login`.' };
+      if (/logged in/i.test(a.out)) return { state: 'ok', detail: 'Signed in' };
+      return { state: 'unknown', detail: 'Could not read the sign-in state.' };
+    },
+    async selfTest(cfg: Config, level: SelfTestLevel): Promise<SelfTestResult> {
+      const d = await this.detect(cfg);
+      const a = d.state === 'ok' ? await this.auth(cfg) : null;
+      const cheap = cheapSelfTest(d, a);
+      if (level === 'cheap' || !cheap.ok) return { ...cheap, level };
+      // canary = one tiny read-only call through the real adapter (spends a little quota; callers must have asked)
+      const r = await this.runReadOnly!({ stage: 'plan', cwd: process.cwd(), prompt: 'Return the JSON object {"ok": true} in a fenced json block. Do not use tools.', schema: { type: 'object' }, name: 'conductor probe', onEvent: () => undefined });
+      return r.ok ? { level, state: 'ok', ok: true, detail: `Claude answered (${r.model ?? 'model'})` } : { level, state: r.errorKind === 'limit' ? 'ok' : 'unknown', ok: false, detail: r.errorKind === 'limit' ? `Signed in but at its usage limit — ${r.limit?.message ?? r.error}` : (r.error ?? 'Claude did not answer') };
+    },
     async runReadOnly(req: ReadOnlyRunReq) {
       const cfg = d.getConfig();
       const bin = resolveBin(cfg.agents.claude.bin);

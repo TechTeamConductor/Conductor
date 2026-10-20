@@ -243,6 +243,7 @@ export class Stages {
         r.agentRuns += 1;
       });
       const cfg = this.c.cfg();
+      await this.c.freshHealth();
       const res = await this.c.agents.readOnly({
         role: stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification',
         complexity: run.complexity,
@@ -286,6 +287,7 @@ export class Stages {
           return { kind: 'stop' };
         case 'aborted':
           return { kind: 'stop' };
+        case 'auth': // not signed in: another attempt cannot help — say how to sign in (the message carries the exact command)
         case 'isolation':
         case 'spawn':
           await this.toNeedsHuman(key, res.error ?? 'agent could not start', run.next);
@@ -629,6 +631,7 @@ export class Stages {
     }
     // Everything that makes a builder safe (eligibility, provider guard, no-push env, git-meta restore, guard check, commit guard,
     // branch scans) is the envelope's job; the stage only records facts and routes the outcome.
+    await this.c.freshHealth();
     const role = isFix ? 'debugging' : 'implementation';
     const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: this.c.routeStates(), now: this.c.clock.now(), label: providerLabel });
     if (!rt.ok) {

@@ -333,7 +333,7 @@ export interface ApiProvider {
   id: ProviderId;
   label: string;
   /** What the CLI said (redacted, truncated). */
-  state: 'ok' | 'missing' | 'broken-install' | 'not-logged-in' | 'attention';
+  state: 'ok' | 'missing' | 'broken-install' | 'not-logged-in' | 'unknown';
   version?: string;
   detail?: string;
   /** A fixed instruction per provider — never CLI-originated text. Conductor never runs it. */

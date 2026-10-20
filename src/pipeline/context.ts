@@ -29,6 +29,8 @@ export interface PipelineCtx {
   pausedUntil(agent: ProviderId): { until: number; reason: string } | null;
   /** Provider capabilities + CLI-reported health + pauses, as the router wants them. */
   routeStates(): States;
+  /** Refresh the zero-quota provider health first if the last reading is missing/stale (so routing never relies on a dashboard having looked). */
+  freshHealth(): Promise<void>;
   /** Ask the engine to run another poll/schedule pass soon. */
   tickSoon(): void;
   /** Latest provider quota/utilisation reported by an agent run (for the dashboard meter). */

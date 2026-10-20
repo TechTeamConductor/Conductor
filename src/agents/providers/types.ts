@@ -73,10 +73,40 @@ export interface Capabilities {
   buildIsolationVerified: boolean;
 }
 
+export type DetectState = 'missing' | 'broken-install' | 'ok';
+/** Zero-quota: `--version` and nothing else. `broken-install` = the launcher exists but the program does not run. */
+export interface DetectResult {
+  state: DetectState;
+  version?: string;
+  /** What the CLI said, or why we think so — redacted/truncated by the caller before it is shown. */
+  detail?: string;
+  /** Older than what the adapter was written against: reported, the provider is treated as unverified. */
+  belowMinimum?: boolean;
+}
+export type AuthState = 'ok' | 'not-logged-in' | 'unknown';
+export interface AuthResult {
+  state: AuthState;
+  /** e.g. "Signed in as …" (CLI-reported text, redacted by the caller). */
+  detail?: string;
+}
+/** `cheap` never reaches a model; `canary` does (a tiny probe, or Codex's isolation check) and so spends quota ⇒ callers must ask first. */
+export type SelfTestLevel = 'cheap' | 'canary';
+export interface SelfTestResult {
+  level: SelfTestLevel;
+  /** missing | broken-install | not-logged-in | ok | unknown — one vocabulary for every provider. */
+  state: 'missing' | 'broken-install' | 'not-logged-in' | 'ok' | 'unknown';
+  ok: boolean;
+  detail: string;
+}
+
 export interface Provider {
   id: ProviderId;
   /** From PROVIDER_LABEL — used by the commit trailer, failure notes and the UI. */
   label: string;
+  /** One interface for every provider (zero quota): is it there, is it signed in, does a self-test pass. */
+  detect(cfg: Config): Promise<DetectResult>;
+  auth(cfg: Config): Promise<AuthResult>;
+  selfTest(cfg: Config, level: SelfTestLevel): Promise<SelfTestResult>;
   /** Read-only structured run. Its presence IS the `readOnly` capability. */
   runReadOnly?(req: ReadOnlyRunReq): Promise<AgentResult>;
   build?: BuildCapability;

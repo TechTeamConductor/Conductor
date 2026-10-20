@@ -1,16 +1,22 @@
 // The Codex isolation canary: evidence handling against a SIMULATED CLI (fixtures/fake-codex.mjs canary mode). This tests Conductor's logic —
 // positive controls, "attempted" rules, fail ⇒ blocked, ambiguity ⇒ inconclusive — NOT how the real Codex behaves (no working binary here).
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CANARY_VERSION, evaluateCanary, runCodexCanary, type CanaryEvidence } from '../../src/agents/providers/canary.ts';
 import { newCodexFold } from '../../src/agents/providers/codex.ts';
-import { CODEX_CONFIG_TOML, codexHomePath } from '../../src/agents/providers/codex-home.ts';
+import { CODEX_CONFIG_TOML, codexHomePath, prepareCodexHome } from '../../src/agents/providers/codex-home.ts';
 import { sha256 } from '../../src/util.ts';
 
 const FAKE = join(import.meta.dirname, '..', '..', 'fixtures', 'fake-codex.mjs');
+/** The fake CLI models authentication: it needs $CODEX_HOME/auth.json (the credential a `codex login` would have written there). */
+function signIn(): void {
+  prepareCodexHome();
+  writeFileSync(join(codexHomePath(), 'auth.json'), '{}', { mode: 0o600 });
+}
+beforeEach(() => signIn());
 chmodSync(FAKE, 0o755);
 
 function dirWith(scenario: unknown): string {
@@ -309,4 +315,51 @@ test('F-1 (simulated CLI): curl missing in the sandbox (127) ⇒ inconclusive; a
   assert.equal(outcome(missing.report, 'network'), 'inconclusive');
   const wrapped = await canary({ wrapCommands: true });
   assert.equal(wrapped.report.verdict, 'pass', JSON.stringify(wrapped.report.items.filter((i) => i.outcome !== 'pass' && i.outcome !== 'info')));
+});
+
+// ───────────── Reviewer M2 blocker B3 ─────────────
+test('B3: the control run is signed in (the private home\'s own credential) — and a canary on an install that is NOT signed in stops before any model call', async () => {
+  const ok = await canary({});
+  assert.equal(ok.report.verdict, 'pass');
+  assert.equal(calls(ok.d).filter((c) => c.cmd === 'exec-unauthenticated').length, 0, 'neither run was unauthenticated');
+  // now sign out: the home has no credential
+  rmSync(join(codexHomePath(), 'auth.json'), { force: true });
+  const d = dirWith({ version: 'ok', exec: [{ canary: {} }, { canary: {} }] });
+  const rep = await runCodexCanary({ bin: FAKE, extraEnv: { FAKE_DIR: d } });
+  assert.equal(rep.verdict, 'inconclusive');
+  assert.match(rep.items[0]!.detail, /not signed in to Conductor's private home/);
+  assert.equal(calls(d).filter((c) => c.cmd === 'exec' || c.cmd === 'exec-unauthenticated').length, 0, 'no run was even attempted');
+});
+
+test('B3: a sticky `blocked` can be cleared on purpose (add-only record), after which the code constant applies again and a new check decides', () => {
+  _setCanaryValidatedForTests(true);
+  rmSync(verificationFile('codex'), { force: true });
+  addRecord(rec('blocked'));
+  assert.equal(effectiveReadOnlyTier('codex', binding()), 'blocked');
+  addRecord({ provider: 'codex', kind: 'readOnly', verdict: 'inconclusive', source: 'user-clear', binding: binding({ cliVersion: 'cleared' }), at: Date.now() });
+  assert.equal(effectiveReadOnlyTier('codex', binding()), 'unverified');
+  addRecord(rec('blocked'));
+  assert.equal(effectiveReadOnlyTier('codex', binding()), 'blocked', 'a NEW block after the clearing blocks again');
+  rmSync(verificationFile('codex'), { force: true });
+  _setCanaryValidatedForTests(false);
+});
+
+test('B3: the write item needs a recognisable sandbox denial, not just any failure', () => {
+  const fold = newCodexFold();
+  const mkEv = (output: string, exit: number): CanaryEvidence => {
+    const f = newCodexFold();
+    f.commands.push({ command: "sh -c 'echo x > conductor-write-probe-n9.txt'", exitCode: exit, status: '', output });
+    return {
+      nonce: 'n9', port: 1, credSecret: 'S', decoys: ['D'], listenerWorks: true,
+      control: { ran: true, hook: true, mcp: true, ruleProbe: 'blocked' },
+      prod: { ran: true, fold: f, markers: { userHook: false, userMcp: false, projectHook: false, projectMcp: false }, writeFileExists: false, listenerHits: 0 },
+    };
+  };
+  const w = (ev: CanaryEvidence) => evaluateCanary(ev).items.find((i) => i.id === 'sandbox-write')!.outcome;
+  assert.equal(w(mkEv('sh: conductor-write-probe-n9.txt: Read-only file system', 1)), 'pass');
+  assert.equal(w(mkEv('Operation not permitted', 1)), 'pass');
+  assert.equal(w(mkEv('sh: 1: sh: not found', 127)), 'inconclusive', 'a missing shell proves nothing about the sandbox');
+  assert.equal(w(mkEv('', 1)), 'inconclusive');
+  assert.equal(w(mkEv('', 0)), 'inconclusive');
+  void fold;
 });

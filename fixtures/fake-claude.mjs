@@ -11,6 +11,19 @@ if (argv.includes('--version')) {
   process.exit(0);
 }
 const dir = process.env.FAKE_DIR || '';
+if (argv[0] === 'auth' && argv[1] === 'status') {
+  // sign-in state: scenario `login: 'out'` ⇒ signed out (shape of the real `claude auth status` JSON)
+  let login = 'ok';
+  try {
+    login = JSON.parse(readFileSync(join(dir, 'scenario.json'), 'utf8')).login ?? 'ok';
+  } catch {}
+  if (login === 'out') {
+    console.log(JSON.stringify({ loggedIn: false }));
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ loggedIn: true, email: 'fake@example.com', orgName: 'Fake Org', subscriptionType: 'max' }));
+  process.exit(0);
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 

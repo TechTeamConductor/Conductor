@@ -36,7 +36,7 @@ Usage: conductor <command>
   start              run Conductor and open the dashboard (default)
   open               open a fresh signed-in dashboard tab (when it is already running)
   demo               try everything with scripted agents — no keys, no quota
-  doctor             check your setup   [--isolation [claude|codex]] [--probe] [--verify-build cursor] [--yes]
+  doctor             check your setup   [--isolation [claude|codex]] [--probe] [--verify-build cursor] [--clear-block codex] [--yes]
   service install    keep Conductor running in the background (launchd)   [--dry-run]
   service uninstall  remove the background service
   service status
@@ -238,6 +238,15 @@ async function doctor(): Promise<void> {
     console.log(` ${r.ok ? '✓' : '✗'} ${r.note}`);
     console.log(`   init predicate: ${r.initOk ? 'ok' : `FAILED — ${r.initReason}`} · project CLAUDE.md loaded: ${r.projectClaudeMdLoaded} · ancestor file loaded: ${r.ancestorLoaded} · your user rules loaded: ${r.userRulesLoaded}${r.limited ? `\n   (account is at its usage limit: ${r.limited}; the transcript check still ran)` : ''}`);
     if (!r.ok) failed = true;
+  }
+  if (opt('--clear-block')) {
+    // a sticky `blocked` that no check can clear would be a trap: the user can clear it on purpose (recorded, add-only — the next check decides again)
+    if (opt('--clear-block') !== 'codex') {
+      console.log('\nOnly a Codex block can be cleared.');
+      process.exit(2);
+    }
+    addRecord({ provider: 'codex', kind: 'readOnly', verdict: 'inconclusive', source: 'user-clear', binding: { cliVersion: 'cleared', binSha256: null, argvDigest: sha256('cleared'), privateConfigSha: sha256('cleared'), canaryVersion: 0 }, at: Date.now() });
+    console.log('\nThe Codex block was cleared. Codex is "unverified" again until a new isolation check says otherwise.');
   }
   if (opt('--verify-build')) {
     const who = opt('--verify-build');

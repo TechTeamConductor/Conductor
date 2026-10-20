@@ -4,7 +4,7 @@
 
 You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer, in separate git worktrees. **It never pushes, opens PRs, or merges.** There is no external tracker: the board is built in and stored locally.
 
-> **Status.** This is the v2 line (see `.techteam/plans/workspace-v2*.md` for the roadmap). Done so far: the native board (Linear removed), versioned data with backups, side-by-side import of v1 data, **roles and providers** (Claude, Cursor and an opt-in, read-only, *unverified* Codex — see below). Planned next: Codex as an implementer (needs its own isolation proof), task decomposition, task decomposition, a project-context engine, Quick Ask / Deep Research modes, onboarding for three CLIs, desktop installers (Windows `.exe`, Linux `.deb`). Nothing in that second list exists yet.
+> **Status.** This is the v2 line (see `.techteam/plans/workspace-v2*.md` for the roadmap). Done so far: the native board (Linear removed), versioned data with backups, side-by-side import of v1 data, **roles and providers** (Claude, Cursor and an opt-in, read-only, *unverified* Codex — see below). Planned next: Codex as an implementer (needs its own isolation proof), task decomposition, a project-context engine, Quick Ask / Deep Research modes, onboarding for three CLIs, desktop installers (Windows `.exe`, Linux `.deb`). Nothing in that second list exists yet.
 
 ```
 Task card (To do)

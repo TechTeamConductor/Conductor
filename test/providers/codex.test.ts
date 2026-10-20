@@ -1,5 +1,5 @@
 // M2 commit 3: the Codex adapter (read-only) against a scripted fake binary. NOT evidence about the real CLI — see fixtures/fake-codex.mjs.
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,12 @@ import { makeHarness, TestClock } from '../helpers/harness.ts';
 import { comments } from '../helpers/util.ts';
 
 const FAKE = join(import.meta.dirname, '..', '..', 'fixtures', 'fake-codex.mjs');
+/** The fake CLI models authentication: it needs $CODEX_HOME/auth.json (the credential a `codex login` would have written there). */
+function signIn(): void {
+  prepareCodexHome();
+  writeFileSync(join(codexHomePath(), 'auth.json'), '{}', { mode: 0o600 });
+}
+beforeEach(() => signIn());
 chmodSync(FAKE, 0o755);
 
 function fakeDir(scenario: unknown): string {
@@ -37,16 +43,16 @@ async function run(d: string, over: Partial<Parameters<typeof runCodexReadOnly>[
 }
 
 test('argv: constants plus one validated model name — the exact pinned list, prompt NOT in argv, none of the dangerous flags', () => {
-  const a = buildCodexArgs({ model: 'gpt-5.1-codex', schemaFile: '/t/schema.json', outFile: '/t/out.txt' });
+  const a = buildCodexArgs({ model: 'gpt-5.1-codex', outFile: '/t/out.txt' });
   assert.deepEqual(a, [
     'exec', '--json', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '--ephemeral',
     '-c', 'approval_policy="never"', '-c', 'sandbox_workspace_write.network_access=false',
     '-c', 'shell_environment_policy.inherit="core"', '-c', 'shell_environment_policy.ignore_default_excludes=false',
     '-c', 'shell_environment_policy.exclude=["CODEX_*","*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
-    '--model=gpt-5.1-codex', '--output-schema', '/t/schema.json', '-o', '/t/out.txt', '-',
+    '--model=gpt-5.1-codex', '-o', '/t/out.txt', '-',
   ]);
   const joined = buildCodexArgs({ outFile: '/o' }).join(' ');
-  for (const bad of ['--dangerously-bypass-approvals-and-sandbox', '--yolo', '--full-auto', '--approve-for-me', '--add-dir', '--search', '--profile', ' -p ', 'danger-full-access', 'workspace-write', '--skip-git-repo-check', '--config']) {
+  for (const bad of ['--dangerously-bypass-approvals-and-sandbox', '--yolo', '--full-auto', '--approve-for-me', '--add-dir', '--search', '--profile', ' -p ', 'danger-full-access', 'workspace-write', '--skip-git-repo-check', '--config', '--output-schema']) {
     assert.ok(!joined.includes(bad), `argv must not contain ${bad}`);
   }
   assert.ok(buildCodexArgs({ outFile: '/o' }).filter((x) => x === '-c').length === 5, 'every -c is one of our constants');
@@ -81,7 +87,6 @@ test('a run: prompt on STDIN, private CODEX_HOME + scratch HOME, minimal env, te
     assert.equal(existsSync(c.HOME), false, 'the scratch HOME is removed after the run');
     for (const k of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'ANTHROPIC_API_KEY']) assert.ok(!c.envKeys.includes(k), `${k} must not reach the child`);
     assert.ok(!c.envKeys.some((k: string) => /^(OPENAI|LINEAR|CURSOR|GITHUB|AWS|GH_)/.test(k)));
-    assert.ok(c.schemaBytes > 0, 'the schema file existed during the run');
     assert.ok(c.outFile.startsWith(join(tmpdir(), 'conductor-codex-')) && !c.outFile.startsWith(cwd), 'temp files live outside the worktree');
     assert.equal(existsSync(c.outFile), false, 'and are deleted afterwards');
     assert.equal(c.cwd, cwd.startsWith('/private') ? c.cwd : cwd.replace(/^\/var\//, '/private/var/'), 'cwd is the target dir');
@@ -92,7 +97,8 @@ test('a run: prompt on STDIN, private CODEX_HOME + scratch HOME, minimal env, te
     delete process.env.ANTHROPIC_API_KEY;
   }
   assert.equal(statSync(join(userCodexHome, 'auth.json')).mtimeMs, before, 'the user\'s own login file was never touched');
-  assert.deepEqual(readdirSync(codexHomePath()).sort(), ['config.toml'], 'nothing was copied or linked into the private home (no auth.json, no hooks)');
+  assert.deepEqual(readdirSync(codexHomePath()).sort(), ['auth.json', 'config.toml'], 'only Conductor\'s config and the sign-in credential the test wrote: nothing was copied or linked from the user\'s home (no hooks, no foreign auth)');
+  assert.equal(readFileSync(join(codexHomePath(), 'auth.json'), 'utf8'), '{}', 'the credential is the private home\'s own, not the user\'s');
   assert.equal(readFileSync(join(codexHomePath(), 'config.toml'), 'utf8'), CODEX_CONFIG_TOML);
 });
 
@@ -255,6 +261,7 @@ test('engine: a read-only role assigned to Codex runs Codex (fake binary), shows
   const clock = new TestClock();
   const h = await makeHarness({ clock, config: (c) => { c.agents.codex.bin = FAKE; c.roles.review = { providers: ['codex'] }; c.pipeline.planReview = 'always'; } });
   try {
+    signIn(); // the harness has its own Conductor home, so the private Codex home is a different folder than the one beforeEach signed in
     writeFileSync(join(h.fakeDir, 'codex.json'), JSON.stringify({ exec: [{ mode: 'limit' }, { mode: 'ok' }] }));
     const key = h.issue('Review by Codex');
     await h.settle();
@@ -343,5 +350,54 @@ test('F-7: a hop to another provider leaves a durable board comment naming both 
     assert.match(c!, /ask mode, which has weaker isolation/);
   } finally {
     await h.cleanup();
+  }
+});
+
+// ───────────── Reviewer M2 blockers B1 / B2 ─────────────
+import { agentHealth } from '../../src/doctor.ts';
+
+test('B1: the health used by /api/state does not wait for a running Codex stage (zero-quota health is lock-free)', async () => {
+  const d = fakeDir({ login: 'ok', exec: [{ mode: 'ok', delayMs: 2500 }] });
+  const cfg = normalizeConfig({ ...defaultConfig(), agents: { ...defaultConfig().agents, codex: { bin: FAKE } } });
+  const stage = run(d);
+  await new Promise((r) => setTimeout(r, 500)); // the stage holds the home lock for ~2.5 s
+  const t0 = Date.now();
+  const health = await agentHealth(cfg, 'codex', true);
+  const took = Date.now() - t0;
+  assert.equal(health.found, true);
+  assert.ok(took < 1500, `agentHealth took ${took} ms while a Codex stage was running`);
+  assert.ok((await stage).res.ok);
+});
+
+test('B2: a broken Codex that nobody has looked at (no health yet) is a START failure at exec — the next provider does the stage; with a refresh hook the engine never even starts it', async () => {
+  const BROKEN = join(import.meta.dirname, '..', '..', 'fixtures', 'fake-broken.mjs');
+  chmodSync(BROKEN, 0o755);
+  // (a) no health reading at all: Codex is started, fails to start (spawn), the chain advances to Claude
+  const a = await makeHarness({ config: (c) => { c.agents.codex.bin = BROKEN; c.roles.review = { providers: ['codex', 'claude'] }; c.pipeline.planReview = 'always'; } });
+  try {
+    const key = a.issue('Broken Codex, nobody looked');
+    await a.settle();
+    assert.equal(a.run(key).status, 'ready');
+    assert.equal(a.run(key).sessions.find((s) => s.stage === 'plan_review')?.agent, 'claude');
+    const notes = a.store.readEvents(key, 0, 500).events.filter((e) => e.kind === 'note').map((e) => e.text ?? '');
+    assert.ok(notes.some((t) => /Codex could not start — falling back to Claude/.test(t)), notes.join(' | '));
+  } finally {
+    await a.cleanup();
+  }
+  // (b) stale health + a refresh hook: the engine refreshes the zero-quota reading itself and never starts the broken provider
+  const b = await makeHarness({ config: (c) => { c.agents.codex.bin = BROKEN; c.roles.review = { providers: ['codex', 'claude'] }; c.pipeline.planReview = 'always'; } });
+  try {
+    let reading: any = null;
+    let refreshed = 0;
+    b.engine.setHealthSource(() => reading, async () => { refreshed++; reading = { codex: { found: false, ok: false } }; });
+    const key = b.issue('Broken Codex, stale health');
+    await b.settle();
+    assert.ok(refreshed >= 1, 'the engine refreshed the stale reading itself');
+    assert.equal(b.run(key).status, 'ready');
+    assert.equal(b.run(key).sessions.find((s) => s.stage === 'plan_review')?.agent, 'claude');
+    const notes = b.store.readEvents(key, 0, 500).events.filter((e) => e.kind === 'note').map((e) => e.text ?? '');
+    assert.ok(notes.some((t) => /Codex is not installed or does not start — Claude is doing this read-only step/.test(t)), notes.join(' | '));
+  } finally {
+    await b.cleanup();
   }
 });

@@ -87,6 +87,7 @@ export class Engine {
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
+  private healthRefresh: (() => Promise<void>) | null = null;
   private healthSource: (() => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>) | null = null;
 
   constructor(deps: EngineDeps) {
@@ -115,6 +116,7 @@ export class Engine {
       emit: (key, ev) => this.emit(key, ev),
       hist: (key, text) => this.d.store.update(key, (r) => void r.history.push({ ts: this.clock.now(), text })),
       routeStates: () => this.routeStates(),
+      freshHealth: () => this.freshHealth(),
       providerPause: (agent, until, reason) => {
         // a pause derived from a CLI limit message is capped at 24 h (a hostile or buggy message cannot park a provider for months); a human can resume any time
         this.pauses.set(agent, { until: Math.min(until, this.clock.now() + PAUSE_CEILING_MS), reason });
@@ -136,8 +138,22 @@ export class Engine {
   }
 
   /** Last known CLI health (the dashboard's cache). Without it every provider is assumed installed and auth unknown; spawn errors still name the real problem. */
-  setHealthSource(fn: () => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>): void {
+  setHealthSource(fn: () => Partial<Record<ProviderId, { found?: boolean; ok?: boolean; loggedIn?: boolean; version?: string }> | null | undefined>, refresh?: () => Promise<void>): void {
     this.healthSource = fn;
+    this.healthRefresh = refresh ?? null;
+  }
+
+  /**
+   * Routing must not depend on a dashboard having looked recently: when the last reading is missing or stale the engine refreshes the
+   * zero-quota health itself (bounded to 8 s; a failed refresh just means "unknown", which routes as installed).
+   */
+  async freshHealth(): Promise<void> {
+    if (!this.healthRefresh || this.healthSource?.()) return;
+    try {
+      await Promise.race([this.healthRefresh(), new Promise<void>((r) => setTimeout(r, 8000).unref())]);
+    } catch {
+      /* unknown */
+    }
   }
 
   /** The router's view of every provider: capabilities derived from code, tier, CLI-reported health/auth, CLI-reported pauses. */

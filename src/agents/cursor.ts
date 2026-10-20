@@ -4,6 +4,7 @@ import { truncate } from '../util.ts';
 import type { AgentCallBase, EmitEvent } from './claude.ts';
 import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
+import { BROKEN_RE } from './providers/probe.ts';
 
 export interface CursorCall extends AgentCallBase {
   /** build = writes files (`--force`); ask/plan = read-only modes. */
@@ -151,6 +152,7 @@ export async function runCursor(call: CursorCall): Promise<AgentResult> {
 
   const failed = !result || result.is_error === true || (proc.code !== 0 && proc.code !== null);
   if (failed) {
+    if (!result && proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, errorKind: 'spawn', error: `cursor agent is installed but does not start: ${truncate(redact(proc.stderrTail, secrets).trim(), 400)}` };
     // M12: classify from what the CLI itself reported (stderr, or a SHORT error result) — never from long model-written prose,
     // which a hostile repo/prompt could use to fake a "limit" and stall every run.
     const probe = `${result?.is_error === true && finalText.length <= 500 ? finalText : ''}\n${proc.stderrTail}`;

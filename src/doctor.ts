@@ -2,17 +2,17 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import type { AgentHealth, Config } from './types.ts';
+import type { AgentHealth, Config, ProviderId } from './types.ts';
+import { createProviders } from './agents/providers/registry.ts';
 import { resolveBin } from './config.ts';
 import { claudeEnv, cursorEnv } from './agents/env.ts';
 import { buildClaudeArgs, checkClaudeInit } from './agents/claude.ts';
 import { runClaude } from './agents/claude.ts';
 import { runCursor } from './agents/cursor.ts';
 import { runProcess } from './agents/spawn.ts';
-import { CODEX_MIN_VERSION, codexAuth, detectCodex } from './agents/providers/codex.ts';
 import { scanAncestors } from './git/worktree.ts';
 import { KeychainStore } from './secrets.ts';
-import { errMsg, truncate } from './util.ts';
+import { errMsg, systemClock, truncate } from './util.ts';
 
 export interface Check {
   id: string;
@@ -28,61 +28,26 @@ async function cliOut(bin: string, args: string[], env: Record<string, string>):
   return { code: r.code, out: (r.stdoutTail + r.stderrTail).trim() };
 }
 
-/** Zero-quota health of the two agent CLIs (found / version / logged in). Cached 60 s. */
-export async function agentHealth(cfg: Config, which: 'claude' | 'cursor' | 'codex', force = false): Promise<AgentHealth> {
-  if (which === 'codex') return codexHealth(cfg, force);
-  const binName = which === 'claude' ? cfg.agents.claude.bin : cfg.agents.cursor.bin;
+/**
+ * Zero-quota health of a provider CLI, composed from the provider's own `detect()` + `auth()` (one interface for all three: found / version /
+ * signed in, nothing that reaches a model). Cached 60 s. A launcher whose program does not run is `broken-install` (found: false) with a fixed
+ * hint — Conductor only reports it and never installs or repairs anything.
+ */
+export async function agentHealth(cfg: Config, which: ProviderId, force = false): Promise<AgentHealth> {
+  const binName = cfg.agents[which].bin;
   const hit = cache.get(`${which}:${binName}`);
   if (!force && hit && Date.now() - hit.at < 60_000) return hit.value;
-  const bin = resolveBin(binName);
-  let value: AgentHealth;
-  if (!bin) {
-    value = {
-      found: false,
-      ok: false,
-      detail: which === 'claude' ? 'Claude Code CLI not found. Install it from https://claude.com/claude-code, then run `claude` once to sign in.' : 'Cursor CLI not found. Install: curl https://cursor.com/install -fsS | bash — then run `agent login`.',
-    };
-  } else if (which === 'claude') {
-    const v = await cliOut(bin, ['--version'], claudeEnv());
-    const a = await cliOut(bin, ['auth', 'status'], claudeEnv());
-    let loggedIn = false;
-    let who = '';
-    try {
-      const j = JSON.parse(a.out.slice(a.out.indexOf('{')));
-      loggedIn = j.loggedIn === true;
-      who = [j.email, j.orgName, j.subscriptionType ? `${j.subscriptionType} plan` : ''].filter(Boolean).join(' · ');
-    } catch {
-      loggedIn = /logged in/i.test(a.out) && !/not logged/i.test(a.out);
-    }
-    value = { found: true, version: v.out.split('\n')[0]?.slice(0, 60), loggedIn, ok: loggedIn, detail: loggedIn ? `Signed in as ${who || 'unknown account'}` : 'Not signed in — run `claude auth login`.' };
-  } else {
-    const v = await cliOut(bin, ['--version'], cursorEnv());
-    const a = await cliOut(bin, ['status'], cursorEnv());
-    const loggedIn = /logged in/i.test(a.out) && !/not logged/i.test(a.out);
-    value = { found: true, version: v.out.split('\n')[0]?.slice(0, 60), loggedIn, ok: loggedIn, detail: loggedIn ? a.out.split('\n')[0]!.replace(/^✓\s*/, '') : 'Not signed in — run `agent login`.' };
-  }
-  cache.set(`${which}:${binName}`, { at: Date.now(), value });
-  return value;
-}
-
-/**
- * Codex: `--version` + `login status` against Conductor's PRIVATE home, nothing else (zero quota, never a model call). A launcher whose native
- * binary is missing is reported as `broken-install` (found: false) with the stderr tail and a fixed hint — Conductor never repairs it.
- */
-async function codexHealth(cfg: Config, force: boolean): Promise<AgentHealth> {
-  const binName = cfg.agents.codex.bin;
-  const hit = cache.get(`codex:${binName}`);
-  if (!force && hit && Date.now() - hit.at < 60_000) return hit.value;
-  const d = await detectCodex(binName);
+  const p = createProviders({ getConfig: () => cfg, clock: systemClock, extraEnv: {} })[which];
+  const d = await p.detect(cfg);
   let value: AgentHealth;
   if (d.state === 'missing') value = { found: false, ok: false, state: 'missing', detail: d.detail };
-  else if (d.state === 'broken-install') value = { found: false, ok: false, state: 'broken-install', detail: `Codex is installed but does not start: ${d.detail}` };
+  else if (d.state === 'broken-install') value = { found: false, ok: false, state: 'broken-install', detail: `${p.label} is installed but does not start: ${truncate(d.detail ?? '', 300)}` };
   else {
-    const auth = await codexAuth(binName);
-    const detail = d.belowMinimum ? `Codex ${d.version} is older than ${CODEX_MIN_VERSION}, which this version of Conductor was written against; it is treated as unverified.` : auth === 'ok' ? 'Signed in (Conductor\'s private Codex home)' : auth === 'not-logged-in' ? 'Not signed in to Conductor\'s private Codex home.' : 'Sign-in state unknown.';
-    value = { found: true, version: d.version, state: 'ok', loggedIn: auth === 'ok' ? true : auth === 'not-logged-in' ? false : undefined, ok: auth === 'ok' && !d.belowMinimum, detail };
+    const a = await p.auth(cfg);
+    const detail = d.belowMinimum ? `${p.label} ${d.version} is older than the version this Conductor was written against; it is treated as unverified.` : a.detail;
+    value = { found: true, version: d.version, state: 'ok', loggedIn: a.state === 'ok' ? true : a.state === 'not-logged-in' ? false : undefined, ok: a.state === 'ok' && !d.belowMinimum, detail };
   }
-  cache.set(`codex:${binName}`, { at: Date.now(), value });
+  cache.set(`${which}:${binName}`, { at: Date.now(), value });
   return value;
 }
 

@@ -236,11 +236,19 @@ function setFirstReadOnlySlot(chain: readonly ProviderId[], to: 'claude' | 'curs
   else next[i] = to;
   return next.filter((p, k) => next.indexOf(p) === k);
 }
-/** `onClaudeLimit: 'cursor'` ⇒ a Cursor follows Claude (appended when missing); `'wait'` ⇒ no Cursor follows a Claude. Other entries are untouched. */
+/**
+ * `onClaudeLimit: 'cursor'` ⇒ a Cursor follows Claude; `'wait'` ⇒ no Cursor follows a Claude. Other entries are untouched and NOTHING
+ * is reordered: a Cursor that already sits BEFORE Claude (it leads the chain) is left exactly where it is — moving it would silently change
+ * who runs first (the derived value then simply stays `wait`).
+ */
 function setCursorFallback(chain: readonly ProviderId[], on: boolean): ProviderId[] {
   const c = chain.indexOf('claude');
   if (c < 0) return [...chain];
-  if (on) return cursorFollowsClaude(chain) ? [...chain] : [...chain.filter((p) => p !== 'cursor'), 'cursor'];
+  if (on) {
+    if (cursorFollowsClaude(chain)) return [...chain];
+    if (chain.includes('cursor')) return [...chain]; // already present before Claude: do not move it
+    return [...chain, 'cursor'];
+  }
   return chain.filter((p, k) => !(p === 'cursor' && k > c));
 }
 
