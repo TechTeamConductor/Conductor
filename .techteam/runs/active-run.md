@@ -1,27 +1,17 @@
 # Run checkpoint
 
-- Run ID / root Linear issue: workspace-v2 / none (Linear is being removed; no tracker connector in this session)
-- User goal: build the "AI-Native Autonomous Engineering Workspace" (`.techteam/plans/workspace-v2-requirements.md`, verbatim): desktop app (Win `.exe` + Linux `.deb`), 3 CLIs (Codex/Claude/Cursor) per-role, native board replacing Linear, plan-before-execution with decomposition, persistent offline-capable project context, 3 modes (Quick Ask / Engineering / Deep Research), automation policies, onboarding, versioned migrations.
-- Previous run: `conductor-v1` — COMPLETE and committed (`56c7f2d`, tag `v1.0.0-rc2`); its final report is still to be written (`.techteam/runs/final-report-conductor-v1.md`, not yet written).
-- Current graph state: **planning phase**. Master plan rev 2 + sub-plans M1 and M2 written; awaiting Reviewer re-review. No v2 source edited.
-- Completed tasks and evidence:
-  - v1 security batch + BAR-363 question-task fix committed (`56c7f2d`): `npm run check` clean, `npm test` 483 tests / 479 pass / 4 opt-in skips, live suite (`LIVE=1 test/live/*`) 3/3 pass (Cursor E2E, no-push, question) — run 2026-10-20.
-  - Tag `v1.0.0-rc2`; backup of real config/state/runs at `~/.conductor-backups/20261020-134302/`.
-  - Research: Codex non-interactive docs, electron-builder toolsets, Electron safeStorage (sources in plan §1).
-  - Reviewer review #1 of the master plan: **Changes requested** (12 blocking) → `.techteam/reviews/workspace-v2-plan-review.md`. Rev 2 addresses all 12 (see plan header).
-- In-progress tasks and owner: Reviewer (re-review of rev 2 + M1 + M2 sub-plans).
-- Blocked tasks and exact blocker:
-  - Restarting the user's live v1 instance onto the fixed code: **blocked by the permission classifier** (kill of a running process). The live instance (pid 11390, :4317) still runs pre-fix v1 code; BAR-363 stays `needs_human` until the user restarts it (needs the user's OK or a manual restart).
-  - Codex live verification: binary is broken (`ENOENT` native vendor binary); repairing needs a download → user permission (asked at end of M2).
-  - Electron/electron-builder/Docker downloads: user permission (asked at M7).
-- Decisions / assumptions made: D1–D8 in the master plan §6 (parallel build deferred; no auto-install of CLIs; Windows = preview; automation default keeps v1 forced holds; research no-repo + summaries off; Linear import history-only; Codex not an implementer). v2 developed in an isolated local clone `/Volumes/Sandisk/github/techteam-conductor-v2` so the running v1 tool (served from the original tree) is not disturbed; throw-away `CONDUCTOR_HOME` for all tests.
-- Files/artifacts changed: `.techteam/plans/workspace-v2{,-requirements,-m1,-m2}.md`, `.techteam/reviews/workspace-v2-plan-review.md`, this file.
-- Checks already run and outcomes: see "Completed tasks".
-- Last successful checkpoint: commit `56c7f2d` (v1) — v2 has no commits yet.
-- Next concrete action: Reviewer re-review → on **Approved** (at least M1 + M2 sub-plans) create the v2 clone and start **M1a** (board store + `src/schema/` versioning framework, no engine change).
+- Run ID / root Linear issue: workspace-v2 / none (Linear is removed; no tracker connector in this session)
+- User goal: the "AI-Native Autonomous Engineering Workspace" (`.techteam/plans/workspace-v2-requirements.md`, verbatim).
+- Plan status: master = **Approved as direction** (M3–M7 each need their own sub-plan); M1 (M1a–M1d) = **Approved (conditions K1–K7 applied)**; M2 = **Approved with conditions** (Reviewer round 3) + Security design sign-off **Approved with conditions** (8 apply-before-first-edit conditions NOT yet written into the M2 plan — do that before any M2 edit).
+- Working clone: `/Volumes/Sandisk/github/techteam-conductor-v2` (local `main`, nothing pushed). The user's live v1 tool still runs from `/Volumes/Sandisk/github/techteam-conductor` against `~/.conductor`; it has NOT been restarted (permission refused) so it still has the pre-fix v1 code. v2 default home `~/.conductor-v2`.
+- Current graph state: **M1a, M1b, M1c, M1d implemented and committed** (clone HEAD `1edccfa`). Review status: M1a Reviewer **Approved** (B1–B3 closed) · M1a Security **Approved** (S-1…S-12 closed) · M1b Reviewer **Changes requested → fixed** (a7cb467; re-verification pending) · M1b Security **Changes requested → fixed** (9814b6f, B-1…B-10; re-verification pending) · M1c/M1d **not yet reviewed**.
+- Completed tasks and evidence (all in the clone):
+  - M1a (15687f9, f46f9b8, 8264568): board store (journal+snapshot, fsync, rollback on write error, validation, caps), versioning framework + backups, real lock, v2 home.
+  - M1b (4b7b74c, a7cb467, 9814b6f): engine/stages/effects/API/runtime/demo on the board; K1–K4; run.json v2; read-only RunStore; home marker; own-worktree checks; symlink-safe `.conductor`; tombstones; v2 launchd label.
+  - M1c (aea92f8, f456ba7): Linear-free dashboard (2-step wizard, Backlog/To do columns, notes panel, approve with rev), v2 cookie, `conductor migrate` (side by side; dry-run; backup; one-rename publish; K5 namespace; K7), config v3.
+  - M1d (1edccfa): Linear deleted; import-graph test; docs rewritten.
+- Checks run (clone, 2026-10-20): `npm run check` clean · `npm test` **452 tests / 448 pass / 4 opt-in skips** (v1 baseline was 483/479/4; retired ≈214 per the M1 matrix incl. all 205 `test/linear` tests; survivors kept; ≈190 new tests: board, schema, lock, migrate, 95-cell real-state command matrix, security regressions) · kill -9 crash tests (board journal ×5 windows, migrate ×4 windows) · lock contention 12×4 processes · UI verified in the Browser pane (demo + clean-home wizard; desktop + 375 px; approve→build→verify→ready driven from the UI; no console errors; screenshots inspected, NOT saved to `.techteam/runs/evidence/`) · live Cursor suites: re-run in progress (see below) · rehearsal: `migrate` on a COPY of the real BAR-363 data → v1 home byte-identical afterwards, tagged v1 code (no Keychain, no Linear key) still reads it, v2 shows BAR-363 as a "needs you" card.
+- Per-file test counts (declared): agents 20 · board 24 · hardening 9 · boot 1 · core 14 · authz 1 · engine-board 10 · happy 1 · human 6 · limit 3 · loop 3 · matrix 3 (95 generated cells) · plan 4 · regress 18 · safety 13 · security 10 · git/exec 17 · gates 45 · parse 28 · worktree 73 · import-graph 3 · live 3 · lock 4 · migrate 6 · schema 14 · security-m1b 8 · server 21 · wizard 3.
+- Blocked / needs the user: (1) restart the live v1 instance to pick up the BAR-363 fix (permission refused when attempted); (2) permission to repair the broken Codex install (before M2 live checks) and for Electron/electron-builder/Docker downloads (M7); (3) decisions D1–D9 in the master plan (defaults taken, listed in the status report).
+- Not done yet: Reviewer + Security checkpoint for M1c/M1d and re-verification of the M1b fixes; the 8 M2 security-design conditions into `workspace-v2-m2.md`; M2 implementation; M3–M7 sub-plans; UI screenshots into evidence; landing the clone into the original repo (user-initiated, local fast-forward after stopping the live v1 instance).
 - Retry count / alternate strategy tried: 0
-- Plan status: pending_reviewer (rev 2)
-- Plan artifact: `.techteam/plans/workspace-v2.md` (+ `-m1`, `-m2`, `-requirements`)
-- Plan reviewed by: Reviewer agent `a398525bdb5f63c18` (round 1: Changes requested)
-- Plan review artifact: `.techteam/reviews/workspace-v2-plan-review.md`
-- Plan approved at: —
