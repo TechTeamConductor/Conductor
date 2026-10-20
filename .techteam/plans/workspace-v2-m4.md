@@ -1,7 +1,7 @@
 # Sub-plan M4 — Project context engine and offline mode
 
 - Parent: `.techteam/plans/workspace-v2.md` (direction for M4 + binding additions M-8/M-9 as recorded there). Requirement: `workspace-v2-requirements.md` §5 (Persistent Project Context and Offline Intelligence), §6 (retrieve only the relevant context), §8 steps 6–7 (initial analysis, local index).
-- Author: TechTeam Lead · Date: 2026-10-20 · Plan status: **rev 2 — Reviewer: Approved with conditions M4-1…M4-4; Security skim: Approved, M4-S1…M4-S6 (all in §2b, which is BINDING and overrides any earlier sentence)** (rev 1 was pending_reviewer) · Depends on: M1 (board projects), M2 (roles/router; the `context` role), M3 (plans/items consume packs).
+- Author: TechTeam Lead · Date: 2026-10-20 · Plan status: **rev 2 — Reviewer: Approved (with conditions M4-1…M4-4, now in §2b); Security: Approved, M4-S1…M4-S6 (in §2b); rev-2 verification by both: Approved — `reviews/workspace-v2-m2-fixes-and-plans-rev2-{review,security}.md` (text conditions folded into §2b-8). §2b is BINDING and overrides any earlier sentence.** · Depends on: M1 (board projects), M2 (roles/router; the `context` role), M3 (plans/items consume packs).
 - Gate: Reviewer approval before the first source edit. Security review of the code (a new persistent store whose content reaches prompts; a new "offline" classification of provider failures). No new CLI, no new inbound network surface; the connectivity probe is an outbound-only check (see 2.6).
 
 ## 1. Current State (verified in the clone at `bd5f186`)
@@ -76,6 +76,13 @@ When a run reaches `finished`/`ready`/`needs_human`/`aborted`, one line is appen
 6. **Store modes and strings (M4-S4, M4-S5, M4-S6).** The context directories are created with an explicit 0700 (`ensureRealDir` sets none); `repoPathHash` is not a trust anchor; history digests (hostile file names, user titles) are fenced in read-only prompts and `textContent` in the UI; **LLM summaries and history digests are never placed in a research prompt** (M5-5: deterministic facts only, repo-aware only).
 7. **Smaller points.** The pack states which commit it was computed from — the run's `baseSha` when a run exists, else the branch tip; `history.ndjson` diff file names and titles never reach a builder; router roles: M3 analysis items use the item's role, M4 summaries use `context`, M5 Quick Ask uses `context`.
 
+8. **Clarifications from the rev-2 reviews (Security C4-1…C4-3, Reviewer M4 conditions; binding).**
+   - **C4-1 — the strict charset has no space, so command text cannot ride in it.** Two classes of string, decided here: (i) *identifiers* — module names, file paths, script **names**, framework/dependency names — use the strict charset `[A-Za-z0-9._@/+:=-]` (≤ 120 chars) and are the only repository-derived strings a **builder** prompt receives, plus the gate list that prompts already carry today (Conductor-detected, unchanged); (ii) *command text* (`package.json` script bodies, Makefile recipes; ≤ 200 chars, control/bidi stripped, whitespace collapsed) goes **only to read-only stages and the UI**, fenced as untrusted data. A script body is never in a builder prompt.
+   - **C4-2 — the cache is validated on load, not trusted.** A builder can rewrite `<home>/projects/<KEY>/context/*`. `facts.json`/`history.ndjson`/`summaries.json` are re-validated on every read (schema, size caps, charset, entry counts); an invalid entry is dropped and counted, a file that fails validation is quarantined and rebuilt. A hash match never skips validation. The residual — **a builder can rewrite the summaries/history cache that reaches read-only stages and so influence a later plan** — is stated plainly in the docs; it is bounded by opt-in summaries, fencing, "deterministic facts for builders are recomputed from git", and the approval/forced-hold gates on the resulting plan.
+   - **C4-3 — tests that must stay:** an offline-refund test (a network-class failure never consumes `agentRuns`), a **cumulative** 24 h cap test and the **episode cap (20)** test, a proxy-env test (`HTTP(S)_PROXY` ⇒ `unknown`), and the planted-network-words-in-a-tool-result test.
+   - **Accounting module lands here, not in M6 (Reviewer sequencing condition; also M5/M6).** `src/limits/budget.ts` is created in **M4 commit 4** with its first consumer (`contextRunsPerDay`) and the final semantics M6 relies on: a **local-day** key (not UTC), counts that survive restarts (add-only file with validation on load, C6-4), caps that count **running time only** (a paused/offline run does not burn them), ceilings as constants. M5's Quick Ask counters and M6's policy limits reuse it; M6 adds policy on top of it and does not create a second counter.
+   - **Builder prompts and board titles.** Titles of open work/milestones that reach a builder are limited to **user-created `work` cards and user-authored milestones**; cards with `createdBy: 'import'` or `untrusted`, and `ask`/`research`/`bug`/`subtask` cards, are excluded from builder prompts (they may appear, fenced, in read-only stages).
+
 ### 2.8 Measurable acceptance criteria
 
 - **M4-AC1** Scanner facts for fixture repos (node, python, Go, mixed monorepo, empty repo, repo with symlinks/submodules/huge files) match expected JSON; nothing is read from the working tree and no symlink is followed.
@@ -112,7 +119,7 @@ When a run reaches `finished`/`ready`/`needs_human`/`aborted`, one line is appen
 - [ ] **Commit 1 — store + scanner + incremental + status** (pure modules, fixtures, no engine change).
 - [ ] **Commit 2 — packs + history + prompt blocks + engine insertion** (facts-only for builders; read-only fencing; refresh-before-plan; failure never blocks).
 - [ ] **Commit 3 — offline classification + pause/resume + probe + labels + API/UI.**
-- [ ] **Commit 4 — opt-in LLM summaries with budget + docs.**
+- [ ] **Commit 4 — `src/limits/budget.ts` (first consumer: the context-run budget; final semantics per §2b-8) + opt-in LLM summaries + docs.**
 - [ ] Reviewer code review + Security review; checkpoint commit.
 
 ## 5. Testing Strategy
