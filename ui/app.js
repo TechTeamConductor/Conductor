@@ -482,8 +482,9 @@ function buildHeader() {
   HDR.connLbl = h('span', { class: 'conn-label' });
   HDR.conn = h('span', { class: 'conn', hidden: true }, HDR.connIcon, HDR.connLbl);
   HDR.newBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-label': 'New task', onclick: () => openNewTask() }, icon('plus'), h('span', { class: 'btn-label-hide' }, 'New task'));
+  HDR.askBtn = h('button', { type: 'button', class: 'btn', 'aria-label': 'Ask a question', title: 'Ask a question about a project', onclick: () => openAsk() }, icon('help'), h('span', { class: 'btn-label-hide' }, 'Ask'));
   HDR.setBtn = h('button', { type: 'button', class: 'btn btn-icon', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings() }, icon('sliders'));
-  top.append(brand, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.newBtn, HDR.setBtn);
+  top.append(brand, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.askBtn, HDR.newBtn, HDR.setBtn);
 }
 function engineView(eng) {
   const pp = eng.providerPause || {};
@@ -1915,6 +1916,69 @@ function dlgShell(title, bodyNodes, footNodes, onSubmit, wide) {
 }
 function field(id, label, control, hint, extra) {
   return h('div', { class: 'field' }, h('label', { for: id }, label), control, hint ? h('p', { class: 'hint', id: id + '-hint' }, hint) : null, extra || null);
+}
+
+/* ───────────────────────── Quick Ask ───────────────────────── */
+function openAsk() {
+  const repos = (S.state && S.state.repos) || [];
+  const idQ = uid('ask'); const idR = uid('ask'); const idC = uid('ask');
+  const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
+  const out = h('div', { class: 'stack', 'aria-live': 'polite' });
+  const q = h('textarea', { class: 'textarea', id: idQ, maxlength: '4000', placeholder: 'Ask about the code, how something works, or what a change would involve…' });
+  const repo = h('select', { class: 'select', id: idR }, repos.length !== 1 ? h('option', { value: '' }, 'No repository (general question)') : null, repos.map((r) => h('option', { value: r.name }, r.name)));
+  if (repos.length === 1) repo.value = repos[0].name;
+  const change = h('input', { type: 'checkbox', id: idC });
+  const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Ask');
+  let timer = 0;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = 0; } };
+  const render = (r) => {
+    const kids = [];
+    if (r.status === 'running') kids.push(h('p', { class: 'muted' }, 'Reading the code and answering…'));
+    if (r.status === 'failed') kids.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'No answer'), h('div', { class: 'pre' }, r.error || 'Something went wrong.'))));
+    if (r.status === 'canceled') kids.push(h('p', { class: 'muted' }, 'Canceled.'));
+    if (r.status === 'done' && r.result) {
+      if (r.result.answer) kids.push(renderMarkdown(r.result.answer));
+      if (r.result.kind === 'change' && r.result.change) kids.push(h('p', { class: 'muted' }, 'This looks like a request for a change: ' + r.result.change.title + ' (size ' + r.result.change.complexity + '). Nothing was changed.'));
+      if ((r.result.citations || []).length) kids.push(h('p', { class: 'muted' }, 'Sources: ', ...r.result.citations.flatMap((c, i) => [i ? ', ' : '', h('code', null, c.file + (c.lines ? ':' + c.lines : ''))])));
+      kids.push(h('p', { class: 'muted' }, 'Based on ' + (r.basis || 'the repository') + '. The answer is model-written — check it before relying on it.' + (r.tierNote ? ' ' + r.tierNote : '')));
+      if (r.convertedTo) kids.push(h('p', null, 'Started as task ', h('b', null, r.convertedTo), '.'));
+      else if (r.repo) kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn', onclick: async (ev) => {
+        try { const c = await api('POST', '/api/asks/' + enc(r.id) + '/convert'); toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.'); loadState().catch(() => {}); render(await api('GET', '/api/asks/' + enc(r.id))); } catch (ex) { toast('error', ex.message); }
+      } }, 'Turn into a task')));
+    }
+    out.replaceChildren(...kids);
+  };
+  const poll = async (id) => {
+    try {
+      const r = await api('GET', '/api/asks/' + enc(id));
+      render(r);
+      if (r.status === 'running') timer = setTimeout(() => poll(id), 1500);
+      else setBusy(submit, false);
+    } catch (ex) { setBusy(submit, false); err.hidden = false; setText(err, ex.message); }
+  };
+  const onSubmit = async (e) => {
+    e.preventDefault(); err.hidden = true; stop();
+    if (!q.value.trim()) { err.hidden = false; setText(err, 'Type a question first.'); q.focus(); return; }
+    setBusy(submit, true);
+    try {
+      const body = { question: q.value.trim() };
+      if (repo.value) body.repo = repo.value;
+      if (change.checked) body.allowChange = true;
+      const r = await api('POST', '/api/ask', body);
+      render(r); poll(r.id);
+    } catch (ex) { setBusy(submit, false); err.hidden = false; setText(err, ex.message); }
+  };
+  const cancel = h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Close');
+  const dlg = dlgShell('Ask a question', [
+    h('p', { class: 'muted' }, 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.'),
+    field(idQ, 'Question', q),
+    repos.length ? field(idR, 'Repository', repo) : null,
+    h('div', { class: 'field' }, h('label', { for: idC }, change, ' Let Conductor make the change if it is small'), h('p', { class: 'hint' }, 'Only if the question asks for a change. This starts a task and spends your plan quota; its approval rules still apply.')),
+    err, out,
+  ], [h('span', { class: 'spacer' }), cancel, submit], onSubmit, true);
+  dlg.addEventListener('close', stop, { once: true });
+  dlg.showModal();
+  q.focus();
 }
 
 function openNewTask() {
