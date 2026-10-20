@@ -759,3 +759,18 @@ dialog::backdrop { background: var(--scrim); }
   .gate-table td { border: 0 !important; padding: 3px 0 !important; }
   .gate-table td[data-label]::before { content: attr(data-label); display: block; font-size: 11.5px; color: var(--text-3); font-weight: 600; }
 }
+
+/* start screen: three ways in + detected tools */
+.modes { margin: 0 0 18px; }
+.modes-title { margin: 0 0 10px; font-size: 1.05rem; }
+.mode-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.mode-card { display: grid; gap: 6px; text-align: left; padding: 14px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); color: inherit; cursor: pointer; font: inherit; }
+.mode-card:hover, .mode-card:focus-visible { border-color: var(--accent, #7c83ff); outline: none; }
+.mode-ic { width: 22px; height: 22px; display: inline-flex; }
+.mode-t { font-weight: 600; }
+.mode-d { color: var(--muted, #8a8f9a); font-size: 0.9rem; }
+.tools { margin-top: 14px; }
+.tools-title { margin: 0 0 6px; font-size: 0.95rem; }
+.tool-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.tool { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.tool-name { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; min-width: 90px; }

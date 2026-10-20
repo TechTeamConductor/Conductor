@@ -8,6 +8,7 @@ import { paths } from '../paths.ts';
 import { atomicWriteFile } from '../util.ts';
 import { quarantine } from '../schema/version.ts';
 import { cleanCommand } from '../context/facts.ts';
+import { validateReport, type ResearchReport } from './research.ts';
 
 export const ASK_ID_RE = /^ask-[0-9a-f]{16,32}$/;
 export const ASK_LIMITS = Object.freeze({ question: 4000, answer: 20_000, file: 512 * 1024, events: 200, eventChars: 600, index: 500 });
@@ -30,6 +31,8 @@ export interface AskRecord {
   /** Tier note shown with the answer (e.g. "answered by Cursor in ask mode — weaker isolation"). */
   tierNote?: string;
   result?: AskResult;
+  /** Deep Research: the report, with citation status computed by Conductor from the session's tool events. */
+  report?: ResearchReport;
   error?: string;
   events: string[];
   convertedTo?: string;
@@ -92,6 +95,7 @@ export function validateAsk(raw: unknown, id: string): AskRecord | null {
     provider: typeof own(raw, 'provider') === 'string' ? cleanCommand(own(raw, 'provider')).slice(0, 40) : undefined,
     tierNote: typeof own(raw, 'tierNote') === 'string' ? cleanCommand(own(raw, 'tierNote')).slice(0, 300) : undefined,
     result,
+    report: own(raw, 'report') ? validateReport(own(raw, 'report')) ?? undefined : undefined,
     error: typeof own(raw, 'error') === 'string' ? text(own(raw, 'error'), 500) : undefined,
     events: (Array.isArray(own(raw, 'events')) ? (own(raw, 'events') as unknown[]) : []).filter((e): e is string => typeof e === 'string').slice(-ASK_LIMITS.events).map((e) => e.slice(0, ASK_LIMITS.eventChars)),
     convertedTo: typeof conv === 'string' && /^[A-Z]{2,6}-\d{1,9}$/.test(conv) ? conv : undefined,

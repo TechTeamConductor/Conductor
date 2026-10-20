@@ -346,6 +346,8 @@ export interface Config {
     contextRunsPerDay: number;
     /** Quick Ask / Research limits (ceilings are code constants in src/limits/budget.ts). */
     asksPerHour: number;
+    /** Deep Research runs per local day (ceiling 20 in code). */
+    researchPerDay: number;
     /** Global approval policy default (M6). `full-auto` = v1 behaviour. */
     policy: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
     /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
@@ -403,6 +405,8 @@ export interface AgentResult {
   error?: string;
   errorKind?: 'limit' | 'auth' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse' | 'network';
   limit?: LimitInfo;
+  /** Deep Research: what the session actually fetched/searched, taken from the tool events (never from model text). */
+  observed?: { read: string[]; listed: string[]; queries: string[] };
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
 }
 

@@ -712,6 +712,15 @@ function buildBoardView() {
       h('p', { class: 'col-sub' }, c.hint), list, empty);
     B.cols.set(c.id, { el, list, count, empty, title });
   }
+  B.tools = h('div', { class: 'tools' });
+  const modeCard = (icn, title, text, act) => h('button', { type: 'button', class: 'mode-card', data: { act } }, h('span', { class: 'mode-ic' }, icon(icn)), h('span', { class: 'mode-t' }, title), h('span', { class: 'mode-d' }, text));
+  B.modes = h('section', { class: 'modes', 'aria-labelledby': 'modes-h' },
+    h('h2', { id: 'modes-h', class: 'modes-title' }, 'What do you want to do?'),
+    h('div', { class: 'mode-grid' },
+      modeCard('help', 'Quick Ask', 'A question, an explanation, or a small fix. Answered from your code in seconds — no task, no plan.', 'open-ask'),
+      modeCard('code', 'Engineering Work', 'Features, refactors, bug fixes. Conductor plans it, splits it into tasks if needed, builds, and verifies.', 'new-task'),
+      modeCard('shield', 'Deep Research', 'Compare options and check evidence on the web. A report with sources, shown as opened, listed or unverified.', 'open-research')),
+    B.tools);
   B.pollEl = h('span', { class: 'num' }, '5');
   B.empty = h('section', { class: 'empty', 'aria-labelledby': 'empty-h' },
     h('h2', { id: 'empty-h', class: 'empty-title' }, 'Nothing in flight'),
@@ -734,7 +743,7 @@ function buildBoardView() {
   B.history = h('details', { class: 'history' },
     h('summary', null, icon('archive'), h('span', null, 'History'), B.histCount, h('span', { class: 'card-spacer' }), icon('chevron', 'chev')),
     B.histList);
-  $('#view').replaceChildren(B.summary, B.empty, B.board, B.history);
+  $('#view').replaceChildren(B.summary, B.modes, B.empty, B.board, B.history);
 }
 
 function reconcile(parent, els) {
@@ -757,6 +766,7 @@ function updateBoard() {
   const byCol = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
+  renderTools();
   toggleHidden(B.empty, open.length > 0 || idle > 0);
   toggleHidden(B.board, open.length === 0 && idle === 0);
   setText(B.pollEl, st.engine.pollSeconds || 5);
@@ -971,6 +981,8 @@ function onViewClick(e) {
     case 'jump': jumpToColumn(t.dataset.col); break;
     case 'new-task': openNewTask(); break;
     case 'open-setup': navigate('#/setup'); break;
+    case 'open-ask': openAsk('quick'); break;
+    case 'open-research': openAsk('research'); break;
     default: break;
   }
 }
@@ -1928,14 +1940,49 @@ function field(id, label, control, hint, extra) {
   return h('div', { class: 'field' }, h('label', { for: id }, label), control, hint ? h('p', { class: 'hint', id: id + '-hint' }, hint) : null, extra || null);
 }
 
+/* ───────────────────────── detected tools ───────────────────────── */
+const TOOL_STATE = { ok: ['good', 'Ready'], 'not-logged-in': ['warn', 'Not signed in'], missing: ['bad', 'Not installed'], 'broken-install': ['bad', 'Broken install'], unknown: ['mute', 'Unknown'] };
+function toolsNodes() {
+  const ps = (S.state && S.state.providers) || [];
+  if (!ps.length) return [];
+  return [
+    h('h3', { class: 'tools-title' }, 'Your tools', h('span', { class: 'muted' }, ' — found on this Mac automatically')),
+    h('ul', { class: 'tool-list' }, ps.map((p) => {
+      const st = TOOL_STATE[p.state] || TOOL_STATE.unknown;
+      const roles = p.id === 'claude' ? 'plans, reviews, verifies, answers, researches' : p.id === 'cursor' ? 'builds the code' : p.id === 'codex' ? 'optional read-only analysis' : '';
+      return h('li', { class: 'tool' },
+        h('span', { class: 'tool-name' }, icon(AGENT_ICON[p.id] || 'diamond'), p.label || p.id),
+        badge(st[0], st[1]),
+        h('span', { class: 'muted tool-d' }, [p.version ? 'v' + String(p.version).replace(/^v/, '') : '', p.state === 'ok' ? roles : (p.hint || p.detail || '')].filter(Boolean).join(' · ')));
+    })),
+  ];
+}
+function renderTools() {
+  if (B.tools) B.tools.replaceChildren(...toolsNodes());
+}
+
 /* ───────────────────────── Quick Ask ───────────────────────── */
-function openAsk() {
+function renderReport(rp) {
+  const tone = { opened: ['good', 'Opened'], listed: ['warn', 'Listed, not opened'], unverified: ['bad', 'Unverified'] };
+  const out = [h('h3', null, 'Summary'), h('p', null, rp.summary)];
+  if (rp.findings.length) out.push(h('h3', null, 'Findings'), h('ul', { class: 'kv-list' }, rp.findings.map((f) => h('li', null, badge(tone[f.status][0], tone[f.status][1]), ' ', f.claim,
+    f.sources.length ? h('div', { class: 'muted' }, f.sources.map((x) => h('div', null, '— ', x.title || 'source', ' (', h('code', null, x.url), ') ', badge(tone[x.state][0], tone[x.state][1]), x.quote ? h('div', { class: 'ac-sub' }, '“' + x.quote + '”') : null))) : h('div', { class: 'muted' }, 'No usable source cited.')))));
+  if (rp.alternatives.length) out.push(h('h3', null, 'Alternatives'), h('ul', { class: 'kv-list' }, rp.alternatives.map((a) => h('li', null, h('b', null, a.name), a.pros.length ? h('div', null, 'For: ' + a.pros.join('; ')) : null, a.cons.length ? h('div', null, 'Against: ' + a.cons.join('; ')) : null))));
+  out.push(h('h3', null, 'Recommendation'), h('p', null, rp.recommendation));
+  if (rp.steps.length) out.push(h('h3', null, 'Suggested next steps'), h('ol', { class: 'kv-list' }, rp.steps.map((x) => h('li', null, x))));
+  out.push(h('h3', null, 'Limits of this report'), h('p', null, rp.limitations || 'None stated.'));
+  if (rp.fetched.length || rp.searched.length) out.push(h('details', null, h('summary', null, 'Everything it searched and opened'), rp.searched.length ? h('p', { class: 'muted' }, 'Searches: ' + rp.searched.join(' · ')) : null, rp.fetched.length ? h('p', { class: 'muted' }, 'Opened: ' + rp.fetched.join(' · ')) : null));
+  return out;
+}
+
+function openAsk(mode) {
+  const research = mode === 'research';
   const repos = (S.state && S.state.repos) || [];
   const idQ = uid('ask'); const idR = uid('ask'); const idC = uid('ask');
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
   const out = h('div', { class: 'stack', 'aria-live': 'polite' });
   const q = h('textarea', { class: 'textarea', id: idQ, maxlength: '4000', placeholder: 'Ask about the code, how something works, or what a change would involve…' });
-  const repo = h('select', { class: 'select', id: idR }, repos.length !== 1 ? h('option', { value: '' }, 'No repository (general question)') : null, repos.map((r) => h('option', { value: r.name }, r.name)));
+  const repo = h('select', { class: 'select', id: idR }, repos.length !== 1 ? h('option', { value: '' }, research ? 'No repository (research only)' : 'No repository (general question)') : null, repos.map((r) => h('option', { value: r.name }, r.name)));
   if (repos.length === 1) repo.value = repos[0].name;
   const change = h('input', { type: 'checkbox', id: idC });
   const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Ask');
@@ -1943,9 +1990,18 @@ function openAsk() {
   const stop = () => { if (timer) { clearTimeout(timer); timer = 0; } };
   const render = (r) => {
     const kids = [];
-    if (r.status === 'running') kids.push(h('p', { class: 'muted' }, 'Reading the code and answering…'));
+    if (r.status === 'running') kids.push(h('p', { class: 'muted' }, research ? 'Researching on the web — this can take a few minutes…' : 'Reading the code and answering…'));
+    if (r.status === 'done' && r.report) kids.push(...renderReport(r.report));
     if (r.status === 'failed') kids.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'No answer'), h('div', { class: 'pre' }, r.error || 'Something went wrong.'))));
     if (r.status === 'canceled') kids.push(h('p', { class: 'muted' }, 'Canceled.'));
+    if (r.status === 'done' && r.report) {
+      kids.push(h('p', { class: 'muted' }, 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.'));
+      if (r.convertedTo) kids.push(h('p', null, 'Turned into task ', h('b', null, r.convertedTo), '.'));
+      else if (r.repo) kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn btn-primary', onclick: async () => {
+        try { const c = await api('POST', '/api/asks/' + enc(r.id) + '/convert'); toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.'); loadState().catch(() => {}); render(await api('GET', '/api/asks/' + enc(r.id))); } catch (ex) { toast('error', ex.message); }
+      } }, 'Turn into an engineering plan')));
+      else kids.push(h('p', { class: 'muted' }, 'Choose a repository before asking if you want to turn the findings into an engineering plan.'));
+    }
     if (r.status === 'done' && r.result) {
       if (r.result.answer) kids.push(renderMarkdown(r.result.answer));
       if (r.result.kind === 'change' && r.result.change) kids.push(h('p', { class: 'muted' }, 'This looks like a request for a change: ' + r.result.change.title + ' (size ' + r.result.change.complexity + '). Nothing was changed.'));
@@ -1972,18 +2028,19 @@ function openAsk() {
     setBusy(submit, true);
     try {
       const body = { question: q.value.trim() };
+      if (research) body.mode = 'research';
       if (repo.value) body.repo = repo.value;
-      if (change.checked) body.allowChange = true;
+      if (change.checked && !research) body.allowChange = true;
       const r = await api('POST', '/api/ask', body);
       render(r); poll(r.id);
     } catch (ex) { setBusy(submit, false); err.hidden = false; setText(err, ex.message); }
   };
   const cancel = h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Close');
-  const dlg = dlgShell('Ask a question', [
-    h('p', { class: 'muted' }, 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.'),
-    field(idQ, 'Question', q),
-    repos.length ? field(idR, 'Repository', repo) : null,
-    h('div', { class: 'field' }, h('label', { for: idC }, change, ' Let Conductor make the change if it is small'), h('p', { class: 'hint' }, 'Only if the question asks for a change. This starts a task and spends your plan quota; its approval rules still apply.')),
+  const dlg = dlgShell(research ? 'Deep Research' : 'Ask a question', [
+    h('p', { class: 'muted' }, research ? 'Searches and reads sources on the web (it cannot see your code) and writes a report with citations. Needs the internet; uses your Claude plan.' : 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.'),
+    field(idQ, research ? 'What should be researched?' : 'Question', q),
+    repos.length ? field(idR, research ? 'Repository (only needed to turn findings into a plan)' : 'Repository', repo) : null,
+    research ? null : h('div', { class: 'field' }, h('label', { for: idC }, change, ' Let Conductor make the change if it is small'), h('p', { class: 'hint' }, 'Only if the question asks for a change. This starts a task and spends your plan quota; its approval rules still apply.')),
     err, out,
   ], [h('span', { class: 'spacer' }), cancel, submit], onSubmit, true);
   dlg.addEventListener('close', stop, { once: true });
@@ -2124,7 +2181,7 @@ const df = (id) => ({ focus: id });
 function renderWizard(force) {
   if (S.view !== 'wizard' || !S.state) return;
   const st = S.state;
-  const sig = JSON.stringify([st.setup, st.health, st.repos, S.route.view]);
+  const sig = JSON.stringify([st.setup, st.health, st.repos, st.providers, S.route.view]);
   if (!force && sig === W.sig) return;
   W.sig = sig;
   if (!W.inited) { W.inited = true; W.open = firstOpenStep(); }
@@ -2144,6 +2201,7 @@ function renderWizard(force) {
         h('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(WIZ_STEPS.length), 'aria-valuenow': String(done), 'aria-label': 'Setup progress' },
           (() => { const f = h('span'); f.style.setProperty('--pct', (done / WIZ_STEPS.length) * 100 + '%'); return f; })()),
         h('span', null, `${done} of ${WIZ_STEPS.length} done`))),
+    h('section', { class: 'tools tools-wiz', 'aria-label': 'Detected tools' }, ...toolsNodes()),
     h('ol', { class: 'steps' }, WIZ_STEPS.map(([id, title], idx) => wizStep(id, title, idx))),
     done === WIZ_STEPS.length ? h('section', { class: 'wiz-done', 'aria-labelledby': 'wiz-done-h' },
       h('h2', { id: 'wiz-done-h' }, 'You are set up'),

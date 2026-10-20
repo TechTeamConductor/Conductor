@@ -34,15 +34,18 @@ export interface ClaudeCall extends AgentCallBase {
   schema?: Schema;
   maxTurns: number;
   isolation: 'safe-mode' | 'setting-sources';
+  /** `research`: web tools only (WebSearch, WebFetch), no file tools. Verified live against the real CLI. */
+  profile?: 'research';
 }
 
-export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'isolation' | 'name' | 'model'>): string[] {
+export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'isolation' | 'name' | 'model' | 'profile'>): string[] {
   const args = [
     '-p',
     '--output-format', 'stream-json',
     '--verbose',
     ...(c.isolation === 'safe-mode' ? ['--safe-mode'] : ['--setting-sources', 'project,local']),
-    '--tools', 'Read,Grep,Glob',
+    '--tools', c.profile === 'research' ? 'WebSearch,WebFetch' : 'Read,Grep,Glob',
+    ...(c.profile === 'research' ? ['--allowedTools', 'WebSearch', 'WebFetch'] : []),
     // M5: the read-only stages still have Read — keep credential files out of reach (the reply is posted on the card)
     '--disallowedTools', ...CLAUDE_DENIED_READS,
     '--disable-slash-commands',
@@ -61,13 +64,15 @@ export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'iso
  * B1 fail-closed predicate. `plugins`/`agents` are informational (safe-mode lists installed-but-disabled plugins).
  * Returns ok:false with a reason when the session is NOT the locked-down read-only one we asked for.
  */
-export function checkClaudeInit(init: any, opts: { expectStructuredOutput?: boolean } = {}): { ok: boolean; reason?: string } {
+export function checkClaudeInit(init: any, opts: { expectStructuredOutput?: boolean; profile?: 'research' } = {}): { ok: boolean; reason?: string } {
   if (!init || typeof init !== 'object') return { ok: false, reason: 'no init event' };
   const tools: string[] = Array.isArray(init.tools) ? init.tools.map(String) : [];
-  const allowed = new Set<string>(CLAUDE_EXPECTED_TOOLS);
+  const research = opts.profile === 'research';
+  // exact tool sets per profile: plan/review/verify = file tools only; research = web tools only (never both, never anything else)
+  const allowed = new Set<string>(research ? ['WebSearch', 'WebFetch', 'StructuredOutput'] : CLAUDE_EXPECTED_TOOLS);
   const extra = tools.filter((t) => !allowed.has(t));
   if (extra.length) return { ok: false, reason: `unexpected tools present: ${extra.slice(0, 6).join(', ')}` };
-  for (const must of ['Read', 'Grep', 'Glob']) if (!tools.includes(must)) return { ok: false, reason: `expected tool missing: ${must}` };
+  for (const must of research ? ['WebSearch', 'WebFetch'] : ['Read', 'Grep', 'Glob']) if (!tools.includes(must)) return { ok: false, reason: `expected tool missing: ${must}` };
   if (opts.expectStructuredOutput && !tools.includes('StructuredOutput')) return { ok: false, reason: 'StructuredOutput tool missing' };
   const mcp = Array.isArray(init.mcp_servers) ? init.mcp_servers : [];
   if (mcp.length) return { ok: false, reason: `MCP servers present: ${mcp.map((m: any) => m?.name).filter(Boolean).slice(0, 4).join(', ')}` };
@@ -163,6 +168,8 @@ export function foldRateLimit(state: ClaudeStreamState, obj: any): void {
 
 export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
   const state: ClaudeStreamState = { init: null, result: null, limit: null, quota: null };
+  const observed = { read: new Set<string>(), listed: new Set<string>(), queries: [] as string[] };
+  const toolNames = new Map<string, string>();
   const ac = new AbortController();
   let isolationViolation: string | null = null;
   const onExternalAbort = () => ac.abort();
@@ -192,7 +199,7 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
       if (typeof obj?.session_id === 'string') state.sessionId = obj.session_id;
       if (obj.type === 'system' && obj.subtype === 'init') {
         state.init = obj;
-        const chk = checkClaudeInit(obj, { expectStructuredOutput: !!call.schema });
+        const chk = checkClaudeInit(obj, { expectStructuredOutput: !!call.schema, profile: call.profile });
         if (!chk.ok) {
           isolationViolation = chk.reason ?? 'isolation check failed';
           call.onEvent({ agent: 'claude', stage: call.stage, kind: 'error', text: `Isolation check failed — stopping: ${isolationViolation}` });
@@ -200,6 +207,20 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
         }
       } else if (obj.type === 'rate_limit_event') foldRateLimit(state, obj);
       else if (obj.type === 'result') state.result = obj;
+      if (call.profile === 'research') {
+        // structured tool events only — never URLs found in fetched page text or in the model's own words
+        const blocks = Array.isArray(obj?.message?.content) ? obj.message.content : [];
+        for (const b of blocks) {
+          if (obj.type === 'assistant' && b?.type === 'tool_use' && typeof b.id === 'string') {
+            toolNames.set(b.id, String(b.name));
+            if (b.name === 'WebFetch' && typeof b.input?.url === 'string') observed.read.add(b.input.url);
+            if (b.name === 'WebSearch' && typeof b.input?.query === 'string' && observed.queries.length < 50) observed.queries.push(b.input.query.slice(0, 300));
+          } else if (obj.type === 'user' && b?.type === 'tool_result' && toolNames.get(String(b.tool_use_id)) === 'WebSearch') {
+            const text = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((x: any) => String(x?.text ?? '')).join('\n') : '';
+            for (const m of text.matchAll(/"url"\s*:\s*"(https?:\/\/[^"\s]+)"/g)) if (observed.listed.size < 200) observed.listed.add(m[1]!);
+          }
+        }
+      }
       for (const ev of normalizeClaudeEvent(obj, { stage: call.stage, secrets: call.secrets })) call.onEvent(ev);
     },
   });
@@ -216,6 +237,7 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
     turns: typeof r?.num_turns === 'number' ? r.num_turns : undefined,
     exitCode: proc.code,
     quota: state.quota ?? undefined,
+    observed: call.profile === 'research' ? { read: [...observed.read].slice(0, 100), listed: [...observed.listed].slice(0, 200), queries: observed.queries } : undefined,
   };
 
   if (proc.spawnError) return { ...base, errorKind: 'spawn', error: `could not start claude: ${proc.spawnError}` };

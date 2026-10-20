@@ -32,6 +32,17 @@ export interface ReadOnlyRunReq {
   maxTurnsFactor?: number;
 }
 
+/** Deep Research: Claude with web tools only, in an empty scratch directory. */
+export interface ResearchRunReq {
+  cwd: string;
+  prompt: string;
+  schema: Schema;
+  name: string;
+  onEvent: (ev: EmitEvent) => void;
+  signal?: AbortSignal;
+  secrets?: string[];
+}
+
 export interface BuildRunReq {
   cwd: string;
   prompt: string;
@@ -109,5 +120,7 @@ export interface Provider {
   selfTest(cfg: Config, level: SelfTestLevel): Promise<SelfTestResult>;
   /** Read-only structured run. Its presence IS the `readOnly` capability. */
   runReadOnly?(req: ReadOnlyRunReq): Promise<AgentResult>;
+  /** Web research (Claude only today). */
+  runResearch?(req: ResearchRunReq): Promise<AgentResult>;
   build?: BuildCapability;
 }

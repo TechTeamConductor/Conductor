@@ -2,7 +2,7 @@
 import { resolveBin } from '../../config.ts';
 import { claudeEnv } from '../env.ts';
 import { runClaude } from '../claude.ts';
-import { PROVIDER_LABEL, type AuthResult, type Provider, type ProviderDeps, type ReadOnlyRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
+import { PROVIDER_LABEL, type AuthResult, type Provider, type ProviderDeps, type ReadOnlyRunReq, type ResearchRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
 import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
 
@@ -41,6 +41,19 @@ export function claudeProvider(d: ProviderDeps): Provider {
       // canary = one tiny read-only call through the real adapter (spends a little quota; callers must have asked)
       const r = await this.runReadOnly!({ stage: 'plan', cwd: process.cwd(), prompt: 'Return the JSON object {"ok": true} in a fenced json block. Do not use tools.', schema: { type: 'object' }, name: 'conductor probe', onEvent: () => undefined });
       return r.ok ? { level, state: 'ok', ok: true, detail: `Claude answered (${r.model ?? 'model'})` } : { level, state: r.errorKind === 'limit' ? 'ok' : 'unknown', ok: false, detail: r.errorKind === 'limit' ? `Signed in but at its usage limit — ${r.limit?.message ?? r.error}` : (r.error ?? 'Claude did not answer') };
+    },
+    async runResearch(req: ResearchRunReq) {
+      const cfg = d.getConfig();
+      const bin = resolveBin(cfg.agents.claude.bin);
+      if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Claude CLI "${cfg.agents.claude.bin}" not found. Install Claude Code or set agents.claude.bin.` };
+      // web tools need the isolated profile: the fallback that loads project/local settings (hooks) is refused for research
+      if (cfg.agents.claude.isolation !== 'safe-mode') return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: "Deep Research needs Claude's safe-mode isolation." };
+      return runClaude({
+        bin, cwd: req.cwd, prompt: req.prompt, stage: 'plan', name: req.name, schema: req.schema, profile: 'research',
+        maxTurns: 30, isolation: 'safe-mode', model: cfg.agents.claude.model,
+        env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(20),
+        signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
+      });
     },
     async runReadOnly(req: ReadOnlyRunReq) {
       const cfg = d.getConfig();

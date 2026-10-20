@@ -73,6 +73,7 @@ export function defaultConfig(): Config {
       readOnlyParallel: 2,
       contextRunsPerDay: 12,
       asksPerHour: 20,
+      researchPerDay: 5,
       policy: 'full-auto',
       verifyEachItem: false,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
@@ -144,6 +145,7 @@ export function normalizeConfig(input: unknown): Config {
       readOnlyParallel: clamp(pl.readOnlyParallel, 1, 4, d.pipeline.readOnlyParallel),
       contextRunsPerDay: clamp(pl.contextRunsPerDay, 1, 48, d.pipeline.contextRunsPerDay),
       asksPerHour: clamp(pl.asksPerHour, 1, 60, d.pipeline.asksPerHour),
+      researchPerDay: clamp(pl.researchPerDay, 1, 20, d.pipeline.researchPerDay),
       policy: oneOf(pl.policy, ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'] as const, d.pipeline.policy),
       verifyEachItem: pl.verifyEachItem === true,
       timeoutsMin: {

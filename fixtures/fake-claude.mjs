@@ -68,7 +68,8 @@ if (dir) {
 }
 
 const sid = randomUUID();
-const tools = step.badInit ? ['Glob', 'Grep', 'Read', 'Bash', 'StructuredOutput'] : ['Glob', 'Grep', 'Read', 'StructuredOutput'];
+const isResearch = argv.includes('WebSearch,WebFetch');
+const tools = isResearch ? ['WebFetch', 'WebSearch', 'StructuredOutput', ...(step.extraTool ? [step.extraTool] : [])] : step.badInit ? ['Glob', 'Grep', 'Read', 'Bash', 'StructuredOutput'] : ['Glob', 'Grep', 'Read', 'StructuredOutput'];
 out({
   type: 'system', subtype: 'init', cwd: process.cwd(), session_id: sid, tools,
   mcp_servers: step.badInit ? [{ name: 'claude.ai Linear', status: 'connected', source: 'claudeai' }] : [],
@@ -144,11 +145,16 @@ let payload;
 if (stage === 'plan') payload = planFor();
 else if (stage === 'plan_review') payload = reviewFor();
 else if (stage === 'ask') payload = { kind: 'answer', answer: `Answer about ${title}.`, citations: [], ...(step.json ?? {}) };
+else if (stage === 'research') payload = { summary: 'Research summary.', findings: [{ claim: 'Opened claim', sources: [{ url: 'https://example.com/a?utm_source=x#frag', title: 'A', quote: 'q' }] }, { claim: 'Listed claim', sources: [{ url: 'https://example.com/listed', title: 'L', quote: 'q' }] }, { claim: 'Made-up claim', sources: [{ url: 'https://example.com/never-seen', title: 'N', quote: 'q' }] }, { claim: 'Bad scheme', sources: [{ url: 'javascript:alert(1)', title: 'X', quote: '' }, { url: 'https://user:pw@example.com/', title: 'Y', quote: '' }] }], alternatives: [{ name: 'Option A', pros: ['fast'], cons: ['new'] }], recommendation: 'Use option A.', steps: ['Do step one', 'Do step two'], limitations: 'None.', ...(step.json ?? {}) };
 else if (stage === 'analysis') payload = { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) };
 else if (stage === 'verify') payload = verdictFor();
 else payload = { note: `fake claude does not handle stage ${stage}` };
 if (step.raw) payload = step.raw; // e.g. an invalid object to test validation
 
+if (isResearch) {
+  out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'w1', name: 'WebSearch', input: { query: 'fake query' } }, { type: 'tool_use', id: 'w2', name: 'WebFetch', input: { url: 'https://example.com/a' } }] }, session_id: sid });
+  out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'Links: [{"title":"L","url":"https://example.com/listed"}]' }] }, session_id: sid });
+}
 const text = '```json\n' + JSON.stringify(payload, null, 2) + '\n```';
 out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: step.noStructured ? text : 'Done.' }] }, session_id: sid });
 const result = { type: 'result', subtype: 'success', is_error: false, result: step.noStructured ? text : 'Done.', session_id: sid, total_cost_usd: 0.0123, num_turns: 4, duration_ms: 1200 };

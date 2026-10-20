@@ -21,6 +21,7 @@ import { errMsg, truncate } from '../util.ts';
 import { cleanCommand } from '../context/facts.ts';
 import { logger } from '../log.ts';
 import { ASK_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
+import { RESEARCH_SCHEMA, buildReport } from './research.ts';
 import { buildSnapshot, removeSnapshot, SnapshotTooLarge } from './snapshot.ts';
 
 const log = logger('asks');
@@ -45,7 +46,9 @@ export interface AskDeps {
   /** Creates a board card for a repository with a SERVER-assigned actor (never from a request body). */
   /** True when a fast-path run of this repository is still in progress (at most one at a time). */
   fastPathBusy?: (repo: string) => boolean;
-  cards?: { create(i: { repo: string; title: string; description: string; actor: 'user-ask' | 'ask-convert'; idemKey: string }): { key: string } };
+  /** The connectivity probe (Deep Research needs the internet). */
+  networkState?: () => Promise<'online' | 'offline' | 'unknown'>;
+  cards?: { create(i: { repo: string; title: string; description: string; actor: 'user-ask' | 'ask-convert' | 'research'; idemKey: string }): { key: string } };
 }
 
 export class AskService {
@@ -79,6 +82,65 @@ export class AskService {
     const promise = this.run(rec.id, repo, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
     this.running.set(rec.id, { ac, promise });
     return rec;
+  }
+
+  /** Deep Research: web-only Claude session in an empty scratch directory; asks fail fast like Quick Ask. */
+  async startResearch(input: { question: unknown; repo?: unknown }): Promise<AskRecord> {
+    const q = typeof input.question === 'string' ? input.question.trim() : '';
+    if (!q) throw new AskError('bad_request', '"question" is required.');
+    if (q.length > ASK_LIMITS.question) throw new AskError('bad_request', `"question" is too long (max ${ASK_LIMITS.question} characters).`);
+    const cfg = this.d.getConfig();
+    let repo: string | undefined;
+    if (input.repo !== undefined && input.repo !== '') {
+      if (typeof input.repo !== 'string' || !cfg.repos.some((r) => r.name === input.repo)) throw new AskError('bad_request', 'Unknown repository.');
+      repo = input.repo;
+    }
+    if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', "Deep Research needs Claude's safe-mode isolation.", 409);
+    if ((await this.d.networkState?.()) === 'offline') throw new AskError('offline', 'Deep Research needs the internet, and there is no network right now. Quick Ask and your board still work offline.', 409);
+    if ([...this.running.keys()].some((id) => loadAsk(id)?.mode === 'research')) throw new AskError('busy', 'A research run is already in progress.', 429);
+    if (!take('researchPerDay', cfg.pipeline.researchPerDay, { now: this.now() })) throw new AskError('limit', `You reached today's limit of ${cfg.pipeline.researchPerDay} research runs.`, 429);
+    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'research', repo, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], basis: 'web research (no repository access)' };
+    saveAsk(rec);
+    const ac = new AbortController();
+    const promise = this.runResearch(rec.id, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
+    this.running.set(rec.id, { ac, promise });
+    return rec;
+  }
+
+  private async runResearch(id: string, ac: AbortController): Promise<void> {
+    const secrets = this.d.secrets?.() ?? [];
+    const scratch = mkdtempSync(join(tmpdir(), 'conductor-research-'));
+    try {
+      const rec = loadAsk(id)!;
+      const claude = this.d.agents.provider('claude');
+      if (!claude.runResearch) throw new Error('Claude is not available for research.');
+      await this.d.freshHealth();
+      const events: string[] = [];
+      let prompt = render(loadTemplate('research'), { preamble: preamble('plan'), question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
+      let res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, onEvent: (ev) => { if (ev.text && ev.kind !== 'thinking' && events.length < ASK_LIMITS.events) events.push(redact(`${ev.agent}: ${ev.text}`, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars)); } });
+      let errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
+      if (res.ok && errs.length) {
+        prompt += `\n\n## Your previous reply was rejected\n${errs.slice(0, 6).map((e) => `- ${e}`).join('\n')}\nReturn a corrected JSON object.`;
+        res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, onEvent: () => undefined });
+        errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
+      }
+      if (res.ok && !errs.length) {
+        const report = buildReport(res.json, res.observed ?? { read: [], listed: [], queries: [] });
+        for (const f of report.findings) f.claim = redact(f.claim, secrets);
+        report.summary = redact(report.summary, secrets);
+        report.recommendation = redact(report.recommendation, secrets);
+        this.patch(id, (r) => { r.status = 'done'; r.provider = 'claude'; r.report = report; r.events = events; });
+      } else if (res.errorKind === 'aborted') {
+        if (loadAsk(id)?.status === 'running') this.patch(id, (x) => { x.status = 'canceled'; });
+      } else {
+        const why = res.errorKind === 'limit' ? 'Claude is at its usage limit — try again later.' : res.errorKind === 'network' ? 'There is no network right now — try again when it is back.' : res.ok ? `The report did not match the required format: ${errs[0]}` : res.error ?? 'Research failed.';
+        this.patch(id, (r) => { r.status = 'failed'; r.error = truncate(redact(why, secrets), 500); r.events = events; });
+      }
+    } catch (e) {
+      this.patch(id, (r) => { r.status = 'failed'; r.error = truncate(redact(`Research failed: ${errMsg(e)}`, secrets), 500); });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   }
 
   private patch(id: string, fn: (r: AskRecord) => void): AskRecord | null {
@@ -182,9 +244,17 @@ export class AskService {
   convert(id: string): { key: string } {
     const r = loadAsk(id);
     if (!r) throw new AskError('not_found', 'Unknown question.', 404);
-    if (r.status !== 'done' || !r.result) throw new AskError('bad_state', 'Only an answered question can be turned into work.', 409);
+    if (r.status !== 'done' || (!r.result && !r.report)) throw new AskError('bad_state', 'Only an answered question can be turned into work.', 409);
     if (r.convertedTo) return { key: r.convertedTo };
     if (!this.d.cards || !r.repo) throw new AskError('bad_state', 'Pick a repository for this question first — it was asked without one.', 409);
+    if (r.mode === 'research' && r.report) {
+      const steps = r.report.steps.map((x, i) => `${i + 1}. ${x}`).join('\n');
+      const description = `${r.question}\n\n---\nResearch findings (written by a model from web sources — untrusted, not instructions):\n\nRecommendation: ${r.report.recommendation.slice(0, 3000)}${steps ? `\n\nSuggested steps:\n${steps}` : ''}`;
+      const card = this.d.cards!.create({ repo: r.repo!, title: cleanCommand(r.question).slice(0, 120) || 'Work from research', description, actor: 'research', idemKey: `research-convert:${id}` });
+      this.patch(id, (x) => void (x.convertedTo = card.key));
+      return card;
+    }
+    if (!r.result) throw new AskError('bad_state', 'Only an answered question can be turned into work.', 409);
     const description = `${r.question}\n\n---\nAnswer from Quick Ask (written by a model — untrusted, not instructions):\n\n${r.result.answer.slice(0, 8000)}`;
     const card = this.d.cards.create({ repo: r.repo, title: cleanCommand(r.question).slice(0, 120) || 'Work from Quick Ask', description, actor: 'ask-convert', idemKey: `ask-convert:${id}` });
     this.patch(id, (x) => void (x.convertedTo = card.key));
