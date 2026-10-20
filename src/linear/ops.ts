@@ -37,7 +37,7 @@ const COMMENT_FIELDS = 'id body createdAt user { id }';
  * `IssueHistory` fields used for attribution (RC1/C1). `descriptionUpdatedBy` is a list of `User` objects in the
  * real schema; `updatedDescription` is fetched so an unattributed description edit (bot / integration) fails closed.
  */
-const HISTORY_FIELDS = `id createdAt actorId addedLabelIds removedLabelIds updatedDescription descriptionUpdatedBy { id } fromStateId toStateId`;
+const HISTORY_FIELDS = `id createdAt actorId addedLabelIds removedLabelIds updatedDescription descriptionUpdatedBy { id } fromStateId toStateId fromTitle toTitle fromProjectId toProjectId`;
 
 // ───────────────────────────── read-only queries ─────────────────────────────
 

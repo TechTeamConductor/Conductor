@@ -14,7 +14,9 @@ import { logger } from '../log.ts';
 import * as W from '../git/worktree.ts';
 import * as G from '../git/gates.ts';
 import { gitOk } from '../git/exec.ts';
-import { attributeDescription, attributeTrigger, findTriggerLabelOnIssue, viewerComments } from '../linear/attribution.ts';
+import { scanBranchForSecrets } from '../git/branchscan.ts';
+import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
+import { attributeDescription, attributeTitle, attributeTrigger, findTriggerLabelOnIssue, viewerComments } from '../linear/attribution.ts';
 import { BUG_LABEL, type StageKey } from '../linear/names.ts';
 import type { PipelineCtx } from './context.ts';
 import { PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
@@ -91,8 +93,11 @@ export class Stages {
     }
   }
 
-  async toNeedsHuman(key: string, reason: string, origin: NextStep, comment?: string): Promise<void> {
+  async toNeedsHuman(key: string, reasonRaw: string, origin: NextStep, commentRaw?: string): Promise<void> {
     const now = this.c.clock.now();
+    const secrets = this.c.secretsFor(this.run(key));
+    const reason = redact(reasonRaw, secrets); // agent/gate text can carry secrets into the UI, notifications and Linear (H3)
+    const comment = commentRaw === undefined ? undefined : redact(commentRaw, secrets);
     const run = this.patch(key, (r) => {
       r.status = 'needs_human';
       r.needsHuman = { reason: truncate(reason, 600), origin, at: now };
@@ -119,6 +124,10 @@ export class Stages {
     const before = this.run(key);
     const streak = (before.limitStreak ?? 0) + 1;
     const episode = streak === 1 ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
+    if (episode > 6) {
+      // M12: a run that keeps getting rejected (or a provider that keeps faking limits) must not stall silently forever
+      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${limit.provider === 'claude' ? 'Claude' : 'Cursor'} plan limits, then move it to Todo to retry.`, before.next);
+    }
     const known = !!limit.resetsAt && limit.resetsAt > now;
     const backoffMin = Math.min(360, 15 * 2 ** (streak - 1));
     const until = known ? limit.resetsAt! : now + backoffMin * 60_000;
@@ -196,6 +205,8 @@ export class Stages {
       if (!a.ok) return { issue, problem: a.reason ?? 'trigger label attribution failed' };
       const d = attributeDescription(issue, this.c.viewerId());
       if (!d.ok) return { issue, problem: d.reason ?? 'description attribution failed' };
+      const ti = attributeTitle(issue, this.c.viewerId());
+      if (!ti.ok) return { issue, problem: ti.reason ?? 'title attribution failed' };
     } catch {
       /* provisioning lookup failed: not an integrity problem */
     }
@@ -230,6 +241,7 @@ export class Stages {
       const cfg = this.c.cfg();
       const stageCfg = stage === 'plan' ? cfg.stages.plan : stage === 'plan_review' ? cfg.stages.review : cfg.stages.verify;
       const forced: AgentName | undefined = stageCfg === 'claude' && this.c.pausedUntil('claude') && cfg.pipeline.onClaudeLimit === 'cursor' ? 'cursor' : undefined;
+      if (forced && attempt === 0) this.note(key, stage, 'Claude is rate-limited, so Cursor is doing this read-only step (ask mode — it does not have Claude\'s tool lock-down).');
       const res = await this.c.agents.readOnly({
         stage,
         cwd,
@@ -397,13 +409,17 @@ export class Stages {
       const p = j as Plan;
       if (!errs.length && p.blocked?.is && !(p.blocked.questions?.length > 0)) errs.push('$.blocked.questions: required when blocked.is is true');
       if (!errs.length && p.deliverable === 'answer' && !String(p.answer ?? '').trim()) errs.push('$.answer: required when deliverable is "answer"');
+      if (!errs.length && p.deliverable !== 'answer' && !(p.filesToChange?.length > 0)) errs.push('$.deliverable: this plan changes no files — if the task is a question or analysis, set "deliverable" to "answer" and put the full answer in "answer"; otherwise list the files to change');
       if (!errs.length && p.deliverable !== 'answer' && !(p.acceptanceCriteria?.length > 0)) errs.push('$.acceptanceCriteria: needs at least 1 item for a code change');
       return errs;
     });
     if (called.kind === 'stop') return;
     const plan = called.json as Plan;
+    const secretsForRun = this.c.secretsFor(run);
+    plan.summary = redact(plan.summary, secretsForRun);
+    if (plan.answer) plan.answer = redact(plan.answer, secretsForRun);
     this.c.store.writeArtifact(key, `plan-${run.rev}.json`, plan);
-    const md = planToMarkdown(plan);
+    const md = redact(planToMarkdown(plan), secretsForRun);
     this.c.store.writeArtifact(key, `plan-${run.rev}.md`, md);
     try {
       mkdirSync(join(run.worktree, '.conductor'), { recursive: true });
@@ -611,6 +627,7 @@ export class Stages {
     if (run.agentRuns + 1 > cfg.pipeline.maxAgentRunsPerIssue) {
       return this.toNeedsHuman(key, `This issue has used its limit of ${cfg.pipeline.maxAgentRunsPerIssue} agent runs.`, 'build');
     }
+    const metaSnap = await snapshotGitMeta(repo.path).catch(() => null);
     const res = await this.c.agents.build({
       cwd: run.worktree,
       prompt,
@@ -622,6 +639,11 @@ export class Stages {
     });
     this.finishSession(key, res);
     this.refundIfLimit(key, res);
+    if (metaSnap) {
+      // M8: a builder must not leave persistent code execution behind (git hooks, core.hooksPath, aliases, a pushurl …)
+      const tampered = await revertGitMeta(metaSnap).catch(() => []);
+      if (tampered.length) return this.toNeedsHuman(key, `The builder changed git settings/hooks (${tampered.slice(0, 4).join(', ')}). Conductor restored them; review the worktree before continuing.`, 'build');
+    }
     if (!res.ok) return this.handleBuildFailure(key, res);
     this.patch(key, (r) => void (r.buildFails = 0));
 
@@ -635,6 +657,8 @@ export class Stages {
         // the builder may have committed by itself: accept real work instead of calling it "no changes"
         const headNow = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
         if (headNow && headNow !== known && headNow !== run.baseSha) {
+          const selfProblem = await this.postBuildChecks(run, plan, secrets);
+          if (selfProblem) return this.toNeedsHuman(key, selfProblem, 'build');
           this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
           this.patch(key, (r) => {
             r.commitSha = headNow;
@@ -644,6 +668,21 @@ export class Stages {
           return;
         }
         if (run.loop === 1 && !isFix) {
+          const answerText = redact(String(res.text ?? ''), secrets).trim();
+          if (plan.filesToChange.length === 0 && answerText.length >= 40) {
+            // the plan itself changed nothing (a question): the builder's reply is the deliverable — finish as "answered"
+            this.patch(key, (r) => {
+              r.answered = true;
+              r.status = 'ready';
+              r.next = 'none';
+              r.needsHuman = undefined;
+              r.history.push({ ts: this.c.clock.now(), text: 'Answered (no code change needed)' });
+            });
+            await this.applyStage(key, 'ready');
+            await this.c.effects.comment(key, `answer:${run.rev}`, `🤖 **Answer** — no code change was needed\n\n${truncate(answerText, 24_000)}`);
+            this.c.notify(`${key} answered`, truncate(run.title, 80));
+            return;
+          }
           return this.toNeedsHuman(key, 'The builder finished without changing any files. The task may need to be clarified.', 'build');
         }
         return this.toNeedsHuman(key, 'The builder made no changes in response to the reported problems.', 'build');
@@ -660,17 +699,29 @@ export class Stages {
       }
       return this.toNeedsHuman(key, `Could not commit the build: ${committed.detail}`, 'build');
     }
-    const diff = await W.diffAgainst(run.worktree, run.baseSha);
-    const violations = W.diffScopeViolations(diff.files.map((f) => f.path), plan.filesToChange.map((f) => f.path));
-    if (violations.length) {
-      return this.toNeedsHuman(key, `The builder changed protected files that the plan did not list: ${violations.slice(0, 6).join(', ')}. Review them (they are committed on the branch) before continuing.`, 'build');
-    }
+    const buildProblem = await this.postBuildChecks(run, plan, secrets);
+    if (buildProblem) return this.toNeedsHuman(key, buildProblem, 'build');
     this.patch(key, (r) => {
       r.commitSha = committed.sha;
       r.commitNote = undefined;
       r.next = 'verify';
       r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${committed.files.length} file(s) committed (${committed.sha.slice(0, 7)})` });
     });
+  }
+
+  /** Everything the BRANCH now contains (incl. commits the agent made itself) must pass the scope and secret checks. */
+  private async postBuildChecks(run: Run, plan: Plan, secrets: string[]): Promise<string | null> {
+    const diff = await W.diffAgainst(run.worktree, run.baseSha);
+    const paths = diff.files.flatMap((f) => [f.path, ...(f.from ? [f.from] : [])]); // a rename's SOURCE counts too (M6)
+    const violations = W.diffScopeViolations(paths, plan.filesToChange.map((f) => f.path));
+    if (violations.length) {
+      return `The builder changed protected files that the plan did not list: ${violations.slice(0, 6).join(', ')}. Review them (they are committed on the branch) before continuing.`;
+    }
+    const leaks = await scanBranchForSecrets(run.worktree, run.baseSha, secrets);
+    if (leaks.length) {
+      return `The branch contains what looks like a secret (${leaks.slice(0, 4).join('; ')}). Nothing was pushed. Remove it from the branch history before continuing.`;
+    }
+    return null;
   }
 
   private async hasUncommitted(wt: string): Promise<boolean> {

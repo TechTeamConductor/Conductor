@@ -11,7 +11,7 @@ import { loadEnvSecrets, redact } from '../redact.ts';
 import { logger } from '../log.ts';
 import { notify as defaultNotify } from '../notify.ts';
 import * as W from '../git/worktree.ts';
-import { attributeDescription, attributeTrigger, findTriggerLabelOnIssue, hasApproveCommand, hasMarker } from '../linear/attribution.ts';
+import { attributeDescription, attributeProject, attributeTitle, attributeTrigger, currentStateMover, findTriggerLabelOnIssue, hasApproveCommand, viewerAttributedLabels, type IssueWithFlags } from '../linear/attribution.ts';
 import { resolveProvisioned, type Provisioned } from '../linear/provision.ts';
 import { Effects } from './effects.ts';
 import type { PipelineCtx } from './context.ts';
@@ -60,6 +60,7 @@ export class Engine {
   private failCounts = new Map<string, number>();
   private quotaMap = new Map<AgentName, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
+  private moveCache = new Map<string, string>();
   private changeListeners = new Set<() => void>();
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
 
@@ -68,7 +69,7 @@ export class Engine {
     this.store = deps.store;
     this.clock = deps.clock ?? systemClock;
     this.persistentDeps = deps.persistent ?? { load: loadState, save: saveState };
-    this.effects = new Effects({ store: deps.store, linear: deps.linear, secrets: (r) => this.secretsFor(r) });
+    this.effects = new Effects({ store: deps.store, linear: deps.linear, secrets: (r) => this.secretsFor(r), viewerId: () => deps.getConfig().linear.viewerId ?? this.viewer });
     this.stages = new Stages(this.makeCtx());
   }
 
@@ -334,8 +335,10 @@ export class Engine {
       if (!a.ok) return this.ignore(issue, a.reason ?? 'trigger label was added by someone else');
       const d = attributeDescription(full, viewerId);
       if (!d.ok) return this.ignore(issue, d.reason ?? 'description was edited by someone else');
+      const ti = attributeTitle(full, viewerId);
+      if (!ti.ok) return this.ignore(issue, ti.reason ?? 'title was edited by someone else');
     }
-    const repo = this.resolveRepo(full);
+    const repo = this.resolveRepo(full, assignedPickup ? undefined : viewerId);
     const seed = {
       key: full.identifier,
       issueId: full.id,
@@ -381,14 +384,17 @@ export class Engine {
   }
 
   /** label `repo:<name>` > Linear project name > the only registered repo > `repo: <name>` first line. Registered repos only. */
-  resolveRepo(issue: LinearIssue): RepoConfig | null {
+  resolveRepo(issue: LinearIssue, trustedFor?: string): RepoConfig | null {
     const repos = this.d.getConfig().repos;
     const byName = (n: string) => repos.find((r) => r.name.toLowerCase() === n.trim().toLowerCase()) ?? null;
-    for (const l of issue.labels) {
+    // labels / project steer which checkout a `--force` agent works in: only trust ones the API-key owner set (H2)
+    const labels = trustedFor ? viewerAttributedLabels(issue as IssueWithFlags, trustedFor) : issue.labels;
+    const projectName = !trustedFor || attributeProject(issue as IssueWithFlags, trustedFor).ok ? issue.projectName : null;
+    for (const l of labels) {
       const m = /^repo:\s*(.+)$/i.exec(l.name);
       if (m && byName(m[1]!)) return byName(m[1]!);
     }
-    if (issue.projectName && byName(issue.projectName)) return byName(issue.projectName);
+    if (projectName && byName(projectName)) return byName(projectName);
     if (repos.length === 1) return repos[0]!;
     const first = (issue.description ?? '').split('\n').find((l) => l.trim());
     const m = first ? /^repo:\s*([\w.-]+)\s*$/i.exec(first.trim()) : null;
@@ -419,12 +425,12 @@ export class Engine {
     }
     const t = issue.state.type;
     if (t === 'backlog' || t === 'triage') {
-      if (active && run.status !== 'parked') await this.park(run);
+      if (active && run.status !== 'parked' && (await this.moveIsMine(run, issue))) await this.park(run);
       return;
     }
     if (t === 'unstarted') {
       const humanMoved = !!run.expected.stateId;
-      if (run.status === 'parked' || (humanMoved && active) || (TERMINAL.has(run.status) && humanMoved)) {
+      if ((run.status === 'parked' || (humanMoved && active) || (TERMINAL.has(run.status) && humanMoved)) && (await this.moveIsMine(run, issue))) {
         await this.rerunFromHuman(run.key);
       }
       return;
@@ -443,21 +449,48 @@ export class Engine {
       let approved = false;
       if (cfg.linear.mode === 'states') {
         const prov = await this.prov().catch(() => null);
-        approved = !!prov?.stageStateIds && issue.state.id === prov.stageStateIds.building;
+        approved = !!prov?.stageStateIds && issue.state.id === prov.stageStateIds.building && (await this.moveIsMine(run, issue));
       }
       if (!approved) {
-        try {
-          const full = await this.linearOrThrow().issue(run.issueId);
-          const all = full.comments ?? [];
-          // only `/approve` comments written AFTER our approval request count (clock-independent anchor)
-          const anchor = all.findIndex((c) => hasMarker(c.body, `${run.key}:approval:${run.rev}`));
-          approved = hasApproveCommand(anchor >= 0 ? all.slice(anchor + 1) : all, this.viewerId());
-        } catch {
-          /* transient */
+        // Fail closed: `/approve` only counts when it comes AFTER the approval request we actually posted (anchored on that
+        // comment's stored id, not on a text marker a teammate could forge). No request posted yet => nothing can be approved.
+        const req = run.effects[`approval:${run.rev}`];
+        if (req?.status === 'done' && req.linearId) {
+          try {
+            const full = (await this.linearOrThrow().issue(run.issueId)) as IssueWithFlags;
+            const all = full.comments ?? [];
+            const anchor = all.findIndex((c) => c.id === req.linearId);
+            if (anchor >= 0 && !full.commentsTruncated) approved = hasApproveCommand(all.slice(anchor + 1), this.viewerId());
+          } catch {
+            /* transient */
+          }
         }
       }
       if (approved) this.approve(run.key, 'human');
     }
+  }
+
+  /**
+   * Only the API-key owner may park / restart / approve by moving the issue (H1). The mover comes from issue history;
+   * an unknown or foreign mover is ignored (and remembered per issue revision so we do not re-fetch every poll).
+   */
+  private async moveIsMine(run: Run, issue: LinearIssue): Promise<boolean> {
+    const stamp = `${issue.updatedAt}|${issue.state.id}`;
+    const cached = this.moveCache.get(run.key);
+    if (cached?.startsWith(stamp)) return cached.endsWith('|yes');
+    let mine = false;
+    try {
+      const full = await this.linearOrThrow().issue(run.issueId);
+      const mover = currentStateMover(full as IssueWithFlags);
+      mine = !!mover && mover.actorId === this.viewerId();
+      if (!mine) {
+        this.d.store.appendEvent(run.key, { agent: 'conductor', stage: 'engine', kind: 'note', text: `Ignored a status change made by ${mover?.actorId ?? 'an unknown actor'} — only the Linear API-key owner can move a run.` });
+      }
+    } catch {
+      return false; // cannot verify who moved it: do nothing this poll
+    }
+    this.moveCache.set(run.key, `${stamp}|${mine ? 'yes' : 'no'}`);
+    return mine;
   }
 
   private async park(run: Run): Promise<void> {
@@ -495,6 +528,19 @@ export class Engine {
         await this.stages.toNeedsHuman(key, `Cannot restart: ${d.reason ?? 'the description was edited by someone else'}`, 'plan');
         return;
       }
+      const ti = attributeTitle(issue, viewerId);
+      if (!ti.ok) {
+        await this.stages.toNeedsHuman(key, `Cannot restart: ${ti.reason ?? 'the title was edited by someone else'}`, 'plan');
+        return;
+      }
+    }
+    // rolling limit on human restarts: even the owner's own automation must not be able to spin this forever
+    const nowT = this.clock.now();
+    const recent = (run0.restartTimes ?? []).filter((t) => nowT - t < 3_600_000);
+    if (recent.length >= 5) {
+      this.d.store.update(key, (r) => void (r.restartTimes = recent));
+      await this.stages.toNeedsHuman(key, 'This run was restarted 5 times within an hour, so Conductor is pausing it to protect your quota. Wait a while (or fix the underlying problem), then move it to Todo again.', run0.next);
+      return;
     }
     const was = run0.status === 'parked' ? (run0.parkedFrom ?? 'running') : run0.status;
     const origin: NextStep | undefined = run0.needsHuman?.origin;
@@ -509,13 +555,15 @@ export class Engine {
         log.warn(`${key}: backup/reset skipped: ${errMsg(e)}`);
       }
     }
-    const repo = run0.repo ? null : issue ? this.resolveRepo(issue) : null;
+    const repo = run0.repo ? null : issue ? this.resolveRepo(issue, run0.assignedPickup ? undefined : this.viewerId()) : null;
     const obsolete = retryStage ? [] : run0.bugs.filter((b) => b.status === 'open' && b.linearId);
     this.d.store.update(key, (r) => {
       const now = this.clock.now();
+      r.restartTimes = [...recent, nowT];
       r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-issue cap becomes a dead end)
       r.buildFails = 0;
       r.limitStreak = 0;
+      r.limitEpisode = 0;
       if (issue) {
         r.title = issue.title;
         r.description = issue.description ?? '';

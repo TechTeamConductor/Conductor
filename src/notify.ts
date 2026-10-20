@@ -6,6 +6,9 @@ let lastAt = 0;
 let override: ((title: string, message: string) => void) | null = null;
 
 /** Tests/demo can capture notifications instead of showing them. */
+/** L3: osascript would read an argument starting with `-` as an option. */
+const noDash = (s: string): string => (s.startsWith('-') ? ` ${s}` : s);
+
 export function setNotifier(fn: ((title: string, message: string) => void) | null): void {
   override = fn;
 }
@@ -29,7 +32,7 @@ export function notify(title: string, message: string): void {
   if (process.platform !== 'darwin' || process.env.CONDUCTOR_NO_NOTIFY === '1') return;
   execFile(
     '/usr/bin/osascript',
-    ['-e', 'on run argv', '-e', 'display notification (item 1 of argv) with title (item 2 of argv)', '-e', 'end run', m, t],
+    ['-e', 'on run argv', '-e', 'display notification (item 1 of argv) with title (item 2 of argv)', '-e', 'end run', noDash(m), noDash(t)],
     { timeout: 10_000 },
     () => {
       /* ignore failures */

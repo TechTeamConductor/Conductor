@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RepoConfig } from '../../src/types.ts';
 import { git } from '../../src/git/exec.ts';
@@ -1142,18 +1143,40 @@ describe('writeCursorGuard / checkCursorGuard', () => {
     const w = await mkWt(r);
     const first = await writeCursorGuard(w.path);
     const second = await writeCursorGuard(w.path);
-    assert.deepEqual(second, { written: false, envOnly: false, sha256: first.sha256 });
+    // M7: the file is REWRITTEN on every build (never trusted from a previous loop) — same bytes, same hash
+    assert.deepEqual(second, { written: true, envOnly: false, sha256: first.sha256 });
   });
 
-  it('an existing .cursor/cli.json (untracked) is never touched ⇒ env-only', async () => {
+  it('a tampered untracked copy is replaced by the exact deny file on the next build (M7)', async () => {
+    const r = makeRepo();
+    const w = await mkWt(r);
+    const first = await writeCursorGuard(w.path);
+    writeFileSync(join(w.path, '.cursor', 'cli.json'), '{"permissions":{"allow":["Shell(git:push*)"],"deny":[]}}');
+    const second = await writeCursorGuard(w.path);
+    assert.equal(second.sha256, first.sha256);
+    assert.equal(readFileSync(join(w.path, '.cursor', 'cli.json'), 'utf8'), CURSOR_GUARD_JSON);
+  });
+
+  it('never writes through a symlink planted at .cursor (M9)', async () => {
+    const r = makeRepo();
+    const w = await mkWt(r);
+    const outside = mkdtempSync(join(tmpdir(), 'cond-outside-'));
+    symlinkSync(outside, join(w.path, '.cursor'));
+    await writeCursorGuard(w.path);
+    assert.equal(existsSync(join(outside, 'cli.json')), false, 'nothing was written through the link');
+    assert.equal(readFileSync(join(w.path, '.cursor', 'cli.json'), 'utf8'), CURSOR_GUARD_JSON);
+  });
+
+  it('an existing UNTRACKED .cursor/cli.json is replaced by ours (it cannot be the repo\'s own file)', async () => {
     const r = makeRepo();
     const w = await mkWt(r);
     mkdirSync(join(w.path, '.cursor'), { recursive: true });
     writeFileSync(join(w.path, '.cursor', 'cli.json'), '{"permissions":{"allow":["Shell(ls)"],"deny":[]}}');
     const g = await writeCursorGuard(w.path);
-    assert.deepEqual(g, { written: false, envOnly: true, sha256: null });
-    assert.equal(readFileSync(join(w.path, '.cursor', 'cli.json'), 'utf8'), '{"permissions":{"allow":["Shell(ls)"],"deny":[]}}');
-    assert.deepEqual((await checkCursorGuard(w.path, null)).ok, true);
+    assert.equal(g.written, true);
+    assert.equal(g.envOnly, false);
+    assert.equal(readFileSync(join(w.path, '.cursor', 'cli.json'), 'utf8'), CURSOR_GUARD_JSON);
+    assert.equal((await checkCursorGuard(w.path, g.sha256)).ok, true);
   });
 
   it('a TRACKED .cursor/cli.json ⇒ env-only and untouched', async () => {

@@ -125,9 +125,10 @@ async function start(): Promise<void> {
   await rt.server.listenControl(paths.control());
   await rt.refreshLinear();
   rt.engine.start();
-  const url = rt.server.loginUrl();
+  const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
+  const url = `http://127.0.0.1:${port}`;
   console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C. Reopen the dashboard any time with:  npm run open\n`);
-  if (!flag('--no-open') && cfg.ui.openBrowser) openBrowser(url);
+  if (!flag('--no-open') && cfg.ui.openBrowser) openBrowser(loginTarget);
   const shutdown = async (sig: string) => {
     log.info(`${sig}: shutting down`);
     try {
@@ -149,7 +150,7 @@ async function openCmd(): Promise<void> {
   }
   try {
     const r = await controlRequest('/otp', 'POST');
-    openBrowser(r.url);
+    openBrowser(r.file || r.url);
     console.log('Opened the dashboard in your browser (the sign-in link works once).');
   } catch (e) {
     console.error(`Could not reach the running Conductor: ${errMsg(e)}`);

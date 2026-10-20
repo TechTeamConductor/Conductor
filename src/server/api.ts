@@ -51,7 +51,17 @@ export interface ApiDeps {
 }
 
 const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
-const REPO_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+// L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
+const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** L8: a malformed %-escape must be a 400, not an exception. */
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    throw new ApiFail(400, 'bad_request', 'Malformed URL.');
+  }
+}
 
 function str(v: unknown, name: string, max: number, required = true): string {
   if (v === undefined || v === null || v === '') {
@@ -187,9 +197,9 @@ export class Api {
     let m: RegExpExecArray | null;
     if (method === 'GET') {
       if (path === '/api/state') return { json: await this.state() };
-      if ((m = /^\/api\/runs\/([^/]+)$/.exec(path))) return { json: this.runDetail(decodeURIComponent(m[1]!)) };
+      if ((m = /^\/api\/runs\/([^/]+)$/.exec(path))) return { json: this.runDetail(safeDecode(m[1]!)) };
       if ((m = /^\/api\/runs\/([^/]+)\/log$/.exec(path))) {
-        return { json: this.runLog(decodeURIComponent(m[1]!), Number(q.get('after') ?? 0), Number(q.get('limit') ?? 500)) };
+        return { json: this.runLog(safeDecode(m[1]!), Number(q.get('after') ?? 0), Number(q.get('limit') ?? 500)) };
       }
       throw new ApiFail(404, 'not_found', 'No such endpoint.');
     }
@@ -207,7 +217,7 @@ export class Api {
     }
 
     if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open)$/.exec(path)) && method === 'POST') {
-      const key = decodeURIComponent(m[1]!);
+      const key = safeDecode(m[1]!);
       if (!KEY_RE.test(key) || !this.d.store.get(key)) throw new ApiFail(404, 'not_found', 'Unknown run.');
       switch (m[2]) {
         case 'approve':
@@ -292,6 +302,7 @@ export class Api {
 
     if (method === 'POST' && path === '/api/setup/repo') {
       const raw = str(body.path, 'path', 1000).trim();
+      if (/[\x00-\x1f\x7f]/.test(raw)) throw new ApiFail(400, 'bad_request', 'That path contains control characters.'); // L7
       if (!raw.startsWith('/') && !raw.startsWith('~')) throw new ApiFail(400, 'bad_request', 'Enter the full folder path, e.g. /Users/you/code/my-app');
       const p = raw.startsWith('~') ? resolve(process.env.HOME ?? '/', raw.slice(2)) : resolve(raw);
       let info: Awaited<ReturnType<typeof inspectRepo>>;
@@ -301,7 +312,7 @@ export class Api {
         throw new ApiFail(400, 'bad_repo', errMsg(e));
       }
       const cfg = this.d.getConfig();
-      let name = str(body.name, 'name', 64, false) || basename(info.root).replace(/[^A-Za-z0-9._-]/g, '-');
+      let name = str(body.name, 'name', 64, false) || basename(info.root).replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[^A-Za-z0-9]+/, '') || 'repo';
       if (!REPO_NAME_RE.test(name)) throw new ApiFail(400, 'bad_request', 'Name may only contain letters, numbers, dots, dashes and underscores.');
       if (cfg.repos.some((r) => r.name.toLowerCase() === name.toLowerCase() && r.path !== info.root)) name = `${name}-${cfg.repos.length + 1}`;
       const gates = await detectGates(info.root);
@@ -313,7 +324,7 @@ export class Api {
     }
 
     if (method === 'DELETE' && (m = /^\/api\/setup\/repo\/([^/]+)$/.exec(path))) {
-      const name = decodeURIComponent(m[1]!);
+      const name = safeDecode(m[1]!);
       const cfg = this.d.getConfig();
       if (!cfg.repos.some((r) => r.name === name)) throw new ApiFail(404, 'not_found', 'Unknown repository.');
       if (this.d.store.list().some((r) => r.repo === name && !['finished', 'aborted', 'ready'].includes(r.status))) {

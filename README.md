@@ -47,7 +47,7 @@ Everything Conductor does is also written to the Linear issue as comments, so yo
 
 | Where | What you see |
 | --- | --- |
-| **Conductor dashboard** (master view) | board of all runs, live log of both agents, plan, verification, gates, bugs, costs |
+| **Conductor dashboard** (master view) | board of all runs, live log of both agents, plan, verification, gates, bugs |
 | **Linear** | status labels, plan/verification comments, bug sub-issues |
 | **Claude app** | "Open in Claude app" runs `claude --desktop --resume <session>` for that run's Claude session |
 | **Terminal** | every session has a copyable `claude --resume …` / `agent --resume …` command |
@@ -61,7 +61,6 @@ Everything Conductor does is also written to the Linear issue as comments, so yo
 - **Your own global rules** (TechTeam, Cursor rules, …) would normally hijack a headless agent. Claude is isolated from them; Cursor cannot be, so the builder prompt explicitly overrides plan/review/tracker rules, and Conductor holds anything that touches `.claude/`, `.cursor/`, `AGENTS.md`, CI config, etc. for you to look at.
 - **Usage limits are handled:** when Claude says "weekly limit", **Cursor takes over the read-only stages automatically** (default `onClaudeLimit: "cursor"`); if you choose "wait" instead, runs pause (not fail) and resume by themselves after the reset. Repeated limits back off (15 min → 6 h) and post one Linear comment per episode.
 - **Which Claude?** Conductor calls the `claude` command-line tool, which is signed in separately from the Claude desktop app and can be a different plan. `npm run doctor` and the dashboard show which account and plan it uses; switch with `claude auth logout && claude auth login`.
-- **Costs shown (≈$) are estimates** of API-equivalent value reported by the tools — you are not billed per run on flat-rate plans.
 
 ## Commands
 

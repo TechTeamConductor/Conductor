@@ -1,7 +1,8 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { startDemo, type DemoHandle } from '../src/demo.ts';
 
 let demo: DemoHandle;
@@ -202,4 +203,69 @@ test('logout revokes the session', async () => {
   const out = await raw('/api/auth/logout', { method: 'POST', headers: { cookie: c2, 'content-type': 'application/json', 'x-conductor-csrf': st.csrf, 'sec-fetch-site': 'same-origin' }, body: '{}' });
   assert.equal(out.status, 200);
   assert.equal((await raw('/api/state', { headers: { cookie: c2 } })).status, 401);
+});
+
+// ───────────── security review: H4 (code never on a command line), M11 (`//`), M2 (cross-site reads) ─────────────
+test('H4: the bridge page POSTs the one-time code; the sign-in cookie is set with a 200 + meta refresh and the code is single use', async () => {
+  const dir = join(demo.home, 'run');
+  mkdirSync(dir, { recursive: true });
+  const file = demo.rt.server.loginFile(dir);
+  const html = readFileSync(file, 'utf8');
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.match(html, /method="post" action="http:\/\/127\.0\.0\.1:\d+\/auth"/);
+  const otp = /name="otp" value="([^"]+)"/.exec(html)![1]!;
+  const body = `otp=${encodeURIComponent(otp)}`;
+  const hdr = { 'content-type': 'application/x-www-form-urlencoded', 'content-length': String(Buffer.byteLength(body)) };
+  const ok = await raw('/auth', { method: 'POST', headers: hdr, body });
+  assert.equal(ok.status, 200);
+  assert.match(String(ok.headers['set-cookie']?.[0]), /HttpOnly; SameSite=Strict/);
+  assert.match(ok.text, /http-equiv="refresh"/);
+  assert.equal(existsSync(file), false, 'the bridge file is deleted once used');
+  assert.equal((await raw('/auth', { method: 'POST', headers: hdr, body })).status, 403, 'a second use is refused');
+});
+
+test('M11: `GET //` and over-long URLs get a quiet 400 — no exception, no 500', async () => {
+  assert.equal((await raw('//', { headers: authed() })).status, 400);
+  assert.equal((await raw('//evil.example/x', { headers: authed() })).status, 400);
+  assert.equal((await raw('/' + 'a'.repeat(5000), { headers: authed() })).status, 400);
+  assert.equal((await raw('/api/state', { headers: authed() })).status, 200, 'the server is still fine');
+});
+
+test('M2: cross-site reads of the API / event stream are refused; same-origin reads work', async () => {
+  assert.equal((await raw('/api/state', { headers: authed({ 'sec-fetch-site': 'cross-site' }) })).status, 403);
+  assert.equal((await raw('/api/events', { headers: authed({ 'sec-fetch-site': 'same-site' }) })).status, 403);
+  assert.equal((await raw('/api/state', { headers: authed({ 'sec-fetch-site': 'same-origin' }) })).status, 200);
+});
+
+test('M2: sessions expire — 14 days absolute, 3 days idle; v1 session files still load', async () => {
+  const { Auth } = await import('../src/server/auth.ts');
+  let now = 1_000_000;
+  const a = new Auth({ now: () => now });
+  const sid = a.consumeOtp(a.mintOtp())!;
+  assert.equal(a.validSession(sid), true);
+  now += 2 * 24 * 3600_000;
+  assert.equal(a.validSession(sid), true, 'used within 3 days');
+  now += 2.9 * 24 * 3600_000;
+  assert.equal(a.validSession(sid), true, 'still used within 3 days of the last use');
+  now += 3.1 * 24 * 3600_000;
+  assert.equal(a.validSession(sid), false, 'idle > 3 days');
+  const b = new Auth({ now: () => now });
+  const sid2 = b.consumeOtp(b.mintOtp())!;
+  for (let i = 0; i < 15; i++) {
+    now += 1 * 24 * 3600_000;
+    if (i < 13) assert.equal(b.validSession(sid2), true);
+  }
+  assert.equal(b.validSession(sid2), false, '14 days after sign-in, even if used daily');
+});
+
+test('M2: a v1 sessions file (hash list) still loads after the upgrade', async () => {
+  const { Auth } = await import('../src/server/auth.ts');
+  const { sha256 } = await import('../src/util.ts');
+  const { writeFileSync: wf, mkdtempSync: mk } = await import('node:fs');
+  const { tmpdir: td } = await import('node:os');
+  const dir = mk(join(td(), 'cond-auth-'));
+  const f = join(dir, 'sessions.json');
+  wf(f, JSON.stringify([sha256('old-session-id')]));
+  assert.equal(new Auth({ persistPath: f }).validSession('old-session-id'), true);
+  rmSync(dir, { recursive: true, force: true });
 });

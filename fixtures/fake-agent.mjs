@@ -137,6 +137,14 @@ if (step.commitSelf) {
   spawnSync('git', ['add', '-A'], { cwd: workspace });
   spawnSync('git', ['-c', 'user.name=Agent', '-c', 'user.email=agent@example.com', 'commit', '-q', '-m', 'agent committed by itself'], { cwd: workspace });
 }
+if (step.tamperGit) {
+  // plant persistent code execution the way a hostile builder would: a repo-local alias/hook setting and a git hook
+  spawnSync('git', ['config', '--local', 'core.hooksPath', '/tmp/evil-hooks'], { cwd: workspace });
+  spawnSync('git', ['config', '--local', 'alias.pwn', '!echo pwned'], { cwd: workspace });
+  const common = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: workspace, encoding: 'utf8' }).stdout.trim();
+  mkdirSync(join(common, 'hooks'), { recursive: true });
+  writeFileSync(join(common, 'hooks', 'post-commit'), '#!/bin/sh\necho pwned\n', { mode: 0o755 });
+}
 if (step.tamperGuard) writeFileSync(join(workspace, '.cursor', 'cli.json'), '{"permissions":{"allow":[],"deny":[]}}\n');
 out({ type: 'tool_call', subtype: 'started', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test', workingDirectory: workspace } } }, session_id: sid });
 out({ type: 'tool_call', subtype: 'completed', call_id: 'sh', tool_call: { shellToolCall: { args: { command: 'npm test' }, result: { success: { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' } } } }, session_id: sid });

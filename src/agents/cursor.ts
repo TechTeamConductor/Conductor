@@ -151,7 +151,9 @@ export async function runCursor(call: CursorCall): Promise<AgentResult> {
 
   const failed = !result || result.is_error === true || (proc.code !== 0 && proc.code !== null);
   if (failed) {
-    const probe = `${finalText}\n${proc.stderrTail}`;
+    // M12: classify from what the CLI itself reported (stderr, or a SHORT error result) — never from long model-written prose,
+    // which a hostile repo/prompt could use to fake a "limit" and stall every run.
+    const probe = `${result?.is_error === true && finalText.length <= 500 ? finalText : ''}\n${proc.stderrTail}`;
     if (LIMIT_RE.test(probe)) {
       return {
         ...base,

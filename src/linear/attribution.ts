@@ -139,6 +139,47 @@ export function attributeDescription(issue: IssueWithFlags, viewerId: string): A
   return { ok: true };
 }
 
+/** The issue TITLE reaches planner/builder prompts, so it needs the same attribution as the description (H2). */
+export function attributeTitle(issue: IssueWithFlags, viewerId: string): AttributionResult {
+  const bad = historyUnusable(issue);
+  if (bad) return { ok: false, reason: bad };
+  if (issue.creatorId !== viewerId) return { ok: false, reason: `issue was created by ${issue.creatorId ?? 'an unknown user'} (not the API-key owner), so its title is not trusted` };
+  for (const h of sortedHistory(issue.history ?? [])) {
+    for (const u of h.titleUpdatedBy ?? []) if (u !== viewerId) return { ok: false, reason: `title was edited by user ${u} (not the API-key owner) at ${h.createdAt}` };
+  }
+  return { ok: true };
+}
+
+/** The Linear project (used for repo mapping) is trusted only if nobody else moved the issue between projects. */
+export function attributeProject(issue: IssueWithFlags, viewerId: string): AttributionResult {
+  const bad = historyUnusable(issue);
+  if (bad) return { ok: false, reason: bad };
+  for (const h of sortedHistory(issue.history ?? [])) {
+    for (const u of h.projectUpdatedBy ?? []) if (u !== viewerId) return { ok: false, reason: `project was changed by user ${u} (not the API-key owner) at ${h.createdAt}` };
+  }
+  return { ok: true };
+}
+
+/** Labels that are safe to act on: added by the viewer (latest adder), or present from creation on a viewer-created issue. */
+export function viewerAttributedLabels(issue: IssueWithFlags, viewerId: string): LinearLabel[] {
+  if (historyUnusable(issue)) return [];
+  const hist = sortedHistory(issue.history ?? []);
+  return issue.labels.filter((l) => {
+    let lastAdd: LinearHistoryEntry | undefined;
+    for (const h of hist) if (h.addedLabelIds.includes(l.id)) lastAdd = h;
+    return lastAdd ? lastAdd.actorId === viewerId : issue.creatorId === viewerId;
+  });
+}
+
+/** Who moved the issue into its CURRENT state (null if unknown). A teammate must not be able to restart runs (H1). */
+export function currentStateMover(issue: IssueWithFlags): { actorId: string | null; at: string } | null {
+  const hist = sortedHistory(issue.history ?? []);
+  for (let i = hist.length - 1; i >= 0; i--) {
+    if (hist[i]!.toStateId === issue.state.id) return { actorId: hist[i]!.actorId, at: hist[i]!.createdAt };
+  }
+  return null;
+}
+
 /** Viewer-authored comments, oldest first, EXCLUDING Conductor's own comments (those carry a marker). */
 export function viewerComments(issue: Pick<LinearIssue, 'comments'>, viewerId: string): LinearComment[] {
   return (issue.comments ?? [])

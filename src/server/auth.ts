@@ -14,7 +14,9 @@ export class Auth {
   /** CSRF token handed to authenticated clients via /api/state; mutations must echo it in X-Conductor-CSRF. */
   readonly csrf: string = randomToken(24);
   private otps = new Map<string, number>();
-  private sessions = new Set<string>(); // SHA-256 hashes of valid session ids (never the ids themselves)
+  /** SHA-256 hash of the session id → created / last-used (never the ids themselves). */
+  private sessions = new Map<string, { c: number; l: number }>();
+  private lastSave = 0;
   private ttl: number;
   private now: () => number;
   private persistPath: string | undefined;
@@ -23,13 +25,25 @@ export class Auth {
     this.ttl = opts.otpTtlMs ?? 60_000;
     this.now = opts.now ?? (() => Date.now());
     this.persistPath = opts.persistPath;
-    if (this.persistPath) for (const h of readJsonFile<string[]>(this.persistPath, [])) if (typeof h === 'string') this.sessions.add(h);
+    if (this.persistPath) {
+      const raw = readJsonFile<unknown>(this.persistPath, []);
+      const t = this.now();
+      if (Array.isArray(raw)) {
+        for (const h of raw) if (typeof h === 'string') this.sessions.set(h, { c: t, l: t }); // v1 file: hashes only
+      } else if (raw && typeof raw === 'object' && Array.isArray((raw as any).sessions)) {
+        for (const s of (raw as any).sessions) if (s && typeof s.h === 'string' && Number.isFinite(s.c) && Number.isFinite(s.l)) this.sessions.set(s.h, { c: s.c, l: s.l });
+      }
+    }
   }
+  /** Sessions end 14 days after sign-in, or after 3 days without use. */
+  static readonly ABSOLUTE_MS = 14 * 24 * 3600_000;
+  static readonly IDLE_MS = 3 * 24 * 3600_000;
 
   private save(): void {
     if (!this.persistPath) return;
     try {
-      atomicWriteFile(this.persistPath, JSON.stringify([...this.sessions].slice(-20)) + '\n', 0o600);
+      const list = [...this.sessions].slice(-20).map(([h, v]) => ({ h, c: v.c, l: v.l }));
+      atomicWriteFile(this.persistPath, JSON.stringify({ v: 2, sessions: list }) + '\n', 0o600);
     } catch {
       /* sessions then simply do not survive a restart */
     }
@@ -48,13 +62,28 @@ export class Auth {
     this.otps.delete(otp);
     if (exp === undefined || exp < this.now()) return null;
     const sid = randomToken(32);
-    this.sessions.add(sha256(sid));
+    this.sessions.set(sha256(sid), { c: this.now(), l: this.now() });
     this.save();
     return sid;
   }
 
   validSession(sid: string | undefined): boolean {
-    return !!sid && this.sessions.has(sha256(sid));
+    if (!sid) return false;
+    const h = sha256(sid);
+    const s = this.sessions.get(h);
+    if (!s) return false;
+    const t = this.now();
+    if (t - s.c > Auth.ABSOLUTE_MS || t - s.l > Auth.IDLE_MS) {
+      this.sessions.delete(h);
+      this.save();
+      return false;
+    }
+    s.l = t;
+    if (t - this.lastSave > 60_000) {
+      this.lastSave = t;
+      this.save();
+    }
+    return true;
   }
   revoke(sid: string | undefined): void {
     if (sid && this.sessions.delete(sha256(sid))) this.save();
@@ -78,7 +107,7 @@ export function parseCookies(header: string | undefined): Record<string, string>
 }
 
 export function sessionCookie(sid: string): string {
-  return `${COOKIE_NAME}=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`;
+  return `${COOKIE_NAME}=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1209600`;
 }
 export function clearCookie(): string {
   return `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;

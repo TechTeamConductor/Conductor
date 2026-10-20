@@ -1,7 +1,8 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { randomToken } from '../util.ts';
 import type { RunStore } from '../store.ts';
 import type { Engine } from '../pipeline/engine.ts';
 import { logger } from '../log.ts';
@@ -11,6 +12,7 @@ import { Auth, COOKIE_NAME, clearCookie, parseCookies, sessionCookie } from './a
 
 const log = logger('http');
 const MAX_BODY = 1024 * 1024;
+const MAX_SSE = 50;
 
 const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
@@ -41,6 +43,21 @@ export interface ServerDeps {
 
 type Sse = { res: http.ServerResponse; alive: boolean };
 
+function safeList(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+function rmQuiet(file: string): void {
+  try {
+    unlinkSync(file);
+  } catch {
+    /* already gone */
+  }
+}
+
 export class DashboardServer {
   readonly server: http.Server;
   private control: http.Server | null = null;
@@ -51,6 +68,7 @@ export class DashboardServer {
   private pingTimer: NodeJS.Timeout | null = null;
   private unsubs: (() => void)[] = [];
   private sockPath: string | null = null;
+  private bridgeDir: string | null = null;
 
   constructor(deps: ServerDeps) {
     this.d = deps;
@@ -96,7 +114,7 @@ export class DashboardServer {
     this.control = http.createServer((req, res) => {
       res.setHeader('Content-Type', 'application/json');
       if (req.method === 'POST' && req.url === '/otp') {
-        res.end(JSON.stringify({ url: this.loginUrl() }));
+        res.end(JSON.stringify({ url: this.loginUrl(), file: this.loginFile(this.sockPath ? dirname(this.sockPath) : '') }));
       } else if (req.method === 'GET' && req.url === '/status') {
         res.end(JSON.stringify({ pid: process.pid, port: this.port }));
       } else {
@@ -117,6 +135,23 @@ export class DashboardServer {
 
   loginUrl(): string {
     return `http://127.0.0.1:${this.port}/auth?otp=${this.d.auth.mintOtp()}`;
+  }
+
+  /**
+   * H4: the one-time code must not appear on a command line (visible to every process of this user via `ps`).
+   * Write a private 0600 page that POSTs it to /auth and open THAT file instead.
+   */
+  loginFile(dir: string): string {
+    if (!dir) return '';
+    this.bridgeDir = dir;
+    for (const f of safeList(dir)) if (/^open-[a-f0-9]+\.html$/.test(f)) rmQuiet(join(dir, f));
+    const file = join(dir, `open-${randomToken(8).replace(/[^a-f0-9]/gi, 'a').toLowerCase()}.html`);
+    const otp = this.d.auth.mintOtp();
+    const page = `<!doctype html><meta charset="utf-8"><title>Opening Conductor…</title><body style="font:15px system-ui;margin:3em">Opening Conductor…<form id="f" method="post" action="http://127.0.0.1:${this.port}/auth"><input type="hidden" name="otp" value="${otp}"><noscript><button>Continue</button></noscript></form><script>document.getElementById('f').submit()</script></body>`;
+    writeFileSync(file, page, { mode: 0o600 });
+    const t = setTimeout(() => rmQuiet(file), 120_000);
+    t.unref();
+    return file;
   }
 
   toast(level: 'info' | 'warn' | 'error', text: string): void {
@@ -205,7 +240,10 @@ export class DashboardServer {
     try {
       const host = String(req.headers.host ?? '');
       if (!this.hostOk(host)) return this.fail(res, 421, 'bad_host', 'Unexpected Host header.');
-      const url = new URL(req.url ?? '/', `http://${host}`);
+      const rawUrl = req.url ?? '/';
+      // `GET //` makes `new URL()` treat the path as a host and throw (M11) — reject quietly instead of logging an error
+      if (!rawUrl.startsWith('/') || rawUrl.startsWith('//') || rawUrl.length > 4096) return this.fail(res, 400, 'bad_request', 'Bad request.');
+      const url = new URL(rawUrl, `http://${host}`);
       const method = (req.method ?? 'GET').toUpperCase();
       const path = url.pathname;
       const sid = parseCookies(req.headers.cookie)[COOKIE_NAME];
@@ -217,6 +255,22 @@ export class DashboardServer {
         const s = this.d.auth.consumeOtp(url.searchParams.get('otp') ?? '');
         if (!s) return this.send(res, 403, LOGIN_PAGE.replace('<p>This dashboard', '<p><strong>That sign-in link has expired or was already used.</strong></p><p>This dashboard'), 'text/html; charset=utf-8');
         return this.send(res, 302, '', 'text/plain', { Location: '/', 'Set-Cookie': sessionCookie(s) });
+      }
+      if (method === 'POST' && path === '/auth') {
+        // form-encoded (the bridge page); one-time code only. A fresh session is returned with a 200 + meta refresh, because
+        // a redirect would stay a cross-site navigation and the SameSite=Strict cookie would not be sent with it.
+        const chunks: Buffer[] = [];
+        let n = 0;
+        for await (const c of req) {
+          n += (c as Buffer).length;
+          if (n > 4096) return this.fail(res, 413, 'too_large', 'Too large.');
+          chunks.push(c as Buffer);
+        }
+        const s = this.d.auth.consumeOtp(new URLSearchParams(Buffer.concat(chunks).toString('utf8')).get('otp') ?? '');
+        if (!s) return this.send(res, 403, LOGIN_PAGE.replace('<p>This dashboard', '<p><strong>That sign-in link has expired or was already used.</strong></p><p>This dashboard'), 'text/html; charset=utf-8');
+        const dir = this.bridgeDir ?? '';
+        if (dir) for (const f of safeList(dir)) if (/^open-[a-f0-9]+\.html$/.test(f)) rmQuiet(join(dir, f));
+        return this.send(res, 200, '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>Signed in</title><a href="/">Continue</a>', 'text/html; charset=utf-8', { 'Set-Cookie': sessionCookie(s) });
       }
       const st = method === 'GET' || method === 'HEAD' ? STATIC[path] : undefined;
       if (st && st.public) return this.serveStatic(res, st);
@@ -230,6 +284,9 @@ export class DashboardServer {
       if (st) return this.serveStatic(res, st);
       if (!path.startsWith('/api/')) return this.fail(res, 404, 'not_found', 'Not found.');
 
+      // reads are not CSRF-exposed to cross-origin pages (no CORS), but a cross-site <img>/fetch could still trigger SSE/GETs: refuse them
+      const sfsGet = req.headers['sec-fetch-site'];
+      if (method === 'GET' && typeof sfsGet === 'string' && sfsGet !== 'same-origin' && sfsGet !== 'none') return this.fail(res, 403, 'cross_site', 'Cross-site requests are not allowed.');
       if (method === 'GET' && path === '/api/events') return this.openStream(req, res);
 
       if (method === 'GET') return this.runApi(res, method, path, url.searchParams, {}, sid);
@@ -280,6 +337,7 @@ export class DashboardServer {
   }
 
   private openStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (this.clients.size >= MAX_SSE) return this.fail(res, 503, 'busy', 'Too many open dashboard tabs.');
     res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.write('retry: 3000\n\n');
     const c: Sse = { res, alive: true };

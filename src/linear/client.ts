@@ -143,6 +143,10 @@ interface HistoryNode {
   descriptionUpdatedBy?: { id: string }[] | null;
   fromStateId?: string | null;
   toStateId?: string | null;
+  fromTitle?: string | null;
+  toTitle?: string | null;
+  fromProjectId?: string | null;
+  toProjectId?: string | null;
 }
 
 /** Marker used when Linear says the description changed but names no user (bot / integration / import). */
@@ -183,6 +187,9 @@ export function mapHistory(n: HistoryNode): LinearHistoryEntry {
     addedLabelIds: n.addedLabelIds ?? [],
     removedLabelIds: n.removedLabelIds ?? [],
     descriptionUpdatedBy: by,
+    // a title/project change is attributed to the actor; with no actor it fails closed as 'unattributed'
+    titleUpdatedBy: n.toTitle != null || n.fromTitle != null ? [n.actorId ?? UNATTRIBUTED_ACTOR] : [],
+    projectUpdatedBy: n.toProjectId != null || n.fromProjectId != null ? [n.actorId ?? UNATTRIBUTED_ACTOR] : [],
     fromStateId: n.fromStateId ?? null,
     toStateId: n.toStateId ?? null,
   };

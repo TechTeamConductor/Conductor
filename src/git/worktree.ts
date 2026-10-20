@@ -5,6 +5,7 @@
  * Contract: see `.techteam/plans/conductor-v1.md` §2 (Isolation RC2/RC3, Verification integrity RC7, resume matrix,
  * carry-forwards C2 and C5). Erasable TypeScript only; node:* built-ins only; argv-only git calls.
  */
+import { safeWriteInside } from '../fsutil.ts';
 import { access, appendFile, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { constants as fsc, existsSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -696,8 +697,9 @@ export async function diffAgainst(worktree: string, baseSha: string): Promise<{ 
   return { stat: redact(statR.stdout), patch: redact(patch), files };
 }
 
-const PROTECTED_DIR_SEGMENTS = new Set(['.claude', '.cursor', '.husky', '.techteam', '.conductor']);
-const PROTECTED_FILE_NAMES = new Set(['.mcp.json', 'agents.md', 'claude.md', 'claude.local.md', 'gemini.md']);
+const PROTECTED_DIR_SEGMENTS = new Set(['.claude', '.cursor', '.husky', '.techteam', '.conductor', '.devcontainer', '.vscode']);
+// instruction/config files that tools auto-load or execute (security review M6)
+const PROTECTED_FILE_NAMES = new Set(['.mcp.json', 'agents.md', 'claude.md', 'claude.local.md', 'gemini.md', '.envrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs', '.cursorrules', '.windsurfrules', 'lefthook.yml', '.pre-commit-config.yaml']);
 
 function isProtectedPath(p: string): boolean {
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
@@ -924,6 +926,8 @@ export async function agentGitEnv(repoRoot: string): Promise<Record<string, stri
   env.GIT_ASKPASS = '/usr/bin/false';
   env.SSH_ASKPASS = '/usr/bin/false';
   env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_CONFIG_GLOBAL = '/dev/null'; // the user's global git config (aliases, includes, credential helpers) is not the agent's business
+  env.GIT_CONFIG_NOSYSTEM = '1';
   return env;
 }
 
@@ -939,6 +943,9 @@ export async function agentGitEnv(repoRoot: string): Promise<Record<string, stri
 export const CURSOR_GUARD_DENY = [
   'Shell(git:push*)',
   'Shell(git:*push*)',
+  'Shell(git:*send-pack*)',
+  'Shell(ssh:*)',
+  'Shell(nc:*)',
   'Shell(/usr/bin/git:*push*)',
   'Shell(/opt/homebrew/bin/git:*push*)',
   'Shell(/usr/local/bin/git:*push*)',
@@ -957,18 +964,10 @@ export async function writeCursorGuard(worktree: string): Promise<{ written: boo
   const top = await topLevel(worktree);
   const file = join(top, '.cursor', 'cli.json');
   const tracked = await git(top, ['ls-files', '--error-unmatch', '--', '.cursor/cli.json']);
-  if (tracked.code === 0 || (await exists(file))) {
-    // Re-entry (e.g. build loop 2): the file we wrote earlier is byte-identical ⇒ the deny rule is still in force.
-    try {
-      const cur = await readFile(file);
-      if (cur.toString('utf8') === CURSOR_GUARD_JSON) return { written: false, envOnly: false, sha256: sha256(cur) };
-    } catch {
-      /* unreadable: treat as foreign */
-    }
-    return { written: false, envOnly: true, sha256: null };
-  }
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(file, CURSOR_GUARD_JSON, { flag: 'wx' });
+  if (tracked.code === 0) return { written: false, envOnly: true, sha256: null }; // the repo's own file: never overwrite
+  // Untracked (ours from an earlier loop, or planted): REWRITE it every build so a tampered/loosened copy never survives (M7),
+  // and never write through a symlink (M9).
+  safeWriteInside(top, '.cursor/cli.json', CURSOR_GUARD_JSON);
   await addToSharedExclude(top, ['/.cursor/cli.json']);
   return { written: true, envOnly: false, sha256: sha256(CURSOR_GUARD_JSON) };
 }

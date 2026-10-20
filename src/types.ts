@@ -232,6 +232,8 @@ export interface Run {
   lastEventSeq: number;
   /** Markers: conversation comments already consumed into prompts (Linear comment ids). */
   commentsSeen: string[];
+  /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
+  restartTimes?: number[];
 }
 
 // ───────────────────────────── config ─────────────────────────────
@@ -342,6 +344,9 @@ export interface LinearHistoryEntry {
   removedLabelIds: string[];
   /** Users who edited the description in this entry (empty/undefined if not edited). */
   descriptionUpdatedBy: string[];
+  /** Who changed the issue TITLE / PROJECT in this entry (security review H2: both reach agent prompts). */
+  titleUpdatedBy?: string[];
+  projectUpdatedBy?: string[];
   fromStateId?: string | null;
   toStateId?: string | null;
 }

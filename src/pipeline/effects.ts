@@ -9,10 +9,17 @@ const log = logger('effects');
 const MAX_ATTEMPTS = 12;
 const COMMENT_LIMIT = 30_000;
 
+/** Agent-written text is untrusted: no remote images (tracking/exfil) and no @mentions that would ping teammates (L12). */
+function neutralise(s: string): string {
+  return s.replace(/!\[/g, '!\\[').replace(/@(?=[A-Za-z0-9_])/g, '@\u200b');
+}
+
 type StatePayload = { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[] };
 type SubIssuePayload = { fp: string; title: string; description: string; labelIds: string[]; stateId?: string; teamId: string };
 
 export interface EffectsDeps {
+  /** Only comments/issues authored by the API-key owner can be adopted as Conductor's own (marker spoofing, M3). */
+  viewerId?: () => string | undefined;
   store: RunStore;
   linear: () => LinearPort | null;
   secrets: (run: Run) => string[];
@@ -53,7 +60,7 @@ export class Effects {
     return this.serial(key, async () => {
       const run = this.deps.store.get(key);
       if (!run || run.effects[effKey]?.status === 'done') return;
-      const safe = truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT);
+      const safe = neutralise(truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT));
       this.setRec(key, effKey, { kind: 'comment', payload: { body: safe } });
       await this.apply(key, effKey);
     });
@@ -64,7 +71,7 @@ export class Effects {
     return this.serial(key, async () => {
       const run = this.deps.store.get(key);
       if (!run || run.effects[effKey]?.status === 'done') return;
-      const safe = truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT);
+      const safe = neutralise(truncate(redact(body, this.deps.secrets(run)), COMMENT_LIMIT));
       this.setRec(key, effKey, { kind: 'comment', payload: { body: safe, issueId } });
       await this.apply(key, effKey);
     });
@@ -143,7 +150,8 @@ export class Effects {
         let found: string | undefined;
         if (lookup) {
           const issue = await linear.issue(target);
-          found = issue.comments?.find((c) => hasMarker(c.body, mk))?.id;
+          const me = this.deps.viewerId?.();
+          found = issue.comments?.find((c) => hasMarker(c.body, mk) && (!me || c.userId === me))?.id;
         }
         linearId = found ?? (await linear.comment(target, `${body}\n\n${markerLine(mk)}`)).id;
       } else if (rec.kind === 'state') {
@@ -155,12 +163,15 @@ export class Effects {
       } else if (rec.kind === 'subissue') {
         const p = rec.payload as SubIssuePayload;
         let found: string | undefined;
-        if (lookup) found = (await linear.children(run.issueId)).find((c) => hasMarker(c.description ?? '', mk))?.id;
+        if (lookup) {
+          const me = this.deps.viewerId?.();
+          found = (await linear.children(run.issueId)).find((c) => hasMarker(c.description ?? '', mk) && (!me || c.creatorId === me))?.id;
+        }
         if (found) linearId = found;
         else {
           const created = await linear.createIssue({
             teamId: p.teamId,
-            title: truncate(p.title, 200),
+            title: truncate(redact(p.title, this.deps.secrets(run)), 200), // titles leak too (H3)
             description: `${truncate(redact(p.description, this.deps.secrets(run)), 20_000)}\n\n${markerLine(mk)}`,
             parentId: run.issueId,
             labelIds: p.labelIds,

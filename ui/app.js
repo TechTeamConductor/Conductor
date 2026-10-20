@@ -158,7 +158,6 @@ function fmtClock(ts) {
   const d = new Date(ts);
   return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
 }
-const fmtCost = (n) => '≈$' + (Number(n) || 0).toFixed(2);
 /** Quota values may be a 0..1 fraction or a 0..100 percentage (contract does not say): treat <=1 as a fraction. */
 function pctOf(v) {
   if (typeof v !== 'number' || !isFinite(v)) return null;
@@ -817,8 +816,7 @@ function createCard(key) {
   p.loop = h('span', { class: 'chip', title: 'Fix loops used / allowed', hidden: true }, icon('repeat'), p.loopT);
   p.bugs = h('span', { class: 'chip is-bad', hidden: true }, icon('bug'), p.bugsT);
   p.unv = h('span', { class: 'badge tone-warn', hidden: true, title: 'No reliable gates: regressions cannot be ruled out' }, icon('warn'), 'Unverified');
-  p.cost = h('span', { class: 'card-cost', title: 'Estimated API-equivalent value of the agent work so far. Not a charge — you are on flat-rate Claude/Cursor plans.' });
-  p.meta = h('div', { class: 'card-meta' }, p.repo, p.loop, p.bugs, p.unv, p.cost);
+  p.meta = h('div', { class: 'card-meta' }, p.repo, p.loop, p.bugs, p.unv);
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
@@ -870,8 +868,7 @@ function updateCard(el, r) {
   toggleHidden(p.bugs, !(r.bugsOpen > 0));
   if (r.bugsOpen > 0) setText(p.bugsT, plural(r.bugsOpen, 'open bug'));
   toggleHidden(p.unv, !r.unverified);
-  setText(p.cost, r.costUsd > 0 ? fmtCost(r.costUsd) : ''); toggleHidden(p.cost, !(r.costUsd > 0));
-  toggleHidden(p.meta, p.repo.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden && p.cost.hidden);
+  toggleHidden(p.meta, p.repo.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
 
   const showApprove = !!r.canApprove;
   const showRetry = !!r.canRetry && r.column === 'needs_human';
@@ -994,15 +991,14 @@ function updateDrawerHead() {
   const r = runByKey(S.detailKey) || S.detail;
   if (!r || !D.title) return;
   setText(D.title, r.title);
-  const sig = [r.status, r.column, r.agent, r.repo, r.branch, r.loop, r.maxLoops, r.costUsd, r.rev].join('|');
+  const sig = [r.status, r.column, r.agent, r.repo, r.branch, r.loop, r.maxLoops, r.rev].join('|');
   if (sig !== D.headSig) {
     D.headSig = sig;
     D.badges.replaceChildren(...[h('span', { class: 'card-key' }, r.key), statusPill(r), r.agent ? agentChip(r.agent, AGENT_LABEL[r.agent] + ' working') : null].filter(Boolean));
     D.sub.replaceChildren(...[
       r.repo ? h('span', { class: 'chip' }, icon('folder'), r.repo) : null,
       r.branch ? h('span', { class: 'chip chip-mono', title: 'Branch' }, icon('branch'), r.branch) : null,
-      r.loop > 0 && r.maxLoops > 0 ? h('span', { class: 'chip', title: 'Fix loops used / allowed' }, icon('repeat'), `Loop ${r.loop}/${r.maxLoops}`) : null,
-      r.costUsd > 0 ? h('span', { class: 'chip', title: 'Estimated API-equivalent value of the agent work so far. Not a charge — you are on flat-rate Claude/Cursor plans.' }, fmtCost(r.costUsd)) : null].filter(Boolean));
+      r.loop > 0 && r.maxLoops > 0 ? h('span', { class: 'chip', title: 'Fix loops used / allowed' }, icon('repeat'), `Loop ${r.loop}/${r.maxLoops}`) : null].filter(Boolean));
   }
   const bugs = r.bugsOpen || 0;
   setText(D.counts.verification, bugs);
@@ -1018,7 +1014,7 @@ function updateDrawerLive() {
   updateLogStatus();
   const s = runByKey(S.detailKey);
   const d = S.detail;
-  if (s && d && (s.updatedAt !== d.updatedAt || s.status !== d.status || s.loop !== d.loop || s.bugsOpen !== d.bugsOpen || s.costUsd !== d.costUsd)) {
+  if (s && d && (s.updatedAt !== d.updatedAt || s.status !== d.status || s.loop !== d.loop || s.bugsOpen !== d.bugsOpen )) {
     clearTimeout(D.refreshTimer);
     D.refreshTimer = setTimeout(fetchDetail, 350);
   }
@@ -1154,7 +1150,6 @@ function renderOverview(d) {
     fact('Plan revision', 'rev ' + d.rev + (d.complexity ? ' · size ' + d.complexity : '')),
     fact('Verdict', d.verdict ? badge(d.verdict === 'pass' ? 'good' : 'bad', d.verdict === 'pass' ? 'Pass' : 'Fail', d.verdict === 'pass' ? 'tick' : 'x-circle') : 'Not yet'),
     fact('Open bugs', String(d.bugsOpen || 0)),
-    fact('Est. value (not billed)', fmtCost(d.costUsd)),
     fact('Started', h('span', { title: fmtFull(d.startedAt) }, fmtWhen(d.startedAt))),
     fact('Last change', h('span', { title: fmtFull(d.updatedAt) }, fmtAgo(d.updatedAt))),
     fact('Branch', [h('span', { class: 'val' }, d.branch || 'none'), d.branch ? copyBtn(d.branch, 'branch name') : null], true),
@@ -1212,7 +1207,6 @@ function renderSessions(d) {
         badge(sessionTone(s.status), s.status, s.status === 'ok' ? 'tick' : s.status === 'running' ? null : 'info')),
       h('div', { class: 'sess-meta' },
         s.model ? h('span', null, s.model) : null,
-        s.costUsd !== undefined ? h('span', null, fmtCost(s.costUsd)) : null,
         h('span', null, fmtDur(dur) + (s.endedAt ? '' : ' so far')),
         h('span', { title: fmtFull(s.startedAt) }, 'Started ' + fmtWhen(s.startedAt)),
         s.cliVersion ? h('span', null, 'CLI ' + s.cliVersion) : null),

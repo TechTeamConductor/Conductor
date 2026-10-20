@@ -249,6 +249,8 @@ export class FakeLinear implements LinearPort {
       addedLabelIds: entry.addedLabelIds ?? [],
       removedLabelIds: entry.removedLabelIds ?? [],
       descriptionUpdatedBy: entry.descriptionUpdatedBy ?? [],
+      titleUpdatedBy: entry.titleUpdatedBy ?? [],
+      projectUpdatedBy: entry.projectUpdatedBy ?? [],
       fromStateId: entry.fromStateId ?? null,
       toStateId: entry.toStateId ?? null,
     });
@@ -268,7 +270,7 @@ export class FakeLinear implements LinearPort {
   #apply(
     rec: IssueRec,
     actorId: string,
-    patch: { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[]; description?: string },
+    patch: { stateId?: string; addLabelIds?: string[]; removeLabelIds?: string[]; description?: string; title?: string; projectName?: string | null },
   ): void {
     const issue = rec.issue;
     const entry: Partial<LinearHistoryEntry> & { actorId: string | null } = { actorId };
@@ -310,6 +312,16 @@ export class FakeLinear implements LinearPort {
     if (patch.description !== undefined && patch.description !== issue.description) {
       issue.description = patch.description;
       entry.descriptionUpdatedBy = [actorId];
+      changed = true;
+    }
+    if (patch.title !== undefined && patch.title !== issue.title) {
+      issue.title = patch.title;
+      entry.titleUpdatedBy = [actorId];
+      changed = true;
+    }
+    if (patch.projectName !== undefined && patch.projectName !== issue.projectName) {
+      issue.projectName = patch.projectName;
+      entry.projectUpdatedBy = [actorId];
       changed = true;
     }
     if (changed) this.#pushHistory(rec, entry);
@@ -589,6 +601,15 @@ export class FakeLinear implements LinearPort {
 
   humanEditDescription(issueId: string, text: string, userId: string): void {
     this.#apply(this.#rec('humanEditDescription', issueId), userId, { description: text });
+  }
+
+  humanEditTitle(issueId: string, title: string, userId: string): void {
+    this.#apply(this.#rec('humanEditTitle', issueId), userId, { title });
+  }
+
+  humanSetProject(issueId: string, projectName: string | null, userId: string): void {
+    if (projectName) this.seedProject(projectName);
+    this.#apply(this.#rec('humanSetProject', issueId), userId, { projectName });
   }
 
   humanAddLabel(issueId: string, labelName: string, userId: string): void {

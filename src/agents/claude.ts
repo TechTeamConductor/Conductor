@@ -9,6 +9,9 @@ export type EmitEvent = Omit<LogEvent, 'seq' | 'ts'>;
 /** The ONLY tools a Conductor Claude stage may have (B1: StructuredOutput appears when --json-schema is used). */
 export const CLAUDE_EXPECTED_TOOLS = ['Glob', 'Grep', 'Read', 'StructuredOutput'] as const;
 
+/** Credential-shaped files a read-only Claude stage must not open (security review M5). */
+export const CLAUDE_DENIED_READS = ['Read(**/.env)', 'Read(**/.env.*)', 'Read(**/*.pem)', 'Read(**/*.key)', 'Read(**/id_rsa*)', 'Read(**/id_ed25519*)', 'Read(**/.npmrc)', 'Read(**/.aws/**)', 'Read(**/.ssh/**)'] as const;
+
 export interface AgentCallBase {
   bin: string;
   cwd: string;
@@ -39,6 +42,8 @@ export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'iso
     '--verbose',
     ...(c.isolation === 'safe-mode' ? ['--safe-mode'] : ['--setting-sources', 'project,local']),
     '--tools', 'Read,Grep,Glob',
+    // M5: the read-only stages still have Read — keep credential files out of reach (the reply is posted to Linear)
+    '--disallowedTools', ...CLAUDE_DENIED_READS,
     '--disable-slash-commands',
     '--strict-mcp-config',
     '--permission-mode', 'dontAsk',

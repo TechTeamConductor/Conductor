@@ -9,10 +9,13 @@ function tryParse(s: string): unknown | undefined {
 }
 
 /** Last parseable balanced `{…}` object in the text (string/escape aware). */
-function lastBalancedObject(text: string): string | null {
+function lastBalancedObject(textIn: string): string | null {
+  // bound the work: only the last 300 KB, and at most 500 candidate starts (a hostile "{{{{…" must not be quadratic)
+  const text = textIn.length > 300_000 ? textIn.slice(-300_000) : textIn;
   let last: string | null = null;
   let i = 0;
-  while (i < text.length) {
+  let starts = 0;
+  while (i < text.length && starts++ < 500) {
     const start = text.indexOf('{', i);
     if (start < 0) break;
     let depth = 0;
