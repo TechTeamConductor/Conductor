@@ -9,6 +9,8 @@ import { atomicWriteFile } from '../util.ts';
 import { quarantine } from '../schema/version.ts';
 import { cleanCommand } from '../context/facts.ts';
 import { validateReport, type ResearchReport } from './research.ts';
+import { shapeResearchBrief } from '../briefs/schemas.ts';
+import type { ResearchBrief } from '../briefs/types.ts';
 
 export const ASK_ID_RE = /^ask-[0-9a-f]{16,32}$/;
 export const ASK_LIMITS = Object.freeze({ question: 4000, answer: 20_000, file: 512 * 1024, events: 200, eventChars: 600, index: 500 });
@@ -38,6 +40,14 @@ export interface AskRecord {
   convertedTo?: string;
   /** Quick Ask: the user ticked "let Conductor make this change if it is small" BEFORE asking. */
   allowChange?: boolean;
+  /** M8-6 F4: the reviewed research brief (model-written from the question; untrusted) this run was started with. */
+  brief?: ResearchBrief;
+  /** M8-6 F4: research depth (absent = standard). */
+  depth?: 'standard' | 'deep';
+  /** M8-6 B2d: the brief that started this run — stamped in the FIRST save, so a replayed Send adopts it instead of starting another. */
+  briefId?: string;
+  /** M8-6 Q3: the research card was dismissed from the board's "Report ready" lane. */
+  dismissedAt?: number;
 }
 export const askDir = (): string => join(paths.home(), 'asks');
 export const newAskId = (): string => `ask-${randomBytes(8).toString('hex')}`;
@@ -100,6 +110,10 @@ export function validateAsk(raw: unknown, id: string): AskRecord | null {
     events: (Array.isArray(own(raw, 'events')) ? (own(raw, 'events') as unknown[]) : []).filter((e): e is string => typeof e === 'string').slice(-ASK_LIMITS.events).map((e) => e.slice(0, ASK_LIMITS.eventChars)),
     convertedTo: typeof conv === 'string' && /^[A-Z]{2,6}-\d{1,9}$/.test(conv) ? conv : undefined,
     allowChange: own(raw, 'allowChange') === true,
+    ...(mode === 'research' && own(raw, 'brief') ? (() => { const b = shapeResearchBrief(own(raw, 'brief')); return b ? { brief: b } : {}; })() : {}),
+    ...(mode === 'research' && (own(raw, 'depth') === 'standard' || own(raw, 'depth') === 'deep') ? { depth: own(raw, 'depth') as 'standard' | 'deep' } : {}),
+    ...(typeof own(raw, 'briefId') === 'string' && /^brf-[0-9a-f]{16}$/.test(own(raw, 'briefId') as string) ? { briefId: own(raw, 'briefId') as string } : {}),
+    ...(typeof own(raw, 'dismissedAt') === 'number' && Number.isFinite(own(raw, 'dismissedAt')) && (own(raw, 'dismissedAt') as number) > 0 ? { dismissedAt: own(raw, 'dismissedAt') as number } : {}),
   };
 }
 

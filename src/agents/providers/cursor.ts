@@ -7,6 +7,7 @@ import { runCursor } from '../cursor.ts';
 import { PROVIDER_LABEL, type AuthResult, type BuildPrep, type BuildRunReq, type Provider, type ProviderDeps, type ReadOnlyRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
 import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
+import { toolDefaultResolved } from '../../models/select.ts';
 
 const minutes = (n: number) => n * 60_000;
 
@@ -43,9 +44,10 @@ export function cursorProvider(d: ProviderDeps): Provider {
       const bin = resolveBin(cfg.agents.cursor.bin);
       if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.` };
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
+      const sel = req.sel && req.sel.tool === 'cursor' ? req.sel : toolDefaultResolved(cfg, 'cursor'); // a selection for another tool is never applied here (CR-N2)
       return runCursor({
         bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema, mode: 'ask',
-        model: cfg.agents.cursor.model, env: cursorEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
+        model: sel.modelArg, env: cursorEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
         signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
       });
     },
@@ -62,9 +64,10 @@ export function cursorProvider(d: ProviderDeps): Provider {
         if (!bin) {
           return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.` };
         }
+        const sel = req.sel && req.sel.tool === 'cursor' ? req.sel : toolDefaultResolved(cfg, 'cursor'); // a selection for another tool is never applied here (CR-N2)
         return runCursor({
           bin, cwd: req.cwd, prompt: req.prompt, stage: 'build', name: req.name, mode: 'build',
-          model: cfg.agents.cursor.model, env: cursorEnv({ ...d.extraEnv, ...req.env }),
+          model: sel.modelArg, env: cursorEnv({ ...d.extraEnv, ...req.env }),
           idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin.build),
           signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
         });

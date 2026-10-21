@@ -321,14 +321,18 @@ export interface Config {
   agents: {
     claude: {
       bin: string;
-      model?: string;
       isolation: 'safe-mode' | 'setting-sources';
       maxTurns: { plan: number; review: number; verify: number };
     };
-    cursor: { bin: string; model?: string };
-    /** Codex CLI (read-only roles only in M2). `model` is validated against a strict pattern and passed as `--model=<v>`. */
-    codex: { bin: string; model?: string };
+    cursor: { bin: string };
+    /** Codex CLI (read-only roles only in M2). */
+    codex: { bin: string };
   };
+  /**
+   * "Default model for each tool" (config v6, M8-2): replaces v5's `agents.<tool>.model`. Absent = the tool chooses. For Cursor `model` is
+   * a discovered family (or, with `custom`, a listed id). Re-validated at use; never trusted as argv-safe just because it is stored.
+   */
+  toolModels: Partial<Record<ProviderId, { model: string; custom?: true }>>;
   /** Roles → ordered provider chains (config v4). Replaces v3's `stages` + `pipeline.onClaudeLimit`, which are derived for the dashboard (see Settings). */
   roles: Roles;
   pipeline: {
@@ -348,6 +352,8 @@ export interface Config {
     asksPerHour: number;
     /** Deep Research runs per local day (ceiling 20 in code). */
     researchPerDay: number;
+    /** "Design the work" / research-brief calls per hour (M8-6; 1–30, ceiling 30 in code). */
+    designPerHour: number;
     /** Global approval policy default (M6). `full-auto` = v1 behaviour. */
     policy: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
     /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
@@ -408,6 +414,8 @@ export interface AgentResult {
   /** Deep Research: what the session actually fetched/searched, taken from the tool events (never from model text). */
   observed?: { read: string[]; listed: string[]; queries: string[] };
   quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
+  /** M8-2 (S10): the CLI itself rejected the model — no result event, its own stderr says so. A boolean only; nothing else is kept. */
+  cliRejectedModel?: true;
 }
 
 // ───────────────────────────── HTTP API shapes (see docs/API.md) ─────────────────────────────
@@ -441,11 +449,48 @@ export interface ApiProvider {
   /** Paused by a usage limit until this time (epoch ms). */
   pausedUntil: number | null;
 }
+/** GET /api/roles `roles[r]` (M8-2): every PUT-accepted key, always present (null/false when unset) — PUT-round-trippable (R2-N4). */
+export interface ApiRoleEntry {
+  providers: ProviderId[];
+  autoByComplexity: Partial<Record<'S' | 'M' | 'L', ProviderId>> | null;
+  tool: ProviderId | null;
+  model: string | null;
+  custom: boolean;
+  effort: string | null;
+  fast: boolean;
+  thinking: boolean;
+}
+export interface ApiRoleView {
+  tool: ProviderId;
+  runsAs: string;
+  who: string;
+  status: 'ok' | 'no-longer-available' | 'list-unavailable' | 'not-in-list' | 'other-tool' | 'signed-out';
+  notes: string[];
+}
+export interface ApiToolModels {
+  effortLabel: string;
+  levels: { value: string; label: string }[];
+  state: 'reading' | 'fresh' | 'stale' | 'unavailable';
+  refreshing: boolean;
+  fetchedAt: number | null;
+  reason?: string;
+  defaultLabel: string;
+  defaultEfforts: string[] | null;
+  customEfforts: string[] | null;
+  customEffortHint: string;
+  options: { value: string; label: string; efforts: string[] | null; hasBase: boolean; fast: boolean; thinking: boolean; noZdr: boolean }[];
+}
 export interface ApiRoles {
-  roles: Roles;
+  roles: Record<string, ApiRoleEntry>;
   /** For each role and provider: may it be assigned, and if not, why (human words). */
   choices: Record<string, Record<string, { ok: boolean; reason?: string; needsAck?: boolean }>>;
   needs: Record<string, { build?: true; research?: true }>;
+  toolModels: Record<ProviderId, { model: string | null; custom: boolean }>;
+  roleViews: Record<string, ApiRoleView>;
+  rows: { id: string; roles: string[] }[];
+  /** Static wording only — never the old value (B3b, S4a/S4c). */
+  legacyNotices: { tool: ProviderId; message: string }[];
+  models: Record<ProviderId, ApiToolModels>;
 }
 /** One task of a run's graph, as the dashboard shows it (strings were redacted when the plan was stored). */
 export interface ApiGraphItem {
@@ -610,6 +655,8 @@ export interface ApiState {
   repos: ApiRepo[];
   runs: ApiRunSummary[];
   cards: ApiCard[];
+  /** M8-6 C1 (additive): Home composer features — "Design the work" and the research brief — and the counters it shows. */
+  home?: { design: true; researchBrief: boolean; limits: { designPerHour: number; designUsed: number; researchPerDay: number; researchUsed: number } };
 }
 export interface ApiError {
   error: { code: string; message: string };

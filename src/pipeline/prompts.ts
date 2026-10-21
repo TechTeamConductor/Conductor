@@ -34,6 +34,8 @@ export const STAGE_LABEL: Record<string, string> = {
   build: 'build',
   fix: 'fix',
   verify: 'verify',
+  design: 'design the work',
+  research_brief: 'research brief',
 };
 
 export function preamble(stage: string): string {
@@ -92,6 +94,6 @@ export function planToMarkdown(p: Plan): string {
 }
 const esc = (s: string) => String(s).replace(/\|/g, '\\|').replace(/\n+/g, ' ');
 
-export function loadTemplate(name: 'plan' | 'plan-review' | 'build' | 'build-item' | 'item-analysis' | 'fix' | 'verify' | 'ask' | 'research'): string {
+export function loadTemplate(name: 'plan' | 'plan-review' | 'build' | 'build-item' | 'item-analysis' | 'fix' | 'verify' | 'ask' | 'research' | 'design-work' | 'research-brief'): string {
   return load(`${name}.md`);
 }

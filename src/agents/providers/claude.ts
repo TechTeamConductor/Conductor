@@ -5,8 +5,20 @@ import { runClaude } from '../claude.ts';
 import { PROVIDER_LABEL, type AuthResult, type Provider, type ProviderDeps, type ReadOnlyRunReq, type ResearchRunReq, type SelfTestLevel, type SelfTestResult } from './types.ts';
 import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
+import { toolDefaultResolved } from '../../models/select.ts';
 
 const minutes = (n: number) => n * 60_000;
+/** M5 ceiling for any research session's `--max-turns` (Security S14: asserted below). */
+export const RESEARCH_MAX_TURNS_CEILING = 60;
+/**
+ * Deep Research depth (M8-6, user decision Q-C): code constants, never config. Standard = today's exact argv (30 turns / 20 min). Deep
+ * differs ONLY in `--max-turns` and the wall clock. Worst case with the one schema re-run is 2 × (turns, minutes) — stated in the docs.
+ */
+export const RESEARCH_DEPTH = Object.freeze({
+  standard: Object.freeze({ maxTurns: 30, hardMin: 20 }),
+  deep: Object.freeze({ maxTurns: 50, hardMin: 35 }),
+});
+for (const d of Object.values(RESEARCH_DEPTH)) if (d.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('research --max-turns above the ceiling');
 
 export function claudeProvider(d: ProviderDeps): Provider {
   return {
@@ -48,10 +60,13 @@ export function claudeProvider(d: ProviderDeps): Provider {
       if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Claude CLI "${cfg.agents.claude.bin}" not found. Install Claude Code or set agents.claude.bin.` };
       // web tools need the isolated profile: the fallback that loads project/local settings (hooks) is refused for research
       if (cfg.agents.claude.isolation !== 'safe-mode') return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: "Deep Research needs Claude's safe-mode isolation." };
+      const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
+      const depth = req.depth === 'deep' ? RESEARCH_DEPTH.deep : RESEARCH_DEPTH.standard;
+      if (depth.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('research --max-turns above the ceiling');
       return runClaude({
         bin, cwd: req.cwd, prompt: req.prompt, stage: 'plan', name: req.name, schema: req.schema, profile: 'research',
-        maxTurns: 30, isolation: 'safe-mode', model: cfg.agents.claude.model,
-        env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(20),
+        maxTurns: depth.maxTurns, isolation: 'safe-mode', model: sel.modelArg, effort: sel.effortArg,
+        env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(depth.hardMin),
         signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
       });
     },
@@ -62,9 +77,10 @@ export function claudeProvider(d: ProviderDeps): Provider {
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
       const baseTurns = cfg.agents.claude.maxTurns[key];
       const maxTurns = Math.round(baseTurns * (req.maxTurnsFactor ?? 1));
+      const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
       return runClaude({
         bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema,
-        maxTurns, isolation: cfg.agents.claude.isolation, model: cfg.agents.claude.model,
+        maxTurns, isolation: cfg.agents.claude.isolation, model: sel.modelArg, effort: sel.effortArg,
         env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
         signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
       });

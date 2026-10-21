@@ -160,6 +160,43 @@
     return body;
   }
 
+  /* ───────── M8-2: model choices ───────── */
+  /** A job's model choice in the GET/PUT form: { model: string|null, custom, effort: string|null, fast, thinking }. */
+  function selFields(sel) {
+    const s = sel && typeof sel === 'object' ? sel : {};
+    const model = typeof s.model === 'string' && s.model ? s.model : null;
+    return { model, custom: model !== null && s.custom === true, effort: typeof s.effort === 'string' && s.effort ? s.effort : null, fast: s.fast === true, thinking: s.thinking === true };
+  }
+  /** The model choice a role entry holds for `tool` (the server binds a choice to the tool it was made for; another tool gets only the effort). */
+  function selOf(entry, tool) {
+    const e = entry && typeof entry === 'object' ? entry : {};
+    const f = selFields(e);
+    if (e.tool && e.tool !== tool) return { model: null, custom: false, effort: f.effort, fast: false, thinking: false };
+    return f;
+  }
+  const sameSel = (a, b) => { const x = selFields(a); const y = selFields(b); return x.model === y.model && x.custom === y.custom && x.effort === y.effort && x.fast === y.fast && x.thinking === y.thinking; };
+  /**
+   * Add each row's model choice to a roles patch (from rolesPatch). Every role of the row gets the same fields (the server never mirrors);
+   * `tool` is left out of an edited entry (the server derives it). Rows not in `sels` are untouched. Never mutates its inputs.
+   */
+  function withSel(patch, roles, sels) {
+    const out = { roles: JSON.parse(JSON.stringify((patch && patch.roles) || {})) };
+    const ch = sels && typeof sels === 'object' ? sels : {};
+    for (const row of ROLE_ROWS) {
+      if (!Object.prototype.hasOwnProperty.call(ch, row.id)) continue;
+      const f = selFields(ch[row.id]);
+      for (const role of [row.role].concat(row.followers)) {
+        const base = Object.prototype.hasOwnProperty.call(out.roles, role) ? out.roles[role]
+          : roles && Object.prototype.hasOwnProperty.call(roles, role) ? JSON.parse(JSON.stringify(roles[role])) : null;
+        if (!base) continue;
+        base.model = f.model; base.custom = f.custom; base.effort = f.effort; base.fast = f.fast; base.thinking = f.thinking;
+        delete base.tool;
+        out.roles[role] = base;
+      }
+    }
+    return out;
+  }
+
   /* ───────── attribute safety for the DOM helper h() ───────── */
   /** An http(s) URL (normalised) or null. */
   function safeHttp(u) {
@@ -218,9 +255,18 @@
     };
   }
 
+  /* ───────── M8-6 S14/F1: the research audit lists are capped; say how many more there were ───────── */
+  /** "+N more opened, not listed" when `total` (the true count) exceeds the `shown` list length; '' otherwise or for a bad total. */
+  function moreNote(total, shown, what) {
+    const t = typeof total === 'number' && Number.isInteger(total) ? total : 0;
+    const n = t - (typeof shown === 'number' ? shown : 0);
+    return n > 0 ? '+' + n + ' more ' + what + ', not listed' : '';
+  }
+
   const deepFreeze = (o) => { if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const k of Object.keys(o)) deepFreeze(o[k]); } return o; };
   globalThis.ConductorModes = deepFreeze({
     detectMode, MODE_META, NONE, noneAllowed, matchRepo, resolveRepo, taskFromText, TITLE_MAX,
     ROLE_ROWS, leadOf, setLead, roleEdit, rolesPatch, acksNeeded, withAck, safeHttp, safeAttr, toolJobs, colHints, flowText,
+    selFields, selOf, sameSel, withSel, moreNote,
   });
 })();

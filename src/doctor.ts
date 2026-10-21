@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { AgentHealth, Config, ProviderId } from './types.ts';
 import { createProviders } from './agents/providers/registry.ts';
-import { resolveBin } from './config.ts';
+import { legacyModelNotices, resolveBin } from './config.ts';
+import { toolDefaultResolved } from './models/select.ts';
 import { claudeEnv, cursorEnv } from './agents/env.ts';
 import { buildClaudeArgs, checkClaudeInit } from './agents/claude.ts';
 import { runClaude } from './agents/claude.ts';
@@ -71,6 +72,8 @@ export async function runChecks(cfg: Config): Promise<Check[]> {
   const x = await agentHealth(cfg, 'codex');
   const codexUsed = Object.values(cfg.roles).some((r) => r.providers.includes('codex'));
   add('codex', 'Codex CLI (optional)', x.ok ? 'ok' : codexUsed ? 'fail' : 'warn', `${x.version ?? ''} ${x.detail ?? ''}`.trim());
+  // M8-2 (B3b): an earlier model setting that was not kept — static wording only, never the old value (S4a/S4c)
+  for (const n of legacyModelNotices(cfg)) add(`model-setting:${n.tool}`, 'Model setting', 'warn', n.message);
   add('keychain', 'Secret storage', KeychainStore.available() && process.env.CONDUCTOR_NO_KEYCHAIN !== '1' ? 'ok' : 'warn', KeychainStore.available() ? 'macOS Keychain' : '0600 file in the data folder (Keychain unavailable)');
 
   if (!cfg.repos.length) add('repos', 'Repositories', 'warn', 'No repository registered yet.');
@@ -129,7 +132,7 @@ export async function isolationProbe(cfg: Config): Promise<IsolationReport> {
     let limited: string | undefined;
     const r = await runProcess({
       bin,
-      args: buildClaudeArgs({ maxTurns: 3, isolation: cfg.agents.claude.isolation, name: 'conductor isolation probe', schema: undefined, model: cfg.agents.claude.model }),
+      args: buildClaudeArgs({ maxTurns: 3, isolation: cfg.agents.claude.isolation, name: 'conductor isolation probe', schema: undefined, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg }),
       cwd: repo,
       env: claudeEnv(),
       stdin: 'Reply with the single word OK.',
@@ -198,7 +201,7 @@ export async function probe(cfg: Config, target: 'claude' | 'cursor'): Promise<{
         if (!bin) return done(false, 'Claude CLI not found.');
         const r = await runClaude({
           bin, cwd: tmp, prompt: 'Return the JSON object {"ok": true}.', stage: 'plan', name: 'conductor probe',
-          schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } }, maxTurns: 3, isolation: cfg.agents.claude.isolation, model: cfg.agents.claude.model,
+          schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } }, maxTurns: 3, isolation: cfg.agents.claude.isolation, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg,
           env: claudeEnv(), idleMs: 60_000, hardMs: 90_000, onEvent: () => undefined,
         });
         if (r.ok) return done(true, `Claude answered (${r.model ?? 'model'})`);
@@ -209,7 +212,7 @@ export async function probe(cfg: Config, target: 'claude' | 'cursor'): Promise<{
       if (!bin) return done(false, 'Cursor CLI not found.');
       const r = await runCursor({
         bin, cwd: tmp, prompt: 'Return the JSON object {"ok": true} in a fenced json block. Do not use tools.', stage: 'plan', name: 'conductor probe', mode: 'ask',
-        schema: { type: 'object' }, model: cfg.agents.cursor.model, env: cursorEnv(), idleMs: 60_000, hardMs: 90_000, onEvent: () => undefined,
+        schema: { type: 'object' }, model: toolDefaultResolved(cfg, 'cursor').modelArg, env: cursorEnv(), idleMs: 60_000, hardMs: 90_000, onEvent: () => undefined,
       });
       return r.ok ? done(true, `Cursor answered (${r.model ?? 'model'})`) : done(false, truncate(r.error ?? 'Cursor did not answer', 300));
     } finally {

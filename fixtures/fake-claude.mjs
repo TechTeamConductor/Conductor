@@ -169,7 +169,7 @@ if (dir) {
 
 const sid = randomUUID();
 const isResearch = argv.includes('WebSearch,WebFetch');
-const tools = isResearch ? ['WebFetch', 'WebSearch', 'StructuredOutput', ...(step.extraTool ? [step.extraTool] : [])] : step.badInit ? ['Glob', 'Grep', 'Read', 'Bash', 'StructuredOutput'] : ['Glob', 'Grep', 'Read', 'StructuredOutput'];
+const tools = isResearch ? ['WebFetch', 'WebSearch', 'StructuredOutput', ...(step.extraTool ? [step.extraTool] : [])] : step.badInit ? ['Glob', 'Grep', 'Read', 'Bash', 'StructuredOutput'] : ['Glob', 'Grep', 'Read', 'StructuredOutput', ...(step.extraTool ? [step.extraTool] : [])];
 out({
   type: 'system', subtype: 'init', cwd: process.cwd(), session_id: sid, tools,
   mcp_servers: step.badInit ? [{ name: 'claude.ai Linear', status: 'connected', source: 'claudeai' }] : [],
@@ -248,6 +248,8 @@ else if (stage === 'ask') payload = { kind: 'answer', answer: `Answer about ${ti
 else if (stage === 'research') payload = { summary: 'Research summary.', findings: [{ claim: 'Opened claim', sources: [{ url: 'https://example.com/a?utm_source=x#frag', title: 'A', quote: 'q' }] }, { claim: 'Listed claim', sources: [{ url: 'https://example.com/listed', title: 'L', quote: 'q' }] }, { claim: 'Made-up claim', sources: [{ url: 'https://example.com/never-seen', title: 'N', quote: 'q' }] }, { claim: 'Bad scheme', sources: [{ url: 'javascript:alert(1)', title: 'X', quote: '' }, { url: 'https://user:pw@example.com/', title: 'Y', quote: '' }] }], alternatives: [{ name: 'Option A', pros: ['fast'], cons: ['new'] }], recommendation: 'Use option A.', steps: ['Do step one', 'Do step two'], limitations: 'None.', ...(step.json ?? {}) };
 else if (stage === 'analysis') payload = { summary: 'Analysis complete.', details: 'Nothing blocking.', decisions: [], ...(step.json ?? {}) };
 else if (stage === 'verify') payload = verdictFor();
+else if (stage === 'design') payload = { title: 'Add the feature', summary: 'Add the feature with a test.', approach: 'Change `src/index.mjs` and add a test.', files: [{ path: 'src/index.mjs', why: 'the entry point' }, { path: 'src/index.test.mjs', why: 'new test' }], acceptance: ['The feature works', 'A test covers it'], risks: ['None significant.'], parts: [{ title: 'Implement it', summary: 'The change itself.', size: 'S', files: ['src/index.mjs'], deps: [] }, { title: 'Test it', summary: 'A test for the change.', size: 'S', files: ['src/index.test.mjs'], deps: [1] }], ...(step.json ?? {}) };
+else if (stage === 'research_brief') payload = { title: 'Research brief', objective: 'Decide which option to use.', questions: ['What are the options?', 'What do they cost?', 'Which is maintained?'], scope: { in: ['open-source options'], out: ['paid services'], timeWindow: '2024 onwards' }, sourceTypes: ['official-docs', 'release-notes'], deliverable: 'A summary, findings with sources, alternatives, a recommendation.', ...(step.json ?? {}) };
 else payload = { note: `fake claude does not handle stage ${stage}` };
 if (step.raw) payload = step.raw; // e.g. an invalid object to test validation
 

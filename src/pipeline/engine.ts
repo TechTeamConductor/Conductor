@@ -370,7 +370,7 @@ export class Engine {
     const dir = mkdtempSync(join(tmpdir(), 'conductor-ctx-'));
     try {
       await this.freshHealth();
-      const res = await this.d.agents.readOnly({ role: 'context', complexity: undefined, states: this.routeStates(), onLimit: () => undefined, stage: 'plan', cwd: dir, prompt, schema: SUMMARY_SCHEMA as any, name: 'conductor context summary', onEvent: () => undefined, secrets: this.d.secrets?.() ?? [] } as any);
+      const res = await this.d.agents.readOnly({ role: 'context', complexity: undefined, states: this.routeStates(), onLimit: () => undefined, stage: 'plan', cwd: dir, prompt, schema: SUMMARY_SCHEMA as any, name: 'conductor context summary', onEvent: () => undefined, secrets: this.d.secrets?.() ?? [], toolDefaultOnly: true } as any); // M8-2 N4: the summary runs on the tool default, never the Quick Ask choice
       return res.ok ? res.json ?? null : null;
     } catch {
       return null;

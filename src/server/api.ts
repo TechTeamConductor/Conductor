@@ -8,7 +8,9 @@ import type { Engine } from '../pipeline/engine.ts';
 import { EngineError } from '../pipeline/engine.ts';
 import type { RunStore } from '../store.ts';
 import type { PersistentState } from '../config.ts';
-import { applySettings, normalizeConfig, toSettings } from '../config.ts';
+import { applySettings, legacyModelNotices, normalizeConfig, toSettings } from '../config.ts';
+import { ROLE_ROWS, modelsView, roleViews, toolDefaultSelection } from '../models/select.ts';
+import { RolesPlanError, apiRolesForm, apiToolModels, planRoles } from './roles-plan.ts';
 import { PROVIDER_IDS, isProviderId, providerLabel } from '../agents/providers/registry.ts';
 import { COMPLEXITIES, ROLES, ROLE_NEEDS, isComplexity, isRole, type RoleConfig, type Roles } from '../agents/roles.ts';
 import { validatePairing, type ProviderState } from '../agents/routing.ts';
@@ -24,6 +26,9 @@ import { loadContext } from '../context/store.ts';
 import { normalizeProjects } from '../config.ts';
 import { AskError, type AskService } from '../asks/service.ts';
 import { ASK_ID_RE } from '../asks/store.ts';
+import { BriefError, type BriefService } from '../briefs/service.ts';
+import { BRIEF_ID_RE, type ResearchCardView } from '../briefs/types.ts';
+import { used as budgetUsed } from '../limits/budget.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
 import { errMsg, truncate } from '../util.ts';
@@ -34,11 +39,17 @@ import type { CatalogView } from '../models/types.ts';
 export class ApiFail extends Error {
   status: number;
   code: string;
-  constructor(status: number, code: string, message: string) {
+  /** M8-2 (B1e, S8): the control the refusal is about ("roles.<role>.<key>") — only ever allow-listed names. Omitted on the wire when unset. */
+  field?: string;
+  /** M8-6: extra structured details (e.g. retryAt). Never overrides code, message or field (http.ts drops those keys). */
+  extra?: Record<string, unknown>;
+  constructor(status: number, code: string, message: string, field?: string, extra?: Record<string, unknown>) {
     super(message);
     this.name = 'ApiFail';
     this.status = status;
     this.code = code;
+    if (field !== undefined) this.field = field;
+    if (extra !== undefined) this.extra = extra;
   }
 }
 
@@ -52,6 +63,8 @@ export interface ApiResult {
 export interface ApiDeps {
   /** Quick Ask (M5). Absent ⇒ the ask endpoints answer 501. */
   asks?: AskService;
+  /** "Design the work" + research briefs (M8-6). Absent ⇒ the brief endpoints answer 501. */
+  briefs?: BriefService;
   engine: Engine;
   store: RunStore;
   board: Board;
@@ -72,6 +85,8 @@ export interface ApiDeps {
   };
 }
 
+/** N5: GET /api/roles without a model service (e.g. a test or demo wiring) — every tool shows "Tool default" only. */
+const NO_MODELS_REASON = 'Model lists are not available in this mode.';
 const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 // L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -203,6 +218,16 @@ export class Api {
       repos: cfg.repos.map((r) => this.repoView(r, persist)),
       runs: live.runs,
       cards: live.cards,
+      ...(this.d.briefs ? { home: this.homeState(cfg) } : {}),
+    };
+  }
+
+  /** M8-6 C1: feature flags + the counters the Home composer shows (the server enforces them anyway). */
+  private homeState(cfg: Config): NonNullable<ApiState['home']> {
+    return {
+      design: true,
+      researchBrief: !!this.d.asks,
+      limits: { designPerHour: cfg.pipeline.designPerHour, designUsed: budgetUsed('designPerHour'), researchPerDay: cfg.pipeline.researchPerDay, researchUsed: budgetUsed('researchPerDay') },
     };
   }
 
@@ -250,58 +275,39 @@ export class Api {
         choices[role]![id] = v.ok ? { ok: true, needsAck: states[id].tier === 'unverified' } : { ok: false, reason: v.reason };
       }
     }
-    return { roles: cfg.roles, choices, needs: Object.fromEntries(ROLES.map((r) => [r, { ...ROLE_NEEDS[r] }])) };
+    const cat = (t: ProviderId) => this.catalogFor(t);
+    const models = {} as ApiRoles['models'];
+    for (const t of PROVIDER_IDS) models[t] = modelsView(t, cat(t), { toolDefault: toolDefaultSelection(cfg, t), noCatalogReason: NO_MODELS_REASON });
+    return {
+      roles: apiRolesForm(cfg.roles),
+      choices,
+      needs: Object.fromEntries(ROLES.map((r) => [r, { ...ROLE_NEEDS[r] }])),
+      toolModels: apiToolModels(cfg.toolModels),
+      roleViews: roleViews(cfg, cat),
+      rows: ROLE_ROWS.map((r) => ({ id: r.id, roles: [...r.roles] })),
+      legacyNotices: legacyModelNotices(cfg),
+      models,
+    };
   }
 
-  /**
-   * PUT /api/roles. Strict: a plain object, own-property role names, registry provider ids only, every pairing checked against the
-   * capability/tier gate with a human reason, an `unverified` provider needs an explicit acknowledgement, a `blocked` one is refused.
-   */
-  private putRoles(body: unknown): { roles: Roles; notices: string[] } {
-    if (!isPlain(body)) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
-    if (!isPlain(body.roles)) throw new ApiFail(400, 'bad_request', '"roles" must be an object.');
-    const ack = new Set<string>();
-    if (body.acknowledge !== undefined) {
-      if (!Array.isArray(body.acknowledge) || body.acknowledge.length > 8 || !body.acknowledge.every((x) => typeof x === 'string')) throw new ApiFail(400, 'bad_request', '"acknowledge" must be a short list of provider ids.');
-      for (const a of body.acknowledge) ack.add(a);
+  /** M8-2: the synchronous, memory-only catalog view (never refreshes, never spawns). No model service (N5) ⇒ null ⇒ tool defaults. */
+  private catalogFor(t: ProviderId): CatalogView | null {
+    if (!this.d.models) return null;
+    try {
+      return this.d.models.viewAll().find((v) => v.provider === t) ?? null;
+    } catch {
+      return null;
     }
-    const cfg = this.d.getConfig();
-    const states = this.d.engine.routeStates();
-    const next: Roles = JSON.parse(JSON.stringify(cfg.roles));
-    const notices: string[] = [];
-    for (const role of Object.keys(body.roles)) {
-      if (!isRole(role)) throw new ApiFail(400, 'bad_request', `Unknown role "${role.slice(0, 30)}".`);
-      const raw = body.roles[role];
-      if (!isPlain(raw)) throw new ApiFail(400, 'bad_request', `Role "${role}" must be an object.`);
-      const entry: RoleConfig = { providers: [] };
-      if (!Array.isArray(raw.providers) || raw.providers.length === 0 || raw.providers.length > 4) throw new ApiFail(400, 'bad_request', `Role "${role}" needs 1–4 providers.`);
-      const check = (id: unknown, what: string, unchanged = false): ProviderId => {
-        if (!isProviderId(id)) throw new ApiFail(400, 'bad_request', `${what}: unknown provider.`);
-        if (unchanged) return id; // an entry that is already assigned is not re-judged (a GET→PUT round trip of the whole map must work); the router still refuses it at run time
-        const v = validatePairing(role, id, states, providerLabel);
-        if (!v.ok) throw new ApiFail(400, 'unsupported_pairing', v.reason);
-        if (states[id].tier === 'unverified' && !cfg.roles[role].providers.includes(id) && !ack.has(id)) {
-          throw new ApiFail(409, 'needs_acknowledgement', `${providerLabel(id)}'s isolation has not been verified on this machine. Send "acknowledge": ["${id}"] to use it for ${role} anyway.`);
-        }
-        return id;
-      };
-      for (const p of raw.providers) {
-        const id = check(p, `Role "${role}"`, isProviderId(p) && cfg.roles[role].providers.includes(p));
-        if (!entry.providers.includes(id)) entry.providers.push(id);
-      }
-      if (raw.autoByComplexity !== undefined) {
-        if (!isPlain(raw.autoByComplexity)) throw new ApiFail(400, 'bad_request', `Role "${role}": "autoByComplexity" must be an object.`);
-        const picks: NonNullable<RoleConfig['autoByComplexity']> = {};
-        for (const k of Object.keys(raw.autoByComplexity)) {
-          if (!isComplexity(k)) throw new ApiFail(400, 'bad_request', `Role "${role}": complexity must be one of ${COMPLEXITIES.join(', ')}.`);
-          picks[k] = check(raw.autoByComplexity[k], `Role "${role}" (${k})`, cfg.roles[role].autoByComplexity?.[k] === raw.autoByComplexity[k]);
-        }
-        if (Object.keys(picks).length) entry.autoByComplexity = picks;
-      }
-      for (const id of entry.providers) if (!cfg.roles[role].providers.includes(id)) notices.push(`${providerLabel(id)} → ${role}: ${EGRESS[id]}`);
-      next[role] = entry;
+  }
+
+  /** PUT /api/roles and POST /api/roles/preview: one pure plan (S2). PUT turns every problem into a refusal; preview reports them. */
+  private planRolesFor(body: unknown, mode: 'put' | 'preview') {
+    try {
+      return planRoles({ body, cfg: this.d.getConfig(), states: this.d.engine.routeStates(), catalog: (t) => this.catalogFor(t), mode, egress: (id) => EGRESS[id] });
+    } catch (e) {
+      if (e instanceof RolesPlanError) throw new ApiFail(e.status, e.code, e.message, e.field);
+      throw e;
     }
-    return { roles: next, notices };
   }
 
   private providerId(raw: string): ProviderId {
@@ -336,6 +342,18 @@ export class Api {
     return this.d.models;
   }
 
+  private briefsSvc(): BriefService {
+    if (!this.d.briefs) throw new ApiFail(501, 'not_available', 'Design the work is not available here.');
+    return this.d.briefs;
+  }
+
+  /** S12: a strict JSON body — a plain object (prototype check) whose own keys are all in `allowed`. */
+  private strict(body: unknown, allowed: readonly string[]): Record<string, unknown> {
+    if (!isPlain(body) || Object.getPrototypeOf(body) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
+    for (const k of Object.getOwnPropertyNames(body)) if (!allowed.includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+    return body;
+  }
+
   private asksSvc(): AskService {
     if (!this.d.asks) throw new ApiFail(501, 'not_available', 'Quick Ask is not available here.');
     return this.d.asks;
@@ -349,9 +367,18 @@ export class Api {
     return { ...toDetail(this.d.store, run, this.d.getConfig(), Date.now()), notes };
   }
 
-  /** Everything the board view needs: projects + top-level items (children are fetched with the item). */
-  boardView(): { projects: ReturnType<Board['projects']>; items: ReturnType<Board['items']>; milestones: ReturnType<Board['milestones']> } {
-    return { projects: this.d.board.projects(), items: this.d.board.items().slice(-2000), milestones: this.d.board.milestones() };
+  /**
+   * Everything the board view needs: projects + top-level items (children are fetched with the item). M8-6 (additive): items made by
+   * `design` carry `design{briefId, part, parts}` (parsed only from a strict idemKey, S15), and `research` is the READ-ONLY projection of
+   * research asks (Q3: not board items, never journalled, no move/claim/edit).
+   */
+  boardView(): { projects: ReturnType<Board['projects']>; items: (ReturnType<Board['items']>[number] & { design?: { briefId: string; part: number; parts: number } })[]; milestones: ReturnType<Board['milestones']>; research: ResearchCardView[] } {
+    const briefs = this.d.briefs;
+    const items = this.d.board.items().slice(-2000).map((i) => {
+      const o = briefs ? briefs.designOrigin(i) : undefined;
+      return o ? { ...i, design: o } : i;
+    });
+    return { projects: this.d.board.projects(), items, milestones: this.d.board.milestones(), research: this.d.asks ? this.d.asks.researchCards() : [] };
   }
 
   itemView(key: string) {
@@ -365,6 +392,8 @@ export class Api {
       children: this.d.board.children(item.id),
       decisions: this.d.board.decisions(item.projectId).filter((d) => !d.itemId || d.itemId === item.id),
       graph: run ? toGraph(run) : null,
+      // M8-6 N3 (additive): dependencies that are not Done yet, so the UI can say "waiting for KEY" / "waiting for a canceled card"
+      blockedBy: item.dependsOn.map((d) => this.d.board.item(d)).filter((d): d is NonNullable<typeof d> => !!d && d.lane !== 'done').map((d) => ({ key: d.key, lane: d.lane })),
     };
   }
 
@@ -382,6 +411,7 @@ export class Api {
       if (e instanceof EngineError) throw new ApiFail(e.code === 'missing' ? 404 : e.code === 'bad_lane' || e.code === 'bad_repo' ? 400 : 409, e.code, e.message);
       if (e instanceof BoardError) throw new ApiFail(boardStatus(e.code), e.code, e.message);
       if (e instanceof AskError) throw new ApiFail(e.status, e.code, e.message);
+      if (e instanceof BriefError) throw new ApiFail(e.status, e.code, e.message, undefined, e.extra);
       if (e instanceof OpenError) throw new ApiFail(e.code === 'bad_target' ? 400 : 409, e.code, e.message);
       throw e;
     }
@@ -397,6 +427,13 @@ export class Api {
       if (path === '/api/roles') return { json: this.roles() };
       if (path === '/api/models') return { json: { providers: this.modelsSvc().viewAll() } };
       if (path === '/api/asks') return { json: { asks: this.asksSvc().list() } };
+      if (path === '/api/briefs') return { json: { briefs: this.briefsSvc().list() } };
+      if ((m = /^\/api\/briefs\/([^/]+)$/.exec(path))) {
+        const id = safeDecode(m[1]!);
+        const rec = BRIEF_ID_RE.test(id) ? this.briefsSvc().get(id) : null; // the id is checked before any path is built
+        if (!rec) throw new ApiFail(404, 'not_found', 'Unknown brief.');
+        return { json: rec };
+      }
       if ((m = /^\/api\/asks\/([^/]+)$/.exec(path))) {
         const id = safeDecode(m[1]!);
         const rec = ASK_ID_RE.test(id) ? this.asksSvc().get(id) : null;
@@ -459,6 +496,35 @@ export class Api {
       for (const k of Object.keys(body)) if (!allowed.has(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
       if (body.allowChange !== undefined && typeof body.allowChange !== 'boolean') throw new ApiFail(400, 'bad_request', '"allowChange" must be true or false.');
       return { status: 202, json: this.asksSvc().start({ question: body.question, repo: body.repo, allowChange: body.allowChange }) };
+    }
+    // ── M8-6: "Design the work" / research briefs (strict bodies, ids by regex before any path; CSRF/Host/Sec-Fetch in http.ts) ──
+    if (method === 'POST' && path === '/api/briefs') {
+      const b = this.strict(body, ['kind', 'line', 'repo']);
+      return { status: 202, json: this.briefsSvc().start({ kind: b.kind, line: b.line, repo: b.repo }) };
+    }
+    if ((m = /^\/api\/briefs\/([^/]+)\/(cancel|send)$/.exec(path)) && method === 'POST') {
+      const id = safeDecode(m[1]!);
+      if (!BRIEF_ID_RE.test(id)) throw new ApiFail(404, 'not_found', 'Unknown brief.');
+      const svc = this.briefsSvc();
+      if (m[2] === 'cancel') {
+        this.strict(body, []);
+        const v = svc.cancel(id);
+        if (!v) throw new ApiFail(404, 'not_found', 'Unknown brief.');
+        return { json: v };
+      }
+      const r = await svc.send(id, this.strict(body, ['parts', 'depth']));
+      return { status: r.status, json: r.json };
+    }
+    if ((m = /^\/api\/briefs\/([^/]+)$/.exec(path)) && method === 'DELETE') {
+      const id = safeDecode(m[1]!);
+      if (!BRIEF_ID_RE.test(id) || !this.briefsSvc().remove(id)) throw new ApiFail(404, 'not_found', 'Unknown brief.');
+      return { json: { ok: true } };
+    }
+    if ((m = /^\/api\/asks\/([^/]+)\/dismiss$/.exec(path)) && method === 'POST') {
+      const id = safeDecode(m[1]!);
+      if (!ASK_ID_RE.test(id)) throw new ApiFail(404, 'not_found', 'Unknown question.');
+      this.strict(body, []);
+      return { json: this.asksSvc().dismiss(id) };
     }
     if ((m = /^\/api\/asks\/([^/]+)\/convert$/.exec(path)) && method === 'POST') {
       const id = safeDecode(m[1]!);
@@ -556,11 +622,20 @@ export class Api {
     }
 
     if (method === 'PUT' && path === '/api/roles') {
-      const { roles, notices } = this.putRoles(body);
-      const next = normalizeConfig({ ...this.d.getConfig(), roles }); // the load-time capability filter runs again
-      this.d.saveConfig(next);
+      const plan = this.planRolesFor(body, 'put');
+      const next = normalizeConfig({ ...this.d.getConfig(), roles: plan.roles, toolModels: plan.toolModels }); // the load-time filters run again
+      this.d.saveConfig(next); // only after the whole plan passed: nothing is saved on any 4xx (S8)
       this.d.engine.invalidate();
-      return { json: { ok: true, roles: next.roles, notices } };
+      const cat = (t: ProviderId) => this.catalogFor(t);
+      return { json: { ok: true, roles: apiRolesForm(next.roles), toolModels: apiToolModels(next.toolModels), roleViews: roleViews(next, cat), notices: plan.notices } };
+    }
+
+    if (method === 'POST' && path === '/api/roles/preview') {
+      // S2: plan only — no save, no backup, no refresh, no noteUnknownModel, no bin resolution, no spawn; catalogs via the memory view
+      const plan = this.planRolesFor(body, 'preview');
+      const draft = { roles: plan.roles, toolModels: plan.toolModels };
+      const cat = (t: ProviderId) => this.catalogFor(t);
+      return { json: { roles: apiRolesForm(plan.roles), toolModels: apiToolModels(plan.toolModels), roleViews: roleViews(draft, cat), notices: plan.notices, problems: plan.problems.map((p) => ({ field: p.field, code: p.code, message: p.message })) } };
     }
 
     if (method === 'POST' && (m = /^\/api\/providers\/([^/]+)\/test$/.exec(path))) {

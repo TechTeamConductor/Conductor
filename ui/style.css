@@ -1035,3 +1035,20 @@ dialog::backdrop { background: var(--scrim); }
   .pill, .nav-tab, .chip-btn, .menu-item, .recent-row, .suggest button { min-height: 44px; }
   .send { width: 44px; height: 44px; }
 }
+
+/* ───────── M8-6 briefs: model-written multi-line text keeps its line breaks (rendered as text nodes only) ───────── */
+.sec p.is-pre { white-space: pre-wrap; }
+.scan-files li .badge { font-size: 11px; }
+.doc-head { flex-wrap: wrap; }
+
+/* M8-2 model rows: the model/effort editor inside a "Who does what" row and the Handled-by popover */
+.who-row > .who-model { grid-column: 1 / -1; display: grid; gap: 6px; }
+.who-model .who-ctl { justify-content: flex-start; }
+.who-model .who-flags { display: inline-flex; gap: 12px; }
+.who-model .who-flags:not(:has(label:not([hidden]))) { display: none; }
+.who-notes:empty { display: none; }
+.who-notes .who-note { margin: 0; }
+.who-hint-sm:empty { display: none; }
+.td-row { display: grid; gap: 4px; }
+.menu-who .who-model .who-ctl { display: grid; gap: 8px; }
+.menu-who .who-model .who-extra { font-size: 12px; }

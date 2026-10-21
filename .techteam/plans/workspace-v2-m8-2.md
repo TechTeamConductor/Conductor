@@ -337,6 +337,7 @@ The server stays role-level and does **not** mirror. The UI (`ui/modes.js`, M8-U
 
     Effort row (applies everywhere): `levelsFor` gives exactly the discovered levels. Custom Claude/Codex ids use the union of the tool's reported levels. With no list, or a model that has no levels, effort is dropped with a note.
   - The config key is `cfg.toolModels`, not `agents.<tool>.defaultModel`.
+  - (As built, code review deviation #8.) `resolveSelection(tool, sel, catalog, source, toolDefault?)` takes an optional 5th `toolDefault` (the `toolModels[tool]` selection used when `sel` falls back), and `fitEffort(levels, wanted?, { needsToken? })` an optional 3rd argument (a Cursor family with no base id fits toward `medium`). Both are optional: M8-3 calls `selectionForTool`, which passes them. `toolDefaultResolved(cfg, tool)` is the no-catalog tool-default resolution the providers use when no `sel` is passed. `models[t]` also carries view-only `defaultEfforts` / `customEfforts`.
   - Argv builders stay account-agnostic. M8-3 adds `req.account` beside M8-2's `req.sel`.
   - **M8-2 claims config v6; M8-3 takes v7.**
   - A Cursor custom id is not automatically "offered" (fail closed).

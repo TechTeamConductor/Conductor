@@ -54,6 +54,9 @@ export interface ResearchReport {
   /** Everything the session fetched / searched, from the tool events. */
   fetched: string[];
   searched: string[];
+  /** M8-6 S14: the TRUE totals (the lists above stay capped at 100 / 50), so the UI can say "+N more not shown". */
+  fetchedTotal?: number;
+  searchedTotal?: number;
 }
 
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
@@ -83,6 +86,8 @@ export function buildReport(raw: unknown, observed: { read: string[]; listed: st
     limitations: block(own(raw, 'limitations'), 2000),
     fetched: [...read].slice(0, 100),
     searched: observed.queries.slice(0, 50).map((q) => line(q, 300)),
+    fetchedTotal: read.size,
+    searchedTotal: observed.queries.length,
   };
 }
 
@@ -104,5 +109,7 @@ export function validateReport(raw: unknown): ResearchReport | null {
     alternatives: arr(own(raw, 'alternatives')).slice(0, 8).map((a) => ({ name: line(own(a, 'name'), 120), pros: arr(own(a, 'pros')).slice(0, 8).map((x) => line(x, 300)), cons: arr(own(a, 'cons')).slice(0, 8).map((x) => line(x, 300)) })),
     recommendation: block(own(raw, 'recommendation'), 3000), steps: arr(own(raw, 'steps')).slice(0, 15).map((x) => line(x, 400)), limitations: block(own(raw, 'limitations'), 2000),
     fetched: arr(own(raw, 'fetched')).map(normalizeUrl).filter((x): x is string => !!x).slice(0, 100), searched: arr(own(raw, 'searched')).slice(0, 50).map((q) => line(q, 300)),
+    ...(typeof own(raw, 'fetchedTotal') === 'number' && Number.isInteger(own(raw, 'fetchedTotal')) && (own(raw, 'fetchedTotal') as number) >= 0 ? { fetchedTotal: Math.min(own(raw, 'fetchedTotal') as number, 1_000_000) } : {}),
+    ...(typeof own(raw, 'searchedTotal') === 'number' && Number.isInteger(own(raw, 'searchedTotal')) && (own(raw, 'searchedTotal') as number) >= 0 ? { searchedTotal: Math.min(own(raw, 'searchedTotal') as number, 1_000_000) } : {}),
   };
 }

@@ -244,7 +244,8 @@ function toast(level, text, opts) {
 
 /* ───────────────────────── api client ───────────────────────── */
 class ApiFail extends Error {
-  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+  /** `info` = the server's whole error object (M8-6: `retryAt`, `repos`, `cards`; M8-2: `field`). Data only — rendered as text. */
+  constructor(status, code, message, info) { super(message); this.status = status; this.code = code; this.info = info && typeof info === 'object' ? info : null; }
 }
 async function api(method, path, body, retried) {
   const headers = { Accept: 'application/json' };
@@ -270,7 +271,7 @@ async function api(method, path, body, retried) {
       // Stale CSRF value (server restarted?): refresh state once and retry.
       try { const st = await api('GET', '/api/state'); applyState(st, true); return api(method, path, body, true); } catch (err) { if (err instanceof ApiFail && err.status === 401) throw err; }
     }
-    throw new ApiFail(res.status, e ? e.code : 'http_' + res.status, e && e.message ? e.message : `Request failed (${res.status}).`);
+    throw new ApiFail(res.status, e ? e.code : 'http_' + res.status, e && e.message ? e.message : `Request failed (${res.status}).`, e);
   }
   return data;
 }
@@ -764,11 +765,13 @@ const providersSig = (ps) => JSON.stringify((ps || []).map((p) => [p.id, p.state
  * confirmed ids are sent (Security U1). A 409 that still comes back is shown and the flow stops. Returns
  * { ok, notices, error, canceled, nothing }.
  */
-async function applyRoleChanges(changes) {
+async function applyRoleChanges(changes, sels, toolModels) {
   let fresh;
   try { fresh = await api('GET', '/api/roles'); S.roles = fresh; } catch (e) { return { ok: false, error: e.message }; }
-  const patch = M.rolesPatch(fresh.roles, changes);
-  if (!Object.keys(patch.roles).length) return { ok: true, nothing: true, notices: [] };
+  // M8-2: each row's model choice rides on the same PUT (sels: row id → choice; toolModels: "Default model for each tool")
+  const patch = M.withSel(M.rolesPatch(fresh.roles, changes || {}), fresh.roles, sels || {});
+  const tm = toolModels && typeof toolModels === 'object' && Object.keys(toolModels).length ? toolModels : null;
+  if (!Object.keys(patch.roles).length && !tm) return { ok: true, nothing: true, notices: [] };
   const confirmed = [];
   for (const a of M.acksNeeded(fresh.roles, fresh.choices, patch)) {
     const name = provLabel(a.provider);
@@ -782,7 +785,9 @@ async function applyRoleChanges(changes) {
     confirmed.push(a.provider);
   }
   try {
-    const r = await api('PUT', '/api/roles', M.withAck(patch, confirmed));
+    const body = M.withAck(patch, confirmed);
+    if (tm) body.toolModels = JSON.parse(JSON.stringify(tm));
+    const r = await api('PUT', '/api/roles', body);
     const notices = Array.isArray(r && r.notices) ? r.notices.filter((x) => typeof x === 'string') : [];
     for (const n of notices) toast('warn', n);
     await loadRoles();
@@ -792,8 +797,173 @@ async function applyRoleChanges(changes) {
     loadRoles();
     // a 409 here means the choices changed after the fresh GET: say so plainly, keep the server's text as the detail; never resend
     if (e instanceof ApiFail && e.status === 409) return { ok: false, error: 'The tool settings changed while you were editing. Reload Settings and try again.\n' + e.message };
-    return { ok: false, error: e.message };
+    // "Save refused with focus": the server names the control (allow-listed names only)
+    const field = e instanceof ApiFail && e.info && typeof e.info.field === 'string' ? e.info.field : null;
+    return { ok: false, error: e.message, field };
   }
+}
+
+/* ───────────────────────── M8-2: model and effort for a job ───────────────────────── */
+/**
+ * Model / effort / Fast / Thinking / custom id for one Settings row or the Handled-by popover: a draft until Save. The lists come from
+ * GET /api/roles (`models[tool]`, each tool in its own words); the fitted choice, its notes and "Runs as …" come from POST
+ * /api/roles/preview — the server's own fitting and argv code. Nothing is fitted or composed here. Every label is a text node.
+ */
+const CUSTOM_MODEL = '\u0000custom';
+const modelsOf = (tool) => { const m = S.roles && S.roles.models && S.roles.models[tool]; return m && typeof m === 'object' ? m : null; };
+const levelLabel = (tool, v) => { const m = modelsOf(tool); const l = m && Array.isArray(m.levels) ? m.levels.find((x) => x.value === v) : null; return l ? l.label : String(v); };
+const fieldRow = (field) => { const m = /^roles\.([a-z]+)\.([a-zA-Z]+)$/.exec(String(field || '')); if (!m) return null; const row = M.ROLE_ROWS.find((r) => r.role === m[1] || r.followers.includes(m[1])); return row ? { row: row.id, key: m[2] } : null; };
+function modelEditor(o) {
+  // o: { row, tool, entry, view, onChange() }
+  let tool = o.tool;
+  const initial = M.selOf(o.entry, tool);
+  let sel = M.selFields(initial);
+  let base = M.selFields(initial); // what the current tool starts from: a pure tool switch sends no model fields (the server clears and fits)
+  const modelSel = h('select', { class: 'select select-sm', 'aria-label': 'Model for ' + o.row.label });
+  const effortSel = h('select', { class: 'select select-sm' });
+  const effortLbl = h('span', { class: 'eff-l' });
+  const fastCb = h('input', { type: 'checkbox' });
+  const thinkCb = h('input', { type: 'checkbox' });
+  const fastLbl = h('label', { class: 'check' }, fastCb, h('span', null, 'Fast'));
+  const thinkLbl = h('label', { class: 'check' }, thinkCb, h('span', null, 'Thinking'));
+  const customIn = h('input', { class: 'input input-sm', type: 'text', maxlength: '74', autocomplete: 'off', spellcheck: 'false', placeholder: 'for example claude-haiku-5-5', 'aria-label': 'Custom model id for ' + o.row.label });
+  const customLbl = h('label', { class: 'who-custom' }, h('span', { class: 'eff-l' }, 'Custom model id'), customIn);
+  const hint = h('span', { class: 'muted who-hint-sm' });
+  const runs = h('code');
+  const notes = h('div', { class: 'who-notes', role: 'status' });
+  const problem = h('p', { class: 'err', role: 'alert', hidden: true });
+  const el = h('div', { class: 'who-model' },
+    h('div', { class: 'who-ctl' }, h('label', { class: 'eff eff-model' }, h('span', { class: 'eff-l' }, 'Model'), modelSel), h('label', { class: 'eff' }, effortLbl, effortSel)),
+    h('div', { class: 'who-extra' }, h('span', { class: 'who-flags' }, fastLbl, thinkLbl), customLbl, hint, h('span', { class: 'who-run muted' }, 'Runs as ', runs)),
+    notes, problem);
+  const option = () => { const m = modelsOf(tool); return m && Array.isArray(m.options) && sel.model && !sel.custom ? m.options.find((x) => x.value === sel.model) || null : null; };
+  const levels = () => {
+    const m = modelsOf(tool);
+    if (!m) return null;
+    if (sel.custom) return m.customEfforts;
+    if (sel.model) { const op = option(); return op ? op.efforts : null; }
+    return m.defaultEfforts;
+  };
+  const showView = (v) => {
+    setText(runs, v && typeof v.runsAs === 'string' ? v.runsAs : '');
+    const ns = v && Array.isArray(v.notes) ? v.notes.filter((x) => typeof x === 'string') : [];
+    notes.replaceChildren(...ns.map((n) => h('p', { class: 'warn-note who-note' }, n)));
+  };
+  const render = () => {
+    const m = modelsOf(tool) || { options: [], levels: [], defaultLabel: 'the tool chooses', effortLabel: 'Effort' };
+    const opts = [h('option', { value: '' }, 'Tool default (' + m.defaultLabel + ')')];
+    for (const x of m.options || []) opts.push(h('option', { value: x.value }, x.label + (x.noZdr ? ' (NO ZDR)' : '')));
+    if (sel.model && !sel.custom && !option()) opts.push(h('option', { value: sel.model }, sel.model + ' — No longer available'));
+    opts.push(h('option', { value: CUSTOM_MODEL }, 'Custom model id…'));
+    modelSel.replaceChildren(...opts);
+    modelSel.value = sel.custom ? CUSTOM_MODEL : sel.model || '';
+    setText(effortLbl, m.effortLabel);
+    const lv = levels();
+    const op = option();
+    const eo = [h('option', { value: '' }, lv ? (op && op.hasBase ? 'Default' : 'Tool decides') : 'No effort setting')];
+    for (const v of lv || []) eo.push(h('option', { value: v }, levelLabel(tool, v)));
+    if (sel.effort && !(lv || []).includes(sel.effort)) eo.push(h('option', { value: sel.effort }, levelLabel(tool, sel.effort) + ' (not offered)'));
+    effortSel.replaceChildren(...eo);
+    effortSel.value = sel.effort || '';
+    effortSel.disabled = !lv && !sel.effort;
+    toggleHidden(fastLbl, !(tool === 'cursor' && op && op.fast));
+    toggleHidden(thinkLbl, !(tool === 'cursor' && op && op.thinking));
+    fastCb.checked = sel.fast; thinkCb.checked = sel.thinking;
+    toggleHidden(customLbl, !sel.custom);
+    if (sel.custom && customIn.value !== (sel.model || '')) customIn.value = sel.model || '';
+    setText(hint, sel.custom && m.customEffortHint ? m.customEffortHint : m.state && m.state !== 'fresh' && m.reason ? m.reason : '');
+  };
+  // "Runs as …" for the draft, from the server (stale answers are ignored)
+  let seq = 0;
+  let timer = 0;
+  const preview = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const my = ++seq;
+      const changes = tool !== M.leadOf(S.roles.roles, o.row.role) ? { [o.row.id]: tool } : {};
+      const body = M.withSel(M.rolesPatch(S.roles.roles, changes), S.roles.roles, dirty() ? { [o.row.id]: sel } : {});
+      if (!Object.keys(body.roles).length) { showView(o.view); toggleHidden(problem, true); return; }
+      try {
+        const r = await api('POST', '/api/roles/preview', body);
+        if (my !== seq) return;
+        showView(r && r.roleViews ? r.roleViews[o.row.role] : null);
+        const mine = (r && Array.isArray(r.problems) ? r.problems : []).filter((p) => p && typeof p.field === 'string' && fieldRow(p.field) && fieldRow(p.field).row === o.row.id && typeof p.message === 'string');
+        setText(problem, mine.map((p) => p.message).join(' '));
+        toggleHidden(problem, !mine.length);
+      } catch (e) {
+        if (my !== seq) return;
+        setText(problem, e.message); toggleHidden(problem, false);
+      }
+    }, 250);
+  };
+  const changed = () => { render(); preview(); if (o.onChange) o.onChange(); };
+  const dirty = () => !M.sameSel(sel, base);
+  modelSel.addEventListener('change', () => {
+    const v = modelSel.value;
+    if (v === CUSTOM_MODEL) sel = { model: customIn.value.trim() || null, custom: true, effort: sel.effort, fast: false, thinking: false };
+    else sel = { model: v || null, custom: false, effort: sel.effort, fast: false, thinking: false }; // a model change keeps the effort; the server fits it
+    sel.custom = sel.custom && !!sel.model;
+    if (v === CUSTOM_MODEL) { render(); toggleHidden(customLbl, false); customIn.focus(); preview(); if (o.onChange) o.onChange(); return; }
+    changed();
+  });
+  customIn.addEventListener('change', () => { const t = customIn.value.trim(); sel = { model: t || null, custom: !!t, effort: sel.effort, fast: false, thinking: false }; changed(); if (!t) { toggleHidden(customLbl, false); } });
+  effortSel.addEventListener('change', () => { sel = Object.assign({}, sel, { effort: effortSel.value || null }); changed(); });
+  fastCb.addEventListener('change', () => { sel = Object.assign({}, sel, { fast: fastCb.checked }); changed(); });
+  thinkCb.addEventListener('change', () => { sel = Object.assign({}, sel, { thinking: thinkCb.checked }); changed(); });
+  render();
+  showView(o.view);
+  return {
+    el,
+    /** A tool change resets the model to that tool's default and keeps the effort (the server fits it, with a note). */
+    setTool(t) {
+      if (t === tool) return;
+      tool = t;
+      sel = t === o.tool ? M.selFields(initial) : { model: null, custom: false, effort: initial.effort, fast: false, thinking: false };
+      base = M.selFields(sel);
+      customIn.value = '';
+      render();
+      if (t === o.tool) { clearTimeout(timer); seq++; showView(o.view); toggleHidden(problem, true); } else preview();
+    },
+    /** The choice to send, or null when nothing changed for this row. */
+    value() { return dirty() ? M.selFields(sel) : null; },
+    focus(key) { const t = key === 'effort' ? effortSel : key === 'fast' ? fastCb : key === 'thinking' ? thinkCb : sel.custom ? customIn : modelSel; if (!t.hidden && !(t.parentElement && t.parentElement.hidden)) t.focus(); else modelSel.focus(); },
+    showError(m) { setText(problem, m); toggleHidden(problem, !m); },
+  };
+}
+/** "Default model for each tool": one select per tool (+ a custom id), a draft until Save. */
+function toolDefaultsEditor() {
+  const draft = {};
+  const ctl = {};
+  const rows = ['claude', 'cursor', 'codex'].map((t) => {
+    const m = modelsOf(t) || { options: [] };
+    const cur = (S.roles && S.roles.toolModels && S.roles.toolModels[t]) || { model: null, custom: false };
+    const sel = h('select', { class: 'select select-sm', 'aria-label': 'Default model for ' + provLabel(t) });
+    const opts = [h('option', { value: '' }, 'The tool chooses')];
+    for (const x of m.options || []) opts.push(h('option', { value: x.value }, x.label));
+    if (cur.model && !cur.custom && !(m.options || []).some((x) => x.value === cur.model)) opts.push(h('option', { value: cur.model }, cur.model + ' — No longer available'));
+    opts.push(h('option', { value: CUSTOM_MODEL }, 'Custom model id…'));
+    sel.replaceChildren(...opts);
+    sel.value = cur.custom ? CUSTOM_MODEL : cur.model || '';
+    const inp = h('input', { class: 'input input-sm', type: 'text', maxlength: '74', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Custom default model id for ' + provLabel(t), value: cur.custom ? cur.model : '' });
+    const wrap = h('label', { class: 'who-custom', hidden: !cur.custom }, h('span', { class: 'eff-l' }, 'Custom model id'), inp);
+    const upd = () => {
+      const v = sel.value;
+      toggleHidden(wrap, v !== CUSTOM_MODEL);
+      const next = v === CUSTOM_MODEL ? { model: inp.value.trim() || null, custom: !!inp.value.trim() } : { model: v || null, custom: false };
+      if (next.model === (cur.model || null) && next.custom === !!cur.custom) delete draft[t];
+      else draft[t] = next;
+    };
+    sel.addEventListener('change', () => { upd(); if (sel.value === CUSTOM_MODEL) inp.focus(); });
+    inp.addEventListener('change', upd);
+    ctl[t] = { sel, inp };
+    return h('div', { class: 'td-row' }, h('label', { class: 'eff eff-model' }, h('span', { class: 'eff-l' }, provLabel(t)), sel), wrap);
+  });
+  const notices = (S.roles && Array.isArray(S.roles.legacyNotices) ? S.roles.legacyNotices : []).filter((n) => n && typeof n.message === 'string').map((n) => h('p', { class: 'warn-note' }, n.message));
+  const el = h('details', { class: 'tool-defaults', open: notices.length > 0 },
+    h('summary', null, 'Default model for each tool'),
+    h('p', { class: 'who-intro' }, 'Used when a job says “Tool default”, and when work moves to another tool after a usage limit. The lists come from each tool itself.'),
+    ...notices, h('div', { class: 'td-grid' }, rows));
+  return { el, value: () => (Object.keys(draft).length ? JSON.parse(JSON.stringify(draft)) : null), focus(t) { if (ctl[t]) { el.open = true; (ctl[t].sel.value === CUSTOM_MODEL ? ctl[t].inp : ctl[t].sel).focus(); } } };
 }
 
 /* ───────────────────────── small widgets: pill radiogroups and menus ───────────────────────── */
@@ -873,18 +1043,18 @@ const SUGGEST = {
 const MODE_PILLS = [
   { id: 'auto', label: 'Auto', icon: 'sparkle', title: 'Let Conductor decide from what you type' },
   { id: 'ask', label: 'Ask', icon: 'help', title: 'Quick Ask: answered here, no task' },
-  { id: 'work', label: 'Build', icon: 'code', title: 'Engineering work: sent to the board as a task' },
-  { id: 'research', label: 'Research', icon: 'shield', title: 'Deep Research: a web report with sources' },
+  { id: 'work', label: 'Build', icon: 'code', title: 'Engineering work: designed in detail, sent to the board' },
+  { id: 'research', label: 'Research', icon: 'shield', title: 'Deep Research: a detailed brief, then a web report with sources' },
 ];
 const MODE_CARDS = [
   { id: 'ask', title: 'Quick Ask', desc: 'A question or an explanation. Answered right here from your code. No task, no plan.' },
-  { id: 'work', title: 'Engineering Work', desc: 'Features, refactors, bug fixes. Sent to the board as a task: Conductor plans it, splits it into tasks if needed, builds and verifies it.' },
-  { id: 'research', title: 'Deep Research', desc: 'Compare options and check evidence on the web. A report with sources, shown as opened, listed or unverified.' },
+  { id: 'work', title: 'Engineering Work', desc: 'Features, refactors, bug fixes. Checked against your repo, designed in detail, and sent to the board as one or more tasks.' },
+  { id: 'research', title: 'Deep Research', desc: 'Compare options and check evidence on the web. Written up as a detailed brief, then researched: a report with sources, shown as opened, listed or unverified.' },
 ];
 const DISCLOSE = {
   ask: 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.',
-  research: 'Searches and reads sources on the web (it cannot see your code) and writes a report with citations. Needs the internet; uses your Claude plan.',
-  work: 'Creates a card in To do. Conductor plans it, builds it and verifies it without further input.',
+  research: 'First a short research brief for you to check, written by Claude from your question only (it cannot see your code). Then Claude searches and reads sources on the web and writes a report with citations. Needs the internet; uses your Claude plan.',
+  work: 'Conductor reads a read-only copy of the repository, writes a detailed brief and splits it into tasks. Nothing goes to the board until you press Send.',
 };
 const MAX_TURNS = 20;
 const ASK_POLL_MS = 1500;
@@ -895,16 +1065,21 @@ const homeRepoNames = () => ((S.state && S.state.repos) || []).map((r) => r.name
 function lastRepo() { const v = storeGet('home:lastRepo'); return v && homeRepoNames().includes(v) ? v : ''; }
 const effMode = () => (S.home.mode === 'auto' ? M.detectMode(S.home.text) : S.home.mode);
 const homeRepo = () => M.resolveRepo({ text: S.home.text, chosen: S.home.repo, lastUsed: lastRepo(), names: homeRepoNames(), allowNone: noneAllowed(effMode()) });
-const homeBusy = () => S.home.turns.some((t) => t.phase === 'sending' || t.phase === 'running');
+const homeBusy = () => S.home.turns.some((t) => t.phase === 'sending' || t.phase === 'running' || t.phase === 'briefing');
+/** A turn that can be stopped: a running ask/research, or a brief being written. */
+const stoppable = (t) => (t.phase === 'running' && t.askId) || (t.phase === 'briefing' && t.briefId);
 /** "No repository" is a real choice for Research, and for Ask unless exactly one repo is registered (the server then picks it). */
 const noneAllowed = (mode) => M.noneAllowed(mode, homeRepoNames().length);
-const modeRow = (mode) => M.ROLE_ROWS.find((r) => r.id === M.MODE_META[mode].row);
+/** M8-6: with "Design the work" (state.home.design) Build is first handled by the Design row (requirements); otherwise by planning. */
+const designOn = () => !!(S.state && S.state.home && S.state.home.design === true);
+const researchBriefOn = () => !!(S.state && S.state.home && S.state.home.researchBrief === true);
+const modeRow = (mode) => M.ROLE_ROWS.find((r) => r.id === (mode === 'work' && designOn() ? 'design' : M.MODE_META[mode].row));
 
 function buildHomeView() {
   HM.hero = h('section', { class: 'home-hero', 'aria-labelledby': 'hero-h' },
     h('div', { class: 'home-hero-mark' }, icon('baton')),
     h('h1', { id: 'hero-h' }, 'What do you want to do?'),
-    h('p', null, 'Write one line. Conductor answers it, researches it, or sends it to the board as work.'));
+    h('p', null, 'Write one line. Conductor checks it against your repository, writes it up properly, and sends it where it belongs.'));
   HM.clear = h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: clearThread }, 'Clear');
   HM.turnList = h('div', { class: 'thread-list' });
   HM.turnEls = new Map();
@@ -928,7 +1103,7 @@ function buildHomeView() {
     HM.whoIcon, HM.whoLbl, icon('chevron', 'icon-sm'));
   HM.whoWrap = h('div', { class: 'menu-wrap' }, HM.whoBtn);
   HM.sendIcon = h('span', { class: 'send-ic' });
-  HM.send = h('button', { type: 'button', class: 'send', onclick: () => (S.home.turns.some((t) => t.phase === 'running' && t.askId) ? stopRunningTurn() : homeSubmit()) }, HM.sendIcon);
+  HM.send = h('button', { type: 'button', class: 'send', onclick: () => (S.home.turns.some(stoppable) ? stopRunningTurn() : homeSubmit()) }, HM.sendIcon);
   HM.note = h('p', { class: 'cmp-note' });
   HM.allowBox = h('input', { type: 'checkbox', onchange: () => { S.home.allowChange = HM.allowBox.checked; } });
   HM.allowLbl = h('span');
@@ -999,11 +1174,12 @@ function updateHome() {
   HM.whoBtn.title = row.label + (lead ? ' · ' + provLabel(lead) : '') + ' (who does this job)';
   HM.whoBtn.setAttribute('aria-label', 'Handled by: ' + row.label + (lead ? ', ' + provLabel(lead) : ''));
   // send / stop: the name says what happens and where (Security U4)
-  const canStop = hm.turns.some((t) => t.phase === 'running' && t.askId);
+  const canStop = hm.turns.some(stoppable);
   const sendName = canStop ? 'Stop' : busy ? 'Sending…'
     : mode === 'ask' ? (res.name ? 'Ask about ' + res.name : 'Ask (no repository)')
-      : mode === 'research' ? 'Research on the web'
-        : res.name ? 'Send to the board (' + res.name + ')' : 'Send to the board';
+      : mode === 'research' ? (researchBriefOn() ? 'Write a research brief' : 'Research on the web')
+        : designOn() ? (res.name ? 'Design the work in ' + res.name : 'Design the work')
+          : res.name ? 'Send to the board (' + res.name + ')' : 'Send to the board';
   HM.send.setAttribute('aria-label', sendName);
   HM.send.title = sendName;
   HM.send.disabled = canStop ? false : busy || !hm.text.trim();
@@ -1126,27 +1302,32 @@ function fillWhoMenu(pop, row) {
   const choices = S.roles.choices[row.role] || {};
   let draft = lead;
   const status = h('p', { class: 'menu-text', role: 'status' });
-  const out = h('p', { class: 'warn-note', role: 'status', hidden: true });
+  const out = h('p', { class: 'warn-note menu-out', role: 'status', hidden: true });
   const apply = h('button', { type: 'button', class: 'btn btn-primary btn-sm' });
   const items = Object.keys(choices).map((id) => ({ id, label: provLabel(id), locked: !choices[id].ok, reason: choices[id].reason || '', title: choices[id].ok ? (choices[id].needsAck ? 'Isolation not verified on this machine' : null) : choices[id].reason || 'Not available for this job' }));
+  // M8-2: the job's model and effort, in the chosen tool's own words (Deep Research: always Claude today)
+  const ed = modelEditor({ row, tool: row.id === 'research' ? 'claude' : lead, entry: S.roles.roles[row.role], view: (S.roles.roleViews || {})[row.role], onChange: () => sync() });
   const sync = () => {
     pills.set(draft);
-    setText(apply, draft && draft !== lead ? 'Use ' + provLabel(draft) + ' for every ' + row.label + ' job' : 'No change');
-    apply.disabled = !draft || draft === lead || apply.classList.contains('is-busy');
+    const toolChange = !!draft && draft !== lead;
+    const selChange = !!ed.value();
+    setText(apply, toolChange ? 'Use ' + provLabel(draft) + ' for every ' + row.label + ' job' : selChange ? 'Save for every ' + row.label + ' job' : 'No change');
+    apply.disabled = !draft || (!toolChange && !selChange) || apply.classList.contains('is-busy');
   };
   const pills = pillGroup({ label: 'Tool for ' + row.label, items, value: draft,
-    onPick: (id) => { draft = id; setText(status, ''); sync(); },
+    onPick: (id) => { draft = id; setText(status, ''); if (row.id !== 'research') ed.setTool(id); sync(); },
     onLocked: (it) => setText(status, it.label + ': ' + it.reason) });
   apply.addEventListener('click', async () => {
-    if (!draft || draft === lead) return;
+    const sel = ed.value();
+    if (!draft || (draft === lead && !sel)) return;
     apply.classList.add('is-busy'); apply.disabled = true;
     for (const b of pills.btns) b.disabled = true;
-    const r = await applyRoleChanges({ [row.id]: draft });
+    const r = await applyRoleChanges(draft !== lead ? { [row.id]: draft } : {}, sel ? { [row.id]: sel } : {});
     if (!HM.whoMenu || !pop.isConnected) return;
     if (r.ok) {
       const notes = r.notices || [];
-      if (notes.length) { fillWhoMenu(pop, row); const o2 = pop.querySelector('.warn-note'); if (o2) { o2.replaceChildren(...notes.map((n) => h('span', null, n))); o2.hidden = false; } }
-      else { closeHomeMenus(true); toast('good', row.label + ' now runs on ' + provLabel(draft) + '.'); }
+      if (notes.length) { fillWhoMenu(pop, row); const o2 = pop.querySelector('.menu-out'); if (o2) { o2.replaceChildren(...notes.map((n) => h('span', null, n))); o2.hidden = false; } }
+      else { closeHomeMenus(true); toast('good', draft !== lead ? row.label + ' now runs on ' + provLabel(draft) + '.' : row.label + ': model settings saved.'); }
       updateHome();
       return;
     }
@@ -1154,13 +1335,15 @@ function fillWhoMenu(pop, row) {
     for (const b of pills.btns) b.disabled = false;
     draft = M.leadOf(S.roles.roles, row.role);
     if (r.error) { out.textContent = r.error; out.hidden = false; }
+    const fr = fieldRow(r.field);
+    if (fr && fr.row === row.id) ed.focus(fr.key);
     sync();
   });
   const notes = [];
   if (row.id === 'research') notes.push("Deep Research always runs on Claude's web-only research profile today, so this job cannot be moved to another tool yet.");
   const abc = S.roles.roles[row.role] && S.roles.roles[row.role].autoByComplexity;
   if (abc && Object.keys(abc).length) notes.push('Some plan sizes use a different tool first (set in the config file).');
-  pop.replaceChildren(title, scope, pills.el, status, ...notes.map((n) => h('p', { class: 'menu-text muted' }, n)), out,
+  pop.replaceChildren(title, scope, pills.el, ed.el, status, ...notes.map((n) => h('p', { class: 'menu-text muted' }, n)), out,
     h('div', { class: 'turn-actions' }, apply, link));
   sync();
   const f = pills.btns.find((b) => b.getAttribute('aria-checked') === 'true') || pills.btns[0];
@@ -1204,14 +1387,22 @@ async function homeSubmit() {
     if (!names.length) { hm.err = 'Add a repository first (Settings, then Repositories and setup).'; updateHome(); return; }
     if (!res.name) { hm.err = 'Choose which repository this task belongs to.'; updateHome(); toggleHomeMenu('repo'); return; }
   }
-  const t = { id: uid('turn'), mode, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && !!res.name && hm.allowChange };
+  const t = { id: uid('turn'), mode, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && !!res.name && hm.allowChange,
+    briefId: null, brief: null, unticked: new Set(), depth: 'standard', sendBusy: false, sendErr: '' };
   pushTurn(t);
   hm.allowChange = false;
   closeHomeMenus(false);
   updateHome();
   scrollToTurn(t);
   try {
-    if (mode === 'work') {
+    if ((mode === 'work' && designOn()) || (mode === 'research' && researchBriefOn())) {
+      // M8-6: one line → a brief (and parts). Nothing reaches the board until the user presses Send.
+      const body = { kind: mode === 'work' ? 'work' : 'research', line: text };
+      if (t.repo) body.repo = t.repo;
+      const b = await api('POST', '/api/briefs', body);
+      t.briefId = b.id; t.brief = b; t.phase = briefPhase(b);
+      if (t.phase === 'briefing') pollBrief(t);
+    } else if (mode === 'work') {
       const body = M.taskFromText(text);
       if (t.repo) body.repo = t.repo;
       const r = await api('POST', '/api/tasks', body);
@@ -1231,9 +1422,14 @@ async function homeSubmit() {
     if (HM.input) { HM.input.value = ''; fitComposer(); }
   } catch (e) {
     if (e instanceof ApiFail && e.status === 401) return;
-    t.phase = 'error'; t.error = e.message;
+    t.phase = 'error'; t.error = errText(e);
   }
   updateHome();
+}
+/** A server refusal as text; `limited` adds "Try again at HH:MM" from `retryAt`. */
+function errText(e) {
+  const at = e && e.info && typeof e.info.retryAt === 'number' && e.info.retryAt > 0 ? new Date(e.info.retryAt) : null;
+  return (e && e.message ? e.message : 'Something went wrong.') + (e && e.code === 'limited' && at ? ' Try again at ' + at.toTimeString().slice(0, 5) + '.' : '');
 }
 function pollTurn(t, delay) {
   clearTimeout(t.timer);
@@ -1253,8 +1449,13 @@ function pollTurn(t, delay) {
   }, delay || ASK_POLL_MS);
 }
 async function stopRunningTurn() {
-  const t = S.home.turns.find((x) => x.phase === 'running' && x.askId);
+  const t = S.home.turns.find(stoppable);
   if (!t) return;
+  if (t.phase === 'briefing') {
+    try { t.brief = await api('POST', '/api/briefs/' + enc(t.briefId) + '/cancel'); t.phase = briefPhase(t.brief); if (t.phase !== 'briefing') clearTimeout(t.timer); } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); }
+    updateHome();
+    return;
+  }
   try {
     const r = await api('POST', '/api/asks/' + enc(t.askId) + '/cancel');
     t.rec = r; t.phase = askPhase(r);
@@ -1282,7 +1483,8 @@ function scrollToTurn(t) {
 function renderThread() {
   if (!HM.turnEls) return;
   const els = S.home.turns.map((t) => {
-    const sig = JSON.stringify([t.phase, t.error, t.created, t.busy, t.convertErr, t.rec && [t.rec.status, t.rec.basis, t.rec.provider, t.rec.updatedAt, t.rec.convertedTo, t.rec.error], t.phase === 'running' ? null : roleLead(modeRow(t.mode).role)]);
+    const sig = JSON.stringify([t.phase, t.error, t.created, t.busy, t.convertErr, t.rec && [t.rec.status, t.rec.basis, t.rec.provider, t.rec.updatedAt, t.rec.convertedTo, t.rec.error], t.phase === 'running' ? null : roleLead(modeRow(t.mode).role),
+      t.brief && [t.brief.status, t.brief.updatedAt], t.unticked ? [...t.unticked].join() : '', t.depth, t.sendBusy, t.sendErr, briefLimitsSig()]);
     let rec = HM.turnEls.get(t.id);
     if (!rec) { rec = { el: h('article', { class: 'turn', data: { turn: t.id } }), sig: '' }; HM.turnEls.set(t.id, rec); }
     if (rec.sig !== sig) {
@@ -1306,6 +1508,16 @@ function stepNodes(steps) {
 /** Steps come from the record's real fields only (status, basis, provider): nothing advances on a timer. */
 function turnSteps(t) {
   const r = t.rec;
+  if (t.brief) {
+    // M8-6: the brief's steps come from the record (the design's STEPS wording); research then adds the web run's own step
+    const steps = t.brief.steps.map((s) => ({ label: s.label, detail: s.detail, state: s.state === 'failed' ? 'stopped' : s.state }));
+    if (t.mode === 'research' && t.askId) {
+      const done = t.phase === 'done';
+      const ended = t.phase === 'failed' || t.phase === 'canceled' || t.phase === 'error';
+      steps.push({ label: done ? 'Report written by ' + provLabel((r && r.provider) || 'claude') : 'Researching on the web (' + (t.brief.sent && t.brief.sent.depth === 'deep' ? 'Deep' : 'Standard') + '). This can take a few minutes.', state: done ? 'done' : ended ? 'stopped' : 'running' });
+    }
+    return steps;
+  }
   const ended = t.phase === 'failed' || t.phase === 'canceled' || t.phase === 'error';
   if (t.mode === 'work') {
     return [{ label: t.phase === 'sent' ? 'Sent to the board as ' + t.created.key : 'Creating the task', state: t.phase === 'sent' ? 'done' : ended ? 'stopped' : 'running' }];
@@ -1326,12 +1538,13 @@ function turnNodes(t) {
   const meta = M.MODE_META[t.mode];
   const row = modeRow(t.mode);
   const r = t.rec;
-  const by = r && r.provider ? r.provider : roleLead(row.role);
+  const by = r && r.provider ? r.provider : t.brief && t.brief.handledBy ? t.brief.handledBy.provider : roleLead(row.role);
   const out = [];
+  if (t.brief) out.push(...briefNodes(t));
   if (t.phase === 'error') out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'Not sent'), h('div', { class: 'pre' }, t.error))));
-  if (t.phase === 'failed') out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, t.mode === 'research' ? 'No report' : 'No answer'), h('div', { class: 'pre' }, (r && r.error) || 'Something went wrong.'))));
+  if (t.phase === 'failed' && !(t.brief && !t.askId)) out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, t.mode === 'research' ? 'No report' : 'No answer'), h('div', { class: 'pre' }, (r && r.error) || 'Something went wrong.'))));
   if (t.phase === 'canceled') out.push(h('p', { class: 'muted' }, 'Stopped.'));
-  if (t.phase === 'sent') {
+  if (t.phase === 'sent' && !t.brief) {
     out.push(h('div', { class: 'sent' }, icon('check'), h('span', { class: 'sent-t' }, 'Sent to the board'),
       h('span', { class: 'keys' }, h('span', { class: 'chip' }, t.created.key)),
       h('button', { type: 'button', class: 'btn btn-sm', data: { fid: 'view' }, onclick: () => navigate('#/board') }, 'View on board')));
@@ -1369,6 +1582,163 @@ function convertNodes(t, label, doneText, hint, noRepo, primary) {
     h('button', { type: 'button', class: 'btn' + (primary ? ' btn-primary' : '') + (t.busy ? ' is-busy' : ''), disabled: !!t.busy, data: { fid: 'convert' }, onclick: () => convertTurn(t) }, icon('plus'), h('span', null, label)),
     hint ? h('span', { class: 'muted' }, hint) : null),
   t.convertErr ? h('p', { class: 'err', role: 'alert' }, t.convertErr) : null].filter(Boolean);
+}
+
+/* ───────── M8-6: "Design the work" and research briefs (DOM only; every model string is a text node, code spans via textContent) ───────── */
+const BRIEF_POLL_MS = 1000;
+const MODEL_LABEL = 'Written by a model — check it';
+const WORK_APPROVAL_HINT = "Each task starts by itself and its plan waits for your approval (written from a model's brief).";
+const FILE_STATE = { file: 'in the repo', omitted: 'in the repo, not in the snapshot', absent: 'new' };
+/** Brief status → turn phase. A research brief that was sent continues as its ask (pollTurn). */
+function briefPhase(b) {
+  if (b.status === 'running') return 'briefing';
+  if (b.status === 'ready' || b.status === 'sending' || b.status === 'send_failed') return 'review';
+  if (b.status === 'sent') return 'sent';
+  return b.status === 'canceled' ? 'canceled' : 'failed';
+}
+function pollBrief(t, delay) {
+  clearTimeout(t.timer);
+  t.timer = setTimeout(async () => {
+    t.timer = 0;
+    if (!S.home.turns.includes(t) || S.expired) return;
+    try {
+      t.brief = await api('GET', '/api/briefs/' + enc(t.briefId));
+      t.phase = briefPhase(t.brief);
+      if (t.phase === 'briefing') pollBrief(t);
+    } catch (e) {
+      if (e instanceof ApiFail && e.status === 401) return;
+      if (e instanceof ApiFail && e.status === 404) { t.phase = 'error'; t.error = e.message; }
+      else pollBrief(t, 5000); // a moment without the server: keep watching the same brief (never re-sends)
+    }
+    updateHome();
+  }, delay || BRIEF_POLL_MS);
+}
+const briefLimits = () => (S.state && S.state.home && S.state.home.limits) || null;
+const briefLimitsSig = () => { const l = briefLimits(); return l ? [l.researchUsed, l.researchPerDay].join('/') : ''; };
+/** Plain text with `backtick` spans as <code> elements (textContent) — no links, no images, no markup. */
+function codeText(text) {
+  const parts = String(text == null ? '' : text).split(/`([^`\n]{1,300})`/);
+  return parts.map((p, i) => (i % 2 ? h('code', null, p) : p)).filter((x) => x !== '');
+}
+function briefSec(title, ...kids) { return h('section', { class: 'sec' }, title ? h('h4', null, title) : null, ...kids); }
+function briefList(items, cls) { return h('ul', { class: 'sec-list' + (cls ? ' ' + cls : '') }, items.map((x) => h('li', null, cls === 'is-checks' ? h('span', { class: 'cbox' }) : null, h('span', null, ...codeText(x))))); }
+const selectedParts = (t) => ((t.brief.work && t.brief.work.parts) || []).filter((p) => !t.unticked.has(p.id)).map((p) => p.id);
+
+function briefNodes(t) {
+  const b = t.brief;
+  const out = [];
+  const w = b.work;
+  const rs = b.research;
+  if (b.status === 'failed' && !t.askId) {
+    const at = b.errorKind === 'limited' && b.retryAt ? ' Try again at ' + new Date(b.retryAt).toTimeString().slice(0, 5) + '.' : '';
+    out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'No brief'), h('div', { class: 'pre' }, (b.error || 'Something went wrong.') + at))));
+  }
+  if (w && b.scan) {
+    out.push(h('div', { class: 'scan' },
+      h('div', { class: 'scan-line' }, icon('folder', 'icon-sm'), h('span', null, b.scan.repo + ' · ' + b.scan.branch + ' @ ' + b.scan.sha + ' · ' + b.scan.snapshotFiles + ' files in the snapshot')),
+      h('ul', { class: 'scan-files' }, w.files.map((f) => h('li', null, h('span', { class: 'file-chip' }, f.path), h('span', null, f.why + ' · ' + (FILE_STATE[f.state] || 'new')),
+        f.protected ? badge('warn', 'Protected file') : null, f.secretLike ? badge('warn', 'Looks like a secret file') : null))),
+      b.scan.note ? h('p', { class: 'scan-note' }, b.scan.note) : null,
+      h('p', { class: 'scan-note' }, 'The marks say whether a path is in the committed snapshot. They do not prove the brief’s reasoning is right.')));
+  }
+  if (w || rs) {
+    const doc = h('div', { class: 'doc' }, h('div', { class: 'doc-head' }, h('span', null, w ? 'Detailed brief' : 'Research brief'), b.repo ? h('span', { class: 'chip' }, b.repo) : null, badge('warn', MODEL_LABEL)));
+    if (w) {
+      doc.append(briefSec('', h('p', null, h('b', null, w.title))), briefSec('Goal', h('p', null, ...codeText(w.summary))), briefSec('What changes', h('p', { class: 'is-pre' }, ...codeText(w.approach))));
+      if (w.acceptance.length) doc.append(briefSec('Acceptance criteria', briefList(w.acceptance, 'is-checks')));
+      if (w.risks.length) doc.append(briefSec('Risks', briefList(w.risks)));
+    } else {
+      doc.append(briefSec('', h('p', null, h('b', null, rs.title))), briefSec('Objective', h('p', { class: 'is-pre' }, rs.objective)),
+        briefSec('Key questions', h('ol', { class: 'sec-list is-ol' }, rs.questions.map((q) => h('li', null, h('span', null, q))))),
+        briefSec('Scope', briefList(rs.scope.in.map((x) => 'In: ' + x).concat(rs.scope.out.map((x) => 'Out: ' + x), rs.scope.timeWindow ? ['Time window: ' + rs.scope.timeWindow] : []))),
+        briefSec('Source types', h('p', null, rs.sourceTypes.join(', ') || 'Any')),
+        briefSec('Deliverable', h('p', { class: 'is-pre' }, rs.deliverable)),
+        briefSec('', h('p', { class: 'muted' }, 'Written by Claude from your question only — it had no access to your repository. Research uses the web only.')));
+    }
+    out.push(doc);
+  }
+  if (w && w.parts.length) {
+    const review = t.phase === 'review' && b.status === 'ready' && !t.sendBusy;
+    out.push(h('div', { class: 'parts-wrap' },
+      h('div', { class: 'parts-head' }, h('b', null, w.parts.length === 1 ? 'One task' : w.parts.length + ' tasks, in order'), review ? h('span', { class: 'muted' }, 'Untick anything you do not want sent.') : null),
+      h('ul', { class: 'parts' }, w.parts.map((p, i) => {
+        const on = !t.unticked.has(p.id);
+        return h('li', { class: 'part' + (on ? '' : ' is-off') },
+          h('label', { class: 'part-check' }, h('input', { type: 'checkbox', checked: on, disabled: !review, 'aria-label': 'Include part ' + (i + 1), data: { fid: 'part-' + p.id }, onchange: (e) => { if (e.target.checked) t.unticked.delete(p.id); else t.unticked.add(p.id); updateHome(); } })),
+          h('div', { class: 'part-main' }, h('div', { class: 'part-t' }, p.title), h('div', { class: 'part-s' }, p.summary),
+            h('div', { class: 'part-m' }, ...p.files.map((f) => h('span', { class: 'file-chip' }, f)), p.deps.length ? h('span', { class: 'part-dep' }, 'After ' + p.deps.map((d) => 'part ' + d.slice(1)).join(', ')) : null)),
+          h('span', { class: 'badge tone-mute' }, 'Size ' + p.size));
+      }))));
+    const flagged = w.files.filter((f) => f.protected || f.secretLike).map((f) => f.path);
+    if (flagged.length) out.push(h('p', { class: 'warn-note', role: 'note' }, icon('warn', 'icon-sm'), h('span', null, 'This brief names protected or secret-looking files: ' + flagged.join(', ') + '. Plans that touch them always wait for your approval.')));
+  }
+  if (t.phase === 'review') out.push(...briefReview(t));
+  if (t.phase === 'sent' && w && b.sent && b.sent.cards) {
+    const n = b.sent.cards.filter((c) => !c.dependsOn.length).length;
+    out.push(h('div', { class: 'sent' }, icon('check'), h('span', { class: 'sent-t' }, b.sent.cards.length === 1 ? 'Sent 1 task to the board' : 'Sent ' + b.sent.cards.length + ' tasks to the board'),
+      h('span', { class: 'keys' }, ...b.sent.cards.map((c) => h('span', { class: 'chip' }, c.key))),
+      h('button', { type: 'button', class: 'btn btn-sm', data: { fid: 'view' }, onclick: () => navigate('#/board') }, 'View on board')));
+    out.push(h('p', { class: 'muted' }, (n === 1 ? '1 plan will be written now' : n + ' plans will be written now') + '; each one waits for your approval. A task that starts after another one needs that one merged into your base branch and moved to Done first.'));
+  }
+  return out;
+}
+function briefReview(t) {
+  const b = t.brief;
+  const out = [];
+  if (b.status === 'send_failed' && b.sent) out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'Not every task was sent'), h('div', { class: 'pre' }, (b.sent.error || 'The board could not take every card.') + ' Sending again creates only the missing ones.'))));
+  if (t.sendErr) out.push(h('p', { class: 'err', role: 'alert' }, t.sendErr));
+  const acts = [];
+  if (b.kind === 'work') {
+    const chosen = b.status === 'send_failed' && b.sent && b.sent.parts ? b.sent.parts : selectedParts(t);
+    acts.push(h('button', { type: 'button', class: 'btn btn-primary' + (t.sendBusy ? ' is-busy' : ''), disabled: t.sendBusy || !chosen.length || b.status === 'sending', data: { fid: 'send' }, onclick: () => sendBrief(t, { parts: chosen }) },
+      icon('arrow-up'), h('span', null, b.status === 'send_failed' ? 'Send the missing tasks' : chosen.length === 1 ? 'Send 1 task to the board' : 'Send ' + chosen.length + ' tasks to the board')));
+  } else {
+    const lim = briefLimits();
+    const deepOff = !!lim && lim.researchUsed + 2 > lim.researchPerDay;
+    if (deepOff && t.depth === 'deep') t.depth = 'standard';
+    out.push(h('div', { class: 'depth' }, h('span', { class: 'muted' }, 'Depth'),
+      h('div', { class: 'pills', role: 'radiogroup', 'aria-label': 'Research depth' }, [['standard', 'Standard'], ['deep', 'Deep']].map(([id, label]) => h('button', {
+        type: 'button', role: 'radio', class: 'pill' + (t.depth === id ? ' is-on' : ''), 'aria-checked': t.depth === id ? 'true' : 'false', data: { fid: 'depth-' + id },
+        disabled: t.sendBusy || (id === 'deep' && deepOff), title: id === 'deep' && deepOff ? "Deep counts as 2 of today's research runs, and there are not enough left." : null,
+        onclick: () => { t.depth = id; updateHome(); },
+      }, label))),
+      h('span', { class: 'muted' }, t.depth === 'deep' ? "Reads more sources and takes longer (up to 35 minutes). Counts as 2 of today's research runs." : 'A focused pass over the main sources (up to 20 minutes).')));
+    acts.push(h('button', { type: 'button', class: 'btn btn-primary' + (t.sendBusy ? ' is-busy' : ''), disabled: t.sendBusy || b.status === 'sending', data: { fid: 'send' }, onclick: () => sendBrief(t, { depth: t.depth }) }, icon('arrow-up'), h('span', null, 'Send as a research task')));
+  }
+  acts.push(h('button', { type: 'button', class: 'btn', disabled: t.sendBusy || b.status === 'sending' || b.status === 'send_failed', data: { fid: 'discard' }, onclick: () => discardBrief(t) }, 'Discard'));
+  acts.push(h('span', { class: 'muted' }, b.kind === 'work' ? WORK_APPROVAL_HINT : 'It starts now (never queued) and the report shows up here. Its findings become work only if you turn them into a plan.'));
+  out.push(h('div', { class: 'review' }, h('div', { class: 'actions' }, acts)));
+  return out;
+}
+async function sendBrief(t, body) {
+  if (t.sendBusy) return;
+  t.sendBusy = true; t.sendErr = ''; updateHome();
+  try {
+    const r = await api('POST', '/api/briefs/' + enc(t.briefId) + '/send', body);
+    if (t.brief.kind === 'research') {
+      t.askId = r.askId;
+      t.brief = await api('GET', '/api/briefs/' + enc(t.briefId));
+      t.rec = await api('GET', '/api/asks/' + enc(r.askId));
+      t.phase = askPhase(t.rec);
+      if (t.phase === 'running') pollTurn(t);
+    } else {
+      t.brief = await api('GET', '/api/briefs/' + enc(t.briefId));
+      t.phase = briefPhase(t.brief);
+    }
+    loadState().catch(() => {});
+  } catch (e) {
+    if (e instanceof ApiFail && e.status === 401) return;
+    t.sendErr = errText(e);
+    try { t.brief = await api('GET', '/api/briefs/' + enc(t.briefId)); t.phase = briefPhase(t.brief); } catch { /* keep the last known brief */ }
+  }
+  t.sendBusy = false;
+  updateHome();
+}
+async function discardBrief(t) {
+  try { await api('DELETE', '/api/briefs/' + enc(t.briefId)); } catch (e) { if (e instanceof ApiFail && e.status === 401) return; if (!(e instanceof ApiFail && e.status === 404)) { t.sendErr = e.message; updateHome(); return; } }
+  clearTimeout(t.timer);
+  S.home.turns = S.home.turns.filter((x) => x !== t);
+  updateHome();
 }
 
 /* ───────────────────────── board view ───────────────────────── */
@@ -2655,7 +3025,14 @@ function renderReport(rp) {
   out.push(h('h3', null, 'Recommendation'), h('p', null, rp.recommendation));
   if (rp.steps.length) out.push(h('h3', null, 'Suggested next steps'), h('ol', { class: 'kv-list' }, rp.steps.map((x) => h('li', null, x))));
   out.push(h('h3', null, 'Limits of this report'), h('p', null, rp.limitations || 'None stated.'));
-  if (rp.fetched.length || rp.searched.length) out.push(h('details', null, h('summary', null, 'Everything it searched and opened'), rp.searched.length ? h('p', { class: 'muted' }, 'Searches: ' + rp.searched.join(' · ')) : null, rp.fetched.length ? h('p', { class: 'muted' }, 'Opened: ' + rp.fetched.join(' · ')) : null));
+  if (rp.fetched.length || rp.searched.length) {
+    // S14/F1: the lists are capped (100 / 50); the true totals say what is not shown
+    const moreS = M.moreNote(rp.searchedTotal, rp.searched.length, 'searches');
+    const moreF = M.moreNote(rp.fetchedTotal, rp.fetched.length, 'pages opened');
+    out.push(h('details', null, h('summary', null, 'Everything it searched and opened'),
+      rp.searched.length ? h('p', { class: 'muted' }, 'Searches: ' + rp.searched.join(' · ') + (moreS ? ' · ' + moreS : '')) : null,
+      rp.fetched.length ? h('p', { class: 'muted' }, 'Opened: ' + rp.fetched.join(' · ') + (moreF ? ' · ' + moreF : '')) : null));
+  }
   return out;
 }
 
@@ -2724,6 +3101,9 @@ function openSettings() {
 
   /* Who does what: seven rows, a draft until Save (the server's role chains are the truth; reasons are shown verbatim) */
   const draft = {}; // row id → provider id the user picked
+  const editors = {}; // M8-2: row id → model editor
+  let toolDefs = null; // M8-2: "Default model for each tool"
+  const tdHolder = h('div');
   const whoList = h('div', { class: 'who-list' });
   const limitNote = h('p', { class: 'warn-note', role: 'status', hidden: true });
   const syncLimitNote = () => {
@@ -2742,13 +3122,18 @@ function openSettings() {
       return;
     }
     const { roles, choices } = S.roles;
+    const views = S.roles.roleViews || {};
     whoList.replaceChildren(...M.ROLE_ROWS.map((row) => {
       const lead = M.leadOf(roles, row.role);
       const ch = choices[row.role] || {};
       const note = h('p', { class: 'muted who-note', role: 'status' });
       const items = Object.keys(ch).map((id) => ({ id, label: provLabel(id), locked: !ch[id].ok, reason: ch[id].reason || '', title: ch[id].ok ? (ch[id].needsAck ? 'Isolation not verified on this machine: Conductor asks you to confirm on Save' : null) : ch[id].reason || 'Not available for this job' }));
+      // the tool the model choice is judged against: Claude for Deep Research (it only runs there today), else the lead
+      const selTool = row.id === 'research' ? 'claude' : lead;
+      const ed = modelEditor({ row, tool: selTool, entry: roles[row.role], view: views[row.role] });
+      editors[row.id] = ed;
       const pills = pillGroup({ label: 'Tool for ' + row.label, items, value: draft[row.id] || lead,
-        onPick: (id) => { if (id === lead) delete draft[row.id]; else draft[row.id] = id; pills.set(id); setText(note, ''); syncLimitNote(); },
+        onPick: (id) => { if (id === lead) delete draft[row.id]; else draft[row.id] = id; pills.set(id); setText(note, ''); syncLimitNote(); if (row.id !== 'research') ed.setTool(id); },
         onLocked: (it) => setText(note, it.label + ': ' + it.reason) });
       const extra = [];
       if (row.id === 'research') extra.push("Deep Research always runs on Claude's web-only research profile today, so this job cannot be moved to another tool yet.");
@@ -2758,8 +3143,11 @@ function openSettings() {
         h('div', { class: 'who-main' }, h('div', { class: 'who-title' }, row.label), h('div', { class: 'who-hint' }, row.hint),
           ...extra.map((x) => h('div', { class: 'who-hint' }, x))),
         h('div', { class: 'who-ctl' }, pills.el),
+        ed.el,
         note);
     }));
+    toolDefs = toolDefaultsEditor();
+    tdHolder.replaceChildren(toolDefs.el);
   };
 
   const onSubmit = async (e) => {
@@ -2774,7 +3162,11 @@ function openSettings() {
     const patch = {};
     for (const k of Object.keys(next)) if (next[k] !== cur[k]) patch[k] = next[k];
     const roleChanges = Object.assign({}, draft);
-    if (!Object.keys(patch).length && !Object.keys(roleChanges).length) { $('#dlg').close(); return; }
+    const sels = {};
+    for (const id of Object.keys(editors)) { const v = editors[id].value(); if (v) sels[id] = v; }
+    const tm = toolDefs ? toolDefs.value() : null;
+    const whoChanged = Object.keys(roleChanges).length || Object.keys(sels).length || !!tm;
+    if (!Object.keys(patch).length && !whoChanged) { $('#dlg').close(); return; }
     if (!Number.isInteger(next.maxLoops) || next.maxLoops < 1 || next.maxLoops > 10) { showErr('Fix loops must be a whole number from 1 to 10.'); c.maxLoops.focus(); return; }
     if (!Number.isInteger(next.maxParallel) || next.maxParallel < 1 || next.maxParallel > 8) { showErr('Parallel runs must be a whole number from 1 to 8.'); c.maxParallel.focus(); return; }
     setBusy(submit, true);
@@ -2784,12 +3176,16 @@ function openSettings() {
       catch (ex) { showErr(ex.message); setBusy(submit, false); return; }
     }
     // 2. roles, recomputed from a fresh GET (onClaudeLimit may just have changed the chains)
-    if (Object.keys(roleChanges).length) {
-      const r = await applyRoleChanges(roleChanges);
+    if (whoChanged) {
+      const r = await applyRoleChanges(roleChanges, sels, tm);
       if (!r.ok) {
         const why = r.canceled ? 'You did not confirm the tool change.' : r.error || 'Something went wrong.';
         showErr(Object.keys(patch).length ? 'Your other settings were saved. Who does what was not changed: ' + why : 'Who does what was not changed: ' + why);
         setBusy(submit, false);
+        // "Save refused with focus" (M8-2): the server names the control
+        const fr = fieldRow(r.field);
+        if (fr && editors[fr.row]) { editors[fr.row].showError(r.error || ''); editors[fr.row].focus(fr.key); }
+        else { const tmf = /^toolModels\.(claude|cursor|codex)/.exec(String(r.field || '')); if (tmf && toolDefs) toolDefs.focus(tmf[1]); }
         return;
       }
     }
@@ -2806,8 +3202,8 @@ function openSettings() {
       fld('Plan approval', c.planApproval, 'Automatic starts building as soon as the plan is written. Large plans always ask.'),
       fld('Plan review', c.planReview, 'A second pass checks the plan before anything is built.')),
     group('Who does what',
-      h('p', { class: 'who-intro' }, 'Pick the tool for each job. Some tools cannot take some jobs yet; the reason is shown when you pick one. These are global settings: they apply to every request and every card.'),
-      whoList),
+      h('p', { class: 'who-intro' }, 'Pick the tool, the model and how hard it should think for each job. Each tool names its models and levels differently, so the choices change with the tool. Some tools cannot take some jobs yet; the reason is shown when you pick one. These are global settings: they apply to every request and every card.'),
+      whoList, tdHolder),
     group('Usage limits',
       fld('When Claude hits its usage limit', c.onClaudeLimit), limitNote),
     group('Limits',
@@ -2818,7 +3214,7 @@ function openSettings() {
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
   fillWho();
   dlg.showModal();
-  loadRoles().then(() => { if (dlg.open && !Object.keys(draft).length) fillWho(); });
+  loadRoles().then(() => { if (dlg.open && !Object.keys(draft).length && !Object.values(editors).some((e) => e.value())) fillWho(); });
 }
 
 /* ───────────────────────── setup wizard ───────────────────────── */

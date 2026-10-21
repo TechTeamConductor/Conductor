@@ -5,11 +5,13 @@ import { logger } from '../log.ts';
 import { validateEntity } from './validate.ts';
 import { truncate } from '../util.ts';
 import { Journal, type FaultHook } from './journal.ts';
+import { backupPaths } from '../schema/backup.ts';
 import {
   BOARD_SCHEMA_VERSION,
   BoardError,
   HUMAN_LANES,
   LANES,
+  REDACTED_ACTORS,
   USER_KINDS,
   type Actor,
   type BoardChange,
@@ -31,6 +33,8 @@ const PROJECT_KEY_RE = /^[A-Z]{2,6}$/;
 /** Same shape the HTTP API and the run store accept (api.ts KEY_RE ∩ store.ts KEY_RE ∩ branch naming). */
 const ITEM_KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 const AUTO_START_KINDS = new Set<ItemKind>(['work', 'ask', 'research']);
+/** Actors an older (v2) build cannot read: an op carrying one needs a current-version snapshot on disk first. */
+const V3_ONLY_ACTORS: ReadonlySet<Actor> = new Set<Actor>(['design']);
 
 export interface BoardOptions {
   dir?: string;
@@ -109,6 +113,8 @@ export class Board {
   private decisionsById = new Map<string, Decision>();
   /** Rough size of all text held (titles, descriptions, comments, decisions): keeps compaction far below V8's string limit (S-6). */
   private approxBytes = 0;
+  /** True until a current-version snapshot is on disk for a board that started empty (B1/S4). */
+  private stampPending = false;
 
   private constructor(opts: BoardOptions) {
     this.dir = opts.dir ?? paths.board();
@@ -130,6 +136,27 @@ export class Board {
       this.recoveredTornBytes = loaded.tornBytes;
       this.rederiveNextSeq();
       this.approxBytes = this.measure();
+      // B1/S4 (M8-6): the version lives only in the snapshot, and journal ops stay `v: 1`. So on a WRITABLE open whose snapshot is older
+      // than this build (or absent), back up what is there and stamp a current snapshot synchronously, BEFORE any op can be appended.
+      // A newer-only op (e.g. a `design` card) can then never sit behind an older snapshot, where an older build would read it as a
+      // torn tail and cut it off. An older build now refuses the whole board with NewerVersionError.
+      if (!this.readOnly && (loaded.snapshotVersion === null || loaded.snapshotVersion < BOARD_SCHEMA_VERSION)) {
+        if (loaded.snapshotVersion !== null || loaded.journalBytes > 0 || loaded.tornBytes > 0) {
+          // existing older data: back up, then stamp — fail closed (an open that cannot stamp must not accept a v3-only op)
+          try {
+            backupPaths([this.journal.snapshotFile, this.journal.journalFile], { label: `pre-board-v${BOARD_SCHEMA_VERSION}` });
+          } catch (e) {
+            // m5: fail closed, with a message a person can act on (the board is not upgraded and nothing was written)
+            throw new Error(`Conductor could not back up the board before upgrading it to schema ${BOARD_SCHEMA_VERSION} (${(e as Error).message}). Nothing was changed. Free some disk space or set CONDUCTOR_BACKUP_DIR to a writable folder, then start again.`);
+          }
+          this.journal.compact(this.snapshot());
+          this.opsSinceSnapshot = 0;
+        } else {
+          // a brand-new board: nothing to back up; a failed stamp is retried, and REQUIRED before the first v3-only op (commit())
+          this.stampPending = true;
+          this.tryStamp();
+        }
+      }
     } catch (e) {
       this.journal.close();
       throw e;
@@ -239,10 +266,26 @@ export class Board {
     if (this.journal.failed) throw new BoardError('storage_failed', 'The board stopped accepting writes after a storage error. Restart Conductor to recover.');
   }
 
+  private tryStamp(): boolean {
+    try {
+      this.journal.compact(this.snapshot());
+      this.opsSinceSnapshot = 0;
+      this.stampPending = false;
+      return true;
+    } catch (e) {
+      log.warn(`board snapshot could not be stamped yet: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
   /** Durable first, memory second: a failed append leaves memory untouched. */
   private commit<T extends JournalOp>(build: (seq: number, ts: number) => T, change: BoardChange): T {
     this.requireWritable();
     const op = build(this.seq + 1, this.now());
+    // an op only this schema version understands must never be journalled behind an older/absent snapshot (B1/S4)
+    if (this.stampPending && op.t === 'item' && V3_ONLY_ACTORS.has(op.e.createdBy) && !this.tryStamp()) {
+      throw new BoardError('storage_failed', 'The board could not be prepared for this card (see the Conductor log for the system error).');
+    }
     // never write what the loader would refuse (B-4): a 400-char idemKey must fail NOW, not brick the next start
     const bad = validateEntity(op.t, op.e);
     if (bad) throw new BoardError('bad_input', `That ${op.t} is not valid (${bad}).`);
@@ -298,7 +341,7 @@ export class Board {
   // ─────────────────────────── text hygiene ───────────────────────────
   private text(actor: Actor, v: string, max: number, name: string, opts: { oneLine?: boolean; allowEmpty?: boolean } = {}): string {
     let s = opts.oneLine ? clean(v) : v;
-    if (actor === 'conductor' || actor === 'ask-convert' || actor === 'research') s = this.redactFn(s); // agent-derived text never reaches the board unredacted (H3)
+    if (REDACTED_ACTORS.includes(actor)) s = this.redactFn(s); // agent-derived text never reaches the board unredacted (H3)
     if (!opts.allowEmpty && s.trim().length === 0) throw new BoardError('bad_input', `"${name}" cannot be empty.`);
     if (s.length > max) {
       if (actor === 'user') throw new BoardError('too_long', `"${name}" is too long (max ${max} characters).`);
@@ -580,6 +623,11 @@ export class Board {
   comments(itemId: string): BoardComment[] {
     const item = this.itemsById.get(itemId) ?? this.itemsByKey.get(itemId);
     return item ? (this.commentsByItem.get(item.id) ?? []).map((c) => ({ ...c })) : [];
+  }
+
+  /** M8-6 B2c pre-check: could `count` more items holding about `bytes` of text be created now? (Advisory: createItem still enforces.) */
+  hasRoom(count: number, bytes: number): boolean {
+    return this.itemsById.size + count <= LIMITS.maxItems && this.approxBytes + bytes <= LIMITS.maxBytes;
   }
 
   stats(): { projects: number; items: number; comments: number; seq: number; opsSinceSnapshot: number } {

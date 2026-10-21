@@ -1,7 +1,8 @@
 import { AskService } from './asks/service.ts';
+import { BriefService, type BriefDeps } from './briefs/service.ts';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Config } from './types.ts';
+import type { Config, Run } from './types.ts';
 import { defaultConfig, loadConfig, loadState, normalizeConfig, resolveBin, saveConfig, saveState, type PersistentState } from './config.ts';
 import { ensureHome, paths } from './paths.ts';
 import { RunStore } from './store.ts';
@@ -93,6 +94,8 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     log: mlog,
     ...(opts.models ?? {}),
   });
+  // M8-2: stage argv is resolved against the discovered lists (memory-only view, never awaited) and a CLI-rejected --model asks for a refresh
+  if (models) agents.attachModels({ catalog: (t) => models.view(t), onUnknownModel: (t) => models.noteUnknownModel(t) });
   // automatic discovery only when health is REAL (B1): an injected health (tests, demo) never starts a discovery by itself
   const autoDiscovery = !!models && !opts.health;
   const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [], offlineFetcher: globalThis.fetch as any });
@@ -125,8 +128,22 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     fastPathBusy: (repo) => store.list().some((r) => r.fastPath && r.repo === repo && !['ready', 'finished', 'aborted', 'needs_human'].includes(r.status)),
     cards: { create: (i) => { const p = engine.ensureProjectForRepo(i.repo); const it = board.createItem({ projectId: p.id, title: i.title, description: i.description, kind: 'work', lane: 'todo', idemKey: i.idemKey }, i.actor); engine.tickSoon(); return { key: it.key }; } } });
   asks.failInterrupted();
+  // M8-6 "Design the work" + research briefs. The actor `design` is FIXED here (S9): the facade passes exactly kind/lane/parentId/autoStart,
+  // the code-built title/description, ids from this send only and the strict idemKey — no key, external, milestone or stage.
+  const briefs = new BriefService({
+    getConfig, agents, routeStates: () => engine.routeStates(), freshHealth: () => engine.freshHealth(),
+    // S7: the same values the engine redacts for that repository (copyFiles env values + the injected secret source)
+    secrets: (repo) => (repo ? engine.secretsFor({ repo } as Run) : []),
+    networkState: () => engine.probe.check(),
+    asks,
+    cards: designCards(engine, board, getConfig),
+  });
+  briefs.sweepScratch();
+  briefs.failInterrupted();
+  void briefs.resumeSending();
   const apiRef = new Api({
     asks,
+    briefs,
     engine,
     store,
     board,
@@ -154,6 +171,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     },
     async close() {
       models?.stop();
+      await briefs.close();
       await engine.stop();
       await server.close();
       if (ownBoard) board.close();
@@ -161,3 +179,26 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   };
 }
 export { dropSecret };
+
+/**
+ * The ONLY writer of `design` cards (S9): the actor is fixed here, and the facade passes exactly kind work / lane todo / parentId null /
+ * autoStart true, the code-built title and description, dependency ids from this send only and the strict idemKey — never a key,
+ * external link, milestone or stage.
+ */
+export function designCards(engine: Engine, board: Board, getConfig: () => Config): NonNullable<BriefDeps['cards']> {
+  return {
+    createLinked: (i) => {
+      const p = engine.ensureProjectForRepo(i.repo);
+      const it = board.createItem({ projectId: p.id, kind: 'work', lane: 'todo', parentId: null, autoStart: true, title: i.title, description: i.description, dependsOn: i.dependsOn, idemKey: i.idemKey }, 'design');
+      engine.tickSoon();
+      return { id: it.id, key: it.key };
+    },
+    precheck: (repo, count, bytes) => {
+      // a lookup, never a create (code review m2): a refused send must not leave a new project behind
+      const p = board.projects().find((x) => x.repo === repo);
+      if (p?.archived) throw Object.assign(new Error('archived'), { code: 'archived' });
+      if (!board.hasRoom(count, bytes)) throw Object.assign(new Error('full'), { code: 'full' });
+    },
+    baseBranch: (repo) => getConfig().repos.find((r) => r.name === repo)?.baseBranch ?? 'main',
+  };
+}

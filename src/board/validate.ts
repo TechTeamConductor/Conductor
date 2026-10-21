@@ -1,11 +1,11 @@
-import { LANES, type BoardComment, type Decision, type ItemKind, type Milestone, type Project, type WorkItem } from './types.ts';
+import { ACTORS, LANES, type BoardComment, type Decision, type ItemKind, type Milestone, type Project, type WorkItem } from './types.ts';
 
 /** Structural validation of everything read back from disk (security review S-5): a hand-edited or hostile file must not smuggle in bad keys, lanes or links. */
 const PROJECT_KEY_RE = /^[A-Z]{2,6}$/;
 const ITEM_KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const KINDS: readonly ItemKind[] = ['work', 'ask', 'research', 'subtask', 'bug'];
-const ACTORS = ['user', 'conductor', 'import', 'user-ask', 'ask-convert', 'research'];
+export { ACTORS };
 
 const str = (v: unknown, max: number): v is string => typeof v === 'string' && v.length <= max;
 const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
@@ -39,7 +39,7 @@ export function validateItem(i: unknown): string | null {
   if (!LANES.includes(i.lane as never)) return 'item.lane';
   if (i.stage !== undefined && !str(i.stage, 64)) return 'item.stage';
   if (typeof i.autoStart !== 'boolean') return 'item.autoStart';
-  if (!ACTORS.includes(i.createdBy as string)) return 'item.createdBy';
+  if (!(ACTORS as readonly string[]).includes(i.createdBy as string)) return 'item.createdBy';
   if (!num(i.createdAt) || !num(i.updatedAt)) return 'item.createdAt/updatedAt';
   if (i.milestoneId !== undefined && !str(i.milestoneId, 100)) return 'item.milestoneId';
   if (i.idemKey !== undefined && !str(i.idemKey, 300)) return 'item.idemKey';

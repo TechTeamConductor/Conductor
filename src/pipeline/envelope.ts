@@ -5,6 +5,7 @@
 // Extracted from stages.build() — the one intentional behaviour difference is that the git-meta restore now also runs when the provider throws.
 import type { AgentResult } from '../types.ts';
 import type { BuildPrep, Provider, ProviderId } from '../agents/providers/types.ts';
+import type { ResolvedSel } from '../models/select.ts';
 import { capabilitiesOf, isRegisteredProvider } from '../agents/providers/registry.ts';
 import { buildBaseline } from '../agents/providers/verification.ts';
 import type { EmitEvent } from '../agents/claude.ts';
@@ -74,6 +75,8 @@ export interface BuildInput {
   onPrepared: (prep: BuildPrep) => void;
   /** Called with the provider's result before the git-meta check (the stage records the session / refunds a limit hit). */
   onResult: (res: AgentResult) => void;
+  /** M8-2: the builder's model/effort selection. DATA ONLY: forwarded to the provider untouched; no safety step reads it. */
+  sel?: ResolvedSel;
 }
 
 const HELD_NO_GUARD = (label: string, why: string) => `${label}'s guard could not be established (${why}). Nothing was started. Review the setup before continuing.`;
@@ -116,7 +119,7 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
   let res: AgentResult | undefined;
   let thrown: { e: unknown } | undefined;
   try {
-    res = await b.run({ cwd: i.worktree, prompt: i.prompt, name: i.name, env, onEvent: i.onEvent, signal: i.signal, secrets: i.secrets }, prep);
+    res = await b.run({ cwd: i.worktree, prompt: i.prompt, name: i.name, env, onEvent: i.onEvent, signal: i.signal, secrets: i.secrets, ...(i.sel ? { sel: i.sel } : {}) }, prep);
   } catch (e) {
     thrown = { e };
   }

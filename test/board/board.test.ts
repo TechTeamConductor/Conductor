@@ -5,6 +5,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, statSync, writeF
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Board, BoardError, LIMITS } from '../../src/board/index.ts';
+import { BOARD_SCHEMA_VERSION } from '../../src/board/types.ts';
 import { LockHeldError } from '../../src/lock.ts';
 import { CorruptFileError, NewerVersionError } from '../../src/schema/errors.ts';
 
@@ -280,7 +281,7 @@ test('versions: a newer snapshot or journal op is refused (nothing written); leg
   mk(w);
   w.close();
   const snap = JSON.parse(readFileSync(join(dir, 'snapshot.json'), 'utf8'));
-  writeFileSync(join(dir, 'snapshot.json'), JSON.stringify({ ...snap, schemaVersion: 3 }));
+  writeFileSync(join(dir, 'snapshot.json'), JSON.stringify({ ...snap, schemaVersion: BOARD_SCHEMA_VERSION + 1 }));
   assert.throws(() => open(dir), (e: any) => e instanceof NewerVersionError);
   delete snap.schemaVersion;
   writeFileSync(join(dir, 'snapshot.json'), JSON.stringify(snap));

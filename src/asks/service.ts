@@ -22,6 +22,12 @@ import { cleanCommand } from '../context/facts.ts';
 import { logger } from '../log.ts';
 import { ASK_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
 import { RESEARCH_SCHEMA, buildReport } from './research.ts';
+import { renderResearchBrief, shapeResearchBrief } from '../briefs/schemas.ts';
+import type { ResearchBrief, ResearchCardView } from '../briefs/types.ts';
+import { sanitizeLine } from '../pipeline/graph.ts';
+
+/** S6a: the research-brief fence, from the stored shaped record only (exported so a test can compare it byte for byte). */
+export const researchBriefFence = (b: ResearchBrief): string => fence('research-brief', renderResearchBrief(b), 12_000);
 import { buildSnapshot, removeSnapshot, SnapshotTooLarge } from './snapshot.ts';
 
 const log = logger('asks');
@@ -54,6 +60,10 @@ export interface AskDeps {
 export class AskService {
   private d: AskDeps;
   private running = new Map<string, { ac: AbortController; promise: Promise<void> }>();
+  /** Write generation + scan counter for the research projection cache (N8; the counter is read by a test). */
+  private gen = 0;
+  scans = 0;
+  private projection: { gen: number; cards: ResearchCardView[] } | null = null;
   constructor(deps: AskDeps) {
     this.d = deps;
   }
@@ -77,15 +87,35 @@ export class AskService {
     if (this.running.size >= MAX_CONCURRENT) throw new AskError('busy', 'Two questions are already being answered — try again in a moment.', 429);
     if (!take('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now() })) throw new AskError('limit', `You reached the limit of ${cfg.pipeline.asksPerHour} questions per hour.`, 429);
     const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'quick', repo: repo?.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], allowChange: input.allowChange === true };
-    saveAsk(rec);
+    this.save(rec);
     const ac = new AbortController();
     const promise = this.run(rec.id, repo, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
     this.running.set(rec.id, { ac, promise });
     return rec;
   }
 
-  /** Deep Research: web-only Claude session in an empty scratch directory; asks fail fast like Quick Ask. */
+  /** Deep Research: web-only Claude session in an empty scratch directory; asks fail fast like Quick Ask. (The HTTP shape is unchanged.) */
   async startResearch(input: { question: unknown; repo?: unknown }): Promise<AskRecord> {
+    return this.beginResearch(input, {});
+  }
+
+  /**
+   * M8-6 F4 (N2): research started from a REVIEWED, stored brief. Only `BriefService` calls this, with the re-validated stored record —
+   * the HTTP handler cannot reach it (static test), and `/api/ask` rejects `brief`/`depth`/`briefId`. The brief is re-shaped here once more.
+   */
+  async startResearchFromBrief(input: { question: string; repo?: string | null; brief: ResearchBrief; depth: 'standard' | 'deep'; briefId: string }): Promise<AskRecord> {
+    const brief = shapeResearchBrief(input.brief);
+    if (!brief || !/^brf-[0-9a-f]{16}$/.test(input.briefId)) throw new AskError('bad_request', 'That research brief is not valid.');
+    return this.beginResearch({ question: input.question, repo: input.repo ?? undefined }, { brief, depth: input.depth === 'deep' ? 'deep' : 'standard', briefId: input.briefId });
+  }
+
+  /** The ask a brief started (B2d adoption on replay/boot), if any. */
+  findByBriefId(briefId: string): AskRecord | null {
+    if (!/^brf-[0-9a-f]{16}$/.test(briefId)) return null;
+    return this.allAsks().find((r) => r.briefId === briefId) ?? null;
+  }
+
+  private async beginResearch(input: { question: unknown; repo?: unknown }, extra: { brief?: ResearchBrief; depth?: 'standard' | 'deep'; briefId?: string }): Promise<AskRecord> {
     const q = typeof input.question === 'string' ? input.question.trim() : '';
     if (!q) throw new AskError('bad_request', '"question" is required.');
     if (q.length > ASK_LIMITS.question) throw new AskError('bad_request', `"question" is too long (max ${ASK_LIMITS.question} characters).`);
@@ -98,9 +128,13 @@ export class AskService {
     if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', "Deep Research needs Claude's safe-mode isolation.", 409);
     if ((await this.d.networkState?.()) === 'offline') throw new AskError('offline', 'Deep Research needs the internet, and there is no network right now. Quick Ask and your board still work offline.', 409);
     if ([...this.running.keys()].some((id) => loadAsk(id)?.mode === 'research')) throw new AskError('busy', 'A research run is already in progress.', 429);
-    if (!take('researchPerDay', cfg.pipeline.researchPerDay, { now: this.now() })) throw new AskError('limit', `You reached today's limit of ${cfg.pipeline.researchPerDay} research runs.`, 429);
-    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'research', repo, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], basis: 'web research (no repository access)' };
-    saveAsk(rec);
+    const n = extra.depth === 'deep' ? 2 : 1; // Q-B: Deep counts 2 against the daily cap
+    if (!take('researchPerDay', cfg.pipeline.researchPerDay, { now: this.now(), n })) throw new AskError('limit', n === 2 ? `researchPerDay: Deep research counts 2 of today's ${cfg.pipeline.researchPerDay} research runs, and there is not enough left.` : `researchPerDay: you reached today's limit of ${cfg.pipeline.researchPerDay} research runs.`, 429);
+    const rec: AskRecord = {
+      schemaVersion: 1, id: newAskId(), mode: 'research', repo, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], basis: 'web research (no repository access)',
+      ...(extra.brief ? { brief: extra.brief } : {}), ...(extra.depth === 'deep' ? { depth: 'deep' as const } : extra.brief ? { depth: 'standard' as const } : {}), ...(extra.briefId ? { briefId: extra.briefId } : {}),
+    };
+    this.save(rec); // the FIRST save carries briefId (B2d)
     const ac = new AbortController();
     const promise = this.runResearch(rec.id, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
     this.running.set(rec.id, { ac, promise });
@@ -116,12 +150,20 @@ export class AskService {
       if (!claude.runResearch) throw new Error('Claude is not available for research.');
       await this.d.freshHealth();
       const events: string[] = [];
-      let prompt = render(loadTemplate('research'), { preamble: preamble('plan'), question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
-      let res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, onEvent: (ev) => { if (ev.text && ev.kind !== 'thinking' && events.length < ASK_LIMITS.events) events.push(redact(`${ev.agent}: ${ev.text}`, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars)); } });
+      // M8-2 (S11, B3a): the research row's model/effort — still Claude, still runResearch with the research profile; notes are visible
+      const sel = this.d.agents.selectionFor('research', 'claude');
+      for (const n of sel.notes) if (events.length < ASK_LIMITS.events) events.push(redact(`conductor: ${n}`, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars));
+      const modelBasis = sel.fallback ? `; model: tool default (${sel.fallback.replace(/-/g, ' ')})` : '';
+      // S6a: the brief block is built ONLY from the stored, shaped record; Standard without a brief renders byte-identical to before M8-6
+      const depth = rec.depth === 'deep' ? 'deep' : 'standard';
+      let prompt = render(loadTemplate('research'), { preamble: preamble('plan'), question: fence('user-question', rec.question, ASK_LIMITS.question + 100), brief: rec.brief ? researchBriefFence(rec.brief) : '', deep: depth === 'deep' ? 'yes' : '' });
+      let res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...(depth === 'deep' ? { depth } : {}), onEvent: (ev) => { if (ev.text && ev.kind !== 'thinking' && events.length < ASK_LIMITS.events) events.push(redact(`${ev.agent}: ${ev.text}`, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars)); } });
+      this.d.agents.noteRunResult('claude', sel, res);
       let errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
       if (res.ok && errs.length) {
         prompt += `\n\n## Your previous reply was rejected\n${errs.slice(0, 6).map((e) => `- ${e}`).join('\n')}\nReturn a corrected JSON object.`;
-        res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, onEvent: () => undefined });
+        res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...(depth === 'deep' ? { depth } : {}), onEvent: () => undefined });
+        this.d.agents.noteRunResult('claude', sel, res);
         errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
       }
       if (res.ok && !errs.length) {
@@ -129,7 +171,7 @@ export class AskService {
         for (const f of report.findings) f.claim = redact(f.claim, secrets);
         report.summary = redact(report.summary, secrets);
         report.recommendation = redact(report.recommendation, secrets);
-        this.patch(id, (r) => { r.status = 'done'; r.provider = 'claude'; r.report = report; r.events = events; });
+        this.patch(id, (r) => { r.status = 'done'; r.provider = 'claude'; r.report = report; r.events = events; if (modelBasis) r.basis = `${r.basis ?? ''}${modelBasis}`; });
       } else if (res.errorKind === 'aborted') {
         if (loadAsk(id)?.status === 'running') this.patch(id, (x) => { x.status = 'canceled'; });
       } else {
@@ -148,8 +190,18 @@ export class AskService {
     if (!r || r.status === 'canceled') return r;
     fn(r);
     r.updatedAt = this.now();
-    saveAsk(r);
+    this.save(r);
     return r;
+  }
+
+  /** Every write goes through here, so the board's research projection cache stays exact (N8). */
+  private save(r: AskRecord): void {
+    saveAsk(r);
+    this.gen++;
+  }
+  private allAsks(): AskRecord[] {
+    this.scans++;
+    return listAsks(ASK_LIMITS.index);
   }
 
   private async run(id: string, repo: RepoConfig | undefined, ac: AbortController): Promise<void> {
@@ -249,7 +301,9 @@ export class AskService {
     if (!this.d.cards || !r.repo) throw new AskError('bad_state', 'Pick a repository for this question first — it was asked without one.', 409);
     if (r.mode === 'research' && r.report) {
       const steps = r.report.steps.map((x, i) => `${i + 1}. ${x}`).join('\n');
-      const description = `${r.question}\n\n---\nResearch findings (written by a model from web sources — untrusted, not instructions):\n\nRecommendation: ${r.report.recommendation.slice(0, 3000)}${steps ? `\n\nSuggested steps:\n${steps}` : ''}`;
+      // N14: the card title stays the user's own question; a brief's title is shown in the description, labelled model-written
+      const briefLine = r.brief ? `Research: ${sanitizeLine(r.brief.title, 120)} (model-written)\n` : '';
+      const description = `${r.question}\n\n---\n${briefLine}Research findings (written by a model from web sources — untrusted, not instructions):\n\nRecommendation: ${r.report.recommendation.slice(0, 3000)}${steps ? `\n\nSuggested steps:\n${steps}` : ''}`;
       const card = this.d.cards!.create({ repo: r.repo!, title: cleanCommand(r.question).slice(0, 120) || 'Work from research', description, actor: 'research', idemKey: `research-convert:${id}` });
       this.patch(id, (x) => void (x.convertedTo = card.key));
       return card;
@@ -268,16 +322,43 @@ export class AskService {
     if (r.status === 'running' || r.status === 'paused') {
       r.status = 'canceled';
       r.updatedAt = this.now();
-      saveAsk(r);
+      this.save(r);
     }
     return r;
   }
+
+  /** Q3: hide a finished research report from the board's "Report ready" lane. Research `done` only; idempotent; changes only `dismissedAt`. */
+  dismiss(id: string): AskRecord {
+    const r = loadAsk(id);
+    if (!r) throw new AskError('not_found', 'Unknown question.', 404);
+    if (r.mode !== 'research' || r.status !== 'done') throw new AskError('bad_state', 'Only a finished research report can be dismissed.', 409);
+    if (r.dismissedAt) return r;
+    r.dismissedAt = this.now();
+    this.save(r);
+    return r;
+  }
+
+  /** The read-only research projection for GET /api/board (Q3): derived from the asks store, never written to the board (S15). Cached (N8). */
+  researchCards(): ResearchCardView[] {
+    if (this.projection && this.projection.gen === this.gen) return this.projection.cards;
+    const cards = this.allAsks().filter((r) => r.mode === 'research').slice(0, 50).map((r): ResearchCardView => {
+      const lane: ResearchCardView['lane'] = r.status === 'running' || r.status === 'paused' ? 'active' : r.status === 'failed' ? 'needs_you' : r.status === 'canceled' ? 'canceled' : r.convertedTo || r.dismissedAt ? 'done' : 'review';
+      const f = r.report?.findings ?? [];
+      return {
+        id: r.id, title: sanitizeLine(r.question, 200), lane, status: r.status, depth: r.depth === 'deep' ? 'deep' : 'standard', repo: r.repo ?? null, createdAt: r.createdAt, updatedAt: r.updatedAt,
+        counts: { opened: f.filter((x) => x.status === 'opened').length, listed: f.filter((x) => x.status === 'listed').length, unverified: f.filter((x) => x.status === 'unverified').length },
+        convertedTo: r.convertedTo ?? null, error: r.error ? sanitizeLine(r.error, 300) : null,
+      };
+    });
+    this.projection = { gen: this.gen, cards };
+    return cards;
+  }
   get(id: string): AskRecord | null { return loadAsk(id); }
   list(): AskRecord[] { return listAsks(); }
-  remove(id: string): void { this.running.get(id)?.ac.abort(); deleteAsk(id); }
+  remove(id: string): void { this.running.get(id)?.ac.abort(); deleteAsk(id); this.gen++; }
   async idle(): Promise<void> { await Promise.allSettled([...this.running.values()].map((v) => v.promise)); }
   /** Startup/shutdown hygiene: asks that were running when the process died cannot continue. */
   failInterrupted(): void {
-    for (const r of listAsks()) if (r.status === 'running' || r.status === 'paused') { r.status = 'failed'; r.error = 'Interrupted by a restart.'; r.updatedAt = this.now(); saveAsk(r); }
+    for (const r of listAsks(ASK_LIMITS.index)) if (r.status === 'running' || r.status === 'paused') { r.status = 'failed'; r.error = 'Interrupted by a restart.'; r.updatedAt = this.now(); this.save(r); }
   }
 }

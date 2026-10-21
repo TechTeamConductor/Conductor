@@ -4,6 +4,10 @@ import { truncate, type Clock } from '../util.ts';
 import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
 import { BROKEN_RE, NETWORK_RE } from './providers/probe.ts';
+import { claudeModelArgs } from './model-args.ts';
+/** A --model element was actually sent (the helper's own rule). */
+const modelIdOkForFlag = (m: string | undefined): boolean => claudeModelArgs({ model: m }).length > 0;
+export { claudeModelArgs };
 
 export type EmitEvent = Omit<LogEvent, 'seq' | 'ts'>;
 
@@ -12,6 +16,12 @@ export const CLAUDE_EXPECTED_TOOLS = ['Glob', 'Grep', 'Read', 'StructuredOutput'
 
 /** Credential-shaped files a read-only Claude stage must not open (security review M5). */
 export const CLAUDE_DENIED_READS = ['Read(**/.env)', 'Read(**/.env.*)', 'Read(**/*.pem)', 'Read(**/*.key)', 'Read(**/id_rsa*)', 'Read(**/id_ed25519*)', 'Read(**/.npmrc)', 'Read(**/.aws/**)', 'Read(**/.ssh/**)'] as const;
+
+/**
+ * M8-2 S10: the CLI's own words for "that model does not exist". Bounded gaps, no backtracking blow-up. Read ONLY from the bounded stderr tail of a run that
+ * produced no result event, and only when the run carried a --model — never from stdout or model-written text (M12 principle).
+ */
+export const UNKNOWN_MODEL_RE = /\b(unknown|invalid|unsupported|not (found|available))\b.{0,40}\bmodel\b|\bmodel\b.{0,40}\b(not (found|available|supported)|unknown|invalid)\b/i;
 
 export interface AgentCallBase {
   bin: string;
@@ -26,6 +36,8 @@ export interface AgentCallBase {
   onEvent: (ev: EmitEvent) => void;
   secrets?: string[];
   model?: string;
+  /** Claude only (M8-2): re-checked against CLAUDE_EFFORTS by the builder. */
+  effort?: string;
   clock?: Clock;
   graceMs?: number;
   tickMs?: number;
@@ -38,7 +50,7 @@ export interface ClaudeCall extends AgentCallBase {
   profile?: 'research';
 }
 
-export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'isolation' | 'name' | 'model' | 'profile'>): string[] {
+export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'isolation' | 'name' | 'model' | 'profile'> & { effort?: string }): string[] {
   const args = [
     '-p',
     '--output-format', 'stream-json',
@@ -55,7 +67,8 @@ export function buildClaudeArgs(c: Pick<ClaudeCall, 'schema' | 'maxTurns' | 'iso
     '--max-turns', String(c.maxTurns),
     '-n', c.name,
   ];
-  if (c.model) args.push('--model', c.model);
+  // M8-2: the model/effort slice, exactly where --model always was (after -n <name>, before --json-schema); [] when unset
+  args.push(...claudeModelArgs({ model: c.model, effort: c.effort }));
   if (c.schema) args.push('--json-schema', JSON.stringify(c.schema));
   return args;
 }
@@ -261,10 +274,12 @@ export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
   }
   if (r?.subtype === 'error_max_turns') return { ...base, errorKind: 'max_turns', error: 'claude hit the max-turns cap' };
   if (!r) {
+    // M8-2 S10: no result event + a --model was sent + the CLI's own (bounded) stderr says the model is unknown ⇒ a boolean, nothing else
+    const rejected = modelIdOkForFlag(call.model) && UNKNOWN_MODEL_RE.test(proc.stderrTail) ? ({ cliRejectedModel: true } as const) : {};
     // a launcher that cannot start its program prints a shim error and no events: a START failure (the chain may advance), not an agent failure
-    if (proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, errorKind: 'spawn', error: `claude is installed but does not start: ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
+    if (proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, ...rejected, errorKind: 'spawn', error: `claude is installed but does not start: ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
     if (proc.code !== 0 && NETWORK_RE.test(proc.stderrTail)) return { ...base, errorKind: 'network', error: `claude could not reach the network: ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 300)}` };
-    return { ...base, errorKind: 'agent', error: `claude exited without a result (code ${proc.code}). ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
+    return { ...base, ...rejected, errorKind: 'agent', error: `claude exited without a result (code ${proc.code}). ${truncate(redact(proc.stderrTail, call.secrets ?? []).trim(), 400)}` };
   }
   if (r.is_error) return { ...base, errorKind: 'agent', error: truncate(String(r.result ?? 'claude reported an error'), 500) };
 

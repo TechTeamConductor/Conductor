@@ -384,8 +384,12 @@ export class GraphBuilder {
 
     const secrets = h.c.secretsFor(run);
     const subject = `${run.key}: ${truncate(sanitizeLine(run.title, 60), 60)} — ${cur.id}: ${sanitizeLine(cur.title, 80)}${cur.loop > 1 ? ` (fix, loop ${cur.loop})` : ''}`;
+    // M8-2: the item role's model/effort for the tool that actually builds (B2 binding)
+    const sel = h.c.agents.selectionFor(role, builder.id);
+    for (const n of sel.notes) h.note(key, 'build', redact(n, secrets));
     const out = await runBuild({
       provider: builder,
+      sel,
       repoPath: repo.path,
       worktree: run.worktree,
       baseSha: run.baseSha,
@@ -406,6 +410,7 @@ export class GraphBuilder {
         if (prep.note) h.note(key, 'build', prep.note);
       },
       onResult: (res) => {
+        h.c.agents.noteRunResult(builder.id, sel, res);
         h.finishSession(key, res);
         h.refundIfLimit(key, res);
         if (res.ok) h.patch(key, (r) => void (r.buildFails = 0));

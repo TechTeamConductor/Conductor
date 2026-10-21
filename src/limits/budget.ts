@@ -9,9 +9,9 @@ import { paths } from '../paths.ts';
 import { atomicWriteFile } from '../util.ts';
 import { quarantine } from '../schema/version.ts';
 
-export type CounterId = 'contextRunsPerDay' | 'asksPerHour' | 'researchPerDay' | 'fastPathPerHour';
-export const CEILINGS: Readonly<Record<CounterId, number>> = Object.freeze({ contextRunsPerDay: 48, asksPerHour: 60, researchPerDay: 20, fastPathPerHour: 20 });
-const WINDOW: Readonly<Record<CounterId, 'day' | 'hour'>> = Object.freeze({ contextRunsPerDay: 'day', asksPerHour: 'hour', researchPerDay: 'day', fastPathPerHour: 'hour' });
+export type CounterId = 'contextRunsPerDay' | 'asksPerHour' | 'researchPerDay' | 'fastPathPerHour' | 'designPerHour';
+export const CEILINGS: Readonly<Record<CounterId, number>> = Object.freeze({ contextRunsPerDay: 48, asksPerHour: 60, researchPerDay: 20, fastPathPerHour: 20, designPerHour: 30 });
+const WINDOW: Readonly<Record<CounterId, 'day' | 'hour'>> = Object.freeze({ contextRunsPerDay: 'day', asksPerHour: 'hour', researchPerDay: 'day', fastPathPerHour: 'hour', designPerHour: 'hour' });
 const SCOPE_RE = /^[A-Za-z0-9._-]{1,40}$/;
 const FILE_VERSION = 1;
 
@@ -61,15 +61,37 @@ export function used(id: CounterId, opts: { scope?: string; now?: number } = {})
 }
 /** Take `n` if the limit (≤ the ceiling) allows it; returns whether it was taken. Old windows are dropped on write. */
 export function take(id: CounterId, limit: number, opts: { scope?: string; now?: number; n?: number } = {}): boolean {
+  return takeKeyed(id, limit, opts).ok;
+}
+/**
+ * `take` that also returns the window key it counted in (M8-6 N12), so a later `refund` credits THAT window — never the current one.
+ * `n` must be an integer ≥ 1 (S11: a negative `n` would otherwise decrement the counter).
+ */
+export function takeKeyed(id: CounterId, limit: number, opts: { scope?: string; now?: number; n?: number } = {}): { ok: boolean; key: string } {
   const now = opts.now ?? Date.now();
   const n = opts.n ?? 1;
+  if (!Number.isInteger(n) || n < 1) throw new Error('take: n must be an integer >= 1');
   const cap = Math.min(CEILINGS[id], Math.max(0, Math.floor(limit)));
   const s = load();
   const name = nameOf(id, opts.scope);
   const key = windowKey(id, now);
   const cur = s.counters[name]?.[key] ?? 0;
-  if (cur + n > cap) return false;
+  if (cur + n > cap) return { ok: false, key };
   s.counters[name] = { [key]: cur + n };
   atomicWriteFile(file(), JSON.stringify(s) + '\n', 0o600, { durable: true });
-  return true;
+  return { ok: true, key };
+}
+/**
+ * Give back `n` taken in window `key` (from `takeKeyed`), floored at 0. A no-op when that window has rolled over (the stored counter
+ * only keeps the current window) — a refund never credits a later window (N12). Callers refund at most once per take (S11).
+ */
+export function refund(id: CounterId, opts: { key: string; scope?: string; n?: number }): void {
+  const n = opts.n ?? 1;
+  if (!Number.isInteger(n) || n < 1 || !KEY_RE.test(opts.key)) return;
+  const s = load();
+  const name = nameOf(id, opts.scope);
+  const cur = s.counters[name]?.[opts.key];
+  if (cur === undefined) return;
+  s.counters[name] = { [opts.key]: Math.max(0, cur - n) };
+  atomicWriteFile(file(), JSON.stringify(s) + '\n', 0o600, { durable: true });
 }

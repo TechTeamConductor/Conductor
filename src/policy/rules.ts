@@ -6,7 +6,8 @@ import type { Plan } from '../types.ts';
 
 export interface RiskHit { rule: string; detail: string }
 
-const SECRET_FILE = /(^|\/)\.env(\.|$)|(^|\/)(id_rsa|id_ed25519|credentials|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|keystore)$/i;
+/** Exported for display flags (M8-6 S10). */
+export const SECRET_FILE = /(^|\/)\.env(\.|$)|(^|\/)(id_rsa|id_ed25519|credentials|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|keystore)$/i;
 /** What a regex sees: NFKC (fullwidth etc.), format/invisible characters removed, lower-case, whitespace collapsed, quotes inside words dropped. */
 export function canon(s: string): string {
   return String(s).normalize('NFKC').replace(/[\p{Cf}\p{Co}\p{Cn}\u{E0000}-\u{E007F}\u{FE00}-\u{FE0F}]/gu, '').replace(/(?<=\w)["'](?=\w)/g, '').toLowerCase().replace(/\s+/g, ' ').trim();

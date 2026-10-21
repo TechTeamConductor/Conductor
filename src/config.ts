@@ -10,7 +10,8 @@ import { backupPaths } from './schema/backup.ts';
 import { logger } from './log.ts';
 import { ROLES, cursorFollowsClaude, defaultRoles, firstReadOnlyProvider, normalizeRoles, type Roles } from './agents/roles.ts';
 import type { ProviderId } from './agents/providers/types.ts';
-import { MODEL_ID_BASE_RE } from './models/sanitize.ts';
+import { MODEL_ID_BASE_RE, modelIdOk } from './models/sanitize.ts';
+import { PROVIDER_LABEL } from './agents/providers/types.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
@@ -43,14 +44,90 @@ export const CODEX_MODEL_RE = MODEL_ID_BASE_RE;
 export function migrateConfigV4ToV5(raw: any): any {
   return { ...(raw ?? {}), projects: raw && typeof raw.projects === 'object' && raw.projects !== null && !Array.isArray(raw.projects) ? raw.projects : {} };
 }
-export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 5, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5 } };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
+const MODEL_TOOLS = ['claude', 'cursor', 'codex'] as const satisfies readonly ProviderId[];
+const isPlainObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+/**
+ * v5's free-text `agents.<tool>.model` → v6's `toolModels[tool] = { model, custom: true }` (M8-2 §2.1, S4, §2g). Shared by the registered
+ * migration and normalizeConfig (hand-edited / direct input), so it is idempotent:
+ *  - a value that passes that tool's id rule (modelIdOk: Claude may carry one `[1m]`-style suffix; Codex/Cursor narrow) becomes custom;
+ *  - any other value moves VERBATIM to `legacy.v5.agentsModel[tool]` and is never sent, served, rendered or logged (S4c);
+ *  - if the input already has `toolModels` (a hand edit), it wins and every old key moves to legacy the same way (S4b);
+ *  - the warning names the tool and the reason only — never the value, its length or a prefix (S4a).
+ * Returns a new object; `agents.<tool>.model` is gone afterwards (S4e).
+ */
+function moveAgentModels(raw: any, warn: (m: string) => void): any {
+  const src = isPlainObj(raw) ? raw : {};
+  const ag = isPlainObj(src.agents) ? src.agents : undefined;
+  const has = (t: string) => !!ag && isPlainObj(ag[t]) && Object.hasOwn(ag[t] as object, 'model');
+  if (!MODEL_TOOLS.some(has)) return raw;
+  const hadToolModels = Object.hasOwn(src, 'toolModels');
+  const toolModels: Record<string, unknown> = isPlainObj(src.toolModels) ? { ...src.toolModels } : {};
+  const legacy: Record<string, any> = isPlainObj(src.legacy) ? { ...src.legacy } : {};
+  const v5: Record<string, any> = isPlainObj(legacy.v5) ? { ...legacy.v5 } : {};
+  const kept: Record<string, unknown> = isPlainObj(v5.agentsModel) ? { ...v5.agentsModel } : {};
+  const agents: Record<string, unknown> = { ...ag };
+  for (const t of MODEL_TOOLS) {
+    if (!has(t)) continue;
+    const { model, ...restTool } = agents[t] as Record<string, unknown>;
+    agents[t] = restTool;
+    if (model === undefined || model === null || model === '') continue; // today's "unset"
+    if (hadToolModels) {
+      kept[t] = model;
+      warn(`agents.${t}.model was ignored because toolModels is set; kept in legacy.v5, not used`);
+    } else if (typeof model === 'string' && modelIdOk(t, model)) toolModels[t] = { model, custom: true };
+    else {
+      kept[t] = model;
+      warn(`agents.${t}.model was not a valid model id; kept in legacy.v5, not used`);
+    }
+  }
+  const out: any = { ...src, agents, toolModels };
+  if (Object.keys(kept).length) out.legacy = { ...legacy, v5: { ...v5, agentsModel: kept } };
+  return out;
+}
+/** v5 → v6 (M8-2): per-role model choices may appear in `roles`; "Default model for each tool" (`toolModels`) replaces `agents.<tool>.model`. */
+export function migrateConfigV5ToV6(raw: any): any {
+  const moved = moveAgentModels(raw ?? {}, (m) => log.warn(m));
+  return Object.hasOwn(moved, 'toolModels') ? moved : { ...moved, toolModels: {} };
+}
+/** S4d: field by field, own-property registry keys only, built from literals (never spread), each model re-checked with its tool's rule. */
+export function normalizeToolModels(raw: unknown, report: (m: string) => void = () => undefined): Config['toolModels'] {
+  const out: Config['toolModels'] = {};
+  if (!isPlainObj(raw)) return out;
+  for (const t of MODEL_TOOLS) {
+    if (!Object.hasOwn(raw, t)) continue;
+    const e = raw[t];
+    if (e === null || e === undefined) continue;
+    const model = isPlainObj(e) && Object.hasOwn(e, 'model') ? e.model : undefined;
+    if (!modelIdOk(t, model)) {
+      report(`toolModels.${t}: dropped (not a valid ${t} model id)`);
+      continue;
+    }
+    out[t] = isPlainObj(e) && Object.hasOwn(e, 'custom') && e.custom === true ? { model, custom: true } : { model };
+  }
+  return out;
+}
+/** B3b: one static line per tool whose old model setting was not kept, while no default is chosen for it. Never contains the old value. */
+export function legacyModelNotices(cfg: Config): { tool: ProviderId; message: string }[] {
+  const v5 = cfg.legacy && isPlainObj(cfg.legacy.v5) ? cfg.legacy.v5 : undefined;
+  const kept = v5 && isPlainObj(v5.agentsModel) ? v5.agentsModel : undefined;
+  if (!kept) return [];
+  const out: { tool: ProviderId; message: string }[] = [];
+  for (const t of MODEL_TOOLS) {
+    if (!Object.hasOwn(kept, t) || cfg.toolModels[t]) continue;
+    const T = PROVIDER_LABEL[t];
+    // reason-neutral (CR-N4 / L2): a value is set aside both when it is not a valid model id and when a hand-edited toolModels already existed
+    out.push({ tool: t, message: `Your earlier ${T} model setting was not kept, so ${T} now uses its default. Choose a model under 'Default model for each tool'.` });
+  }
+  return out;
+}
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 6, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5, 5: migrateConfigV5ToV6 } };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'toolModels', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
 /** Board project keys (also the context store directory names): 2–6 capital letters. */
 export const PROJECT_SETTINGS_KEY_RE = /^[A-Z]{2,6}$/;
 
 export function defaultConfig(): Config {
   return {
-    version: 5,
+    version: 6,
     ui: { port: 4327, openBrowser: true }, // v1 uses 4317: both can run side by side
     repos: [],
     agents: {
@@ -59,6 +136,7 @@ export function defaultConfig(): Config {
       codex: { bin: 'codex' },
     },
     roles: defaultRoles(),
+    toolModels: {},
     projects: Object.create(null),
     pipeline: {
       maxParallel: 2,
@@ -75,6 +153,7 @@ export function defaultConfig(): Config {
       contextRunsPerDay: 12,
       asksPerHour: 20,
       researchPerDay: 5,
+      designPerHour: 10,
       policy: 'full-auto',
       verifyEachItem: false,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
@@ -92,7 +171,8 @@ const oneOf = <T extends string>(v: unknown, allowed: readonly T[], d: T): T =>
 /** Merge unknown input over defaults and clamp every value to a safe range. */
 export function normalizeConfig(input: unknown): Config {
   const d = defaultConfig();
-  const i = (input && typeof input === 'object' ? input : {}) as Partial<Config> & Record<string, any>;
+  // v5 → v6 for input that skipped the versioned loader (a hand edit, a direct call): idempotent, the same rules as the migration
+  const i = moveAgentModels(input && typeof input === 'object' ? input : {}, (m) => log.warn(m)) as Partial<Config> & Record<string, any>;
   const ag = (i.agents ?? {}) as any;
   const pl = (i.pipeline ?? {}) as any;
   const to = (pl.timeoutsMin ?? {}) as any;
@@ -103,7 +183,7 @@ export function normalizeConfig(input: unknown): Config {
   const withRoles = i.roles === undefined && (i.stages !== undefined || pl.onClaudeLimit !== undefined) ? migrateConfigV3ToV4(i) : i;
   if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 5,
+    version: 6,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
@@ -112,7 +192,6 @@ export function normalizeConfig(input: unknown): Config {
     agents: {
       claude: {
         bin: typeof ag.claude?.bin === 'string' && ag.claude.bin ? ag.claude.bin : d.agents.claude.bin,
-        model: typeof ag.claude?.model === 'string' && ag.claude.model ? ag.claude.model : undefined,
         isolation: oneOf(ag.claude?.isolation, ['safe-mode', 'setting-sources'] as const, 'safe-mode'),
         maxTurns: {
           plan: clamp(ag.claude?.maxTurns?.plan, 3, 200, d.agents.claude.maxTurns.plan),
@@ -122,15 +201,13 @@ export function normalizeConfig(input: unknown): Config {
       },
       cursor: {
         bin: typeof ag.cursor?.bin === 'string' && ag.cursor.bin ? ag.cursor.bin : d.agents.cursor.bin,
-        model: typeof ag.cursor?.model === 'string' && ag.cursor.model ? ag.cursor.model : undefined,
       },
       codex: {
         bin: typeof ag.codex?.bin === 'string' && ag.codex.bin ? ag.codex.bin : d.agents.codex.bin,
-        // the only config-derived value that ever reaches the Codex command line, so it is validated here AND where the argv is built
-        model: typeof ag.codex?.model === 'string' && CODEX_MODEL_RE.test(ag.codex.model) ? ag.codex.model : undefined,
       },
     },
     roles: normalizeRoles((withRoles as any).roles, (m) => log.warn(`config roles: ${m}`)),
+    toolModels: normalizeToolModels((withRoles as any).toolModels, (m) => log.warn(`config ${m}`)),
     projects: normalizeProjects((withRoles as any).projects),
     pipeline: {
       maxParallel: clamp(pl.maxParallel, 1, 6, d.pipeline.maxParallel),
@@ -147,6 +224,7 @@ export function normalizeConfig(input: unknown): Config {
       contextRunsPerDay: clamp(pl.contextRunsPerDay, 1, 48, d.pipeline.contextRunsPerDay),
       asksPerHour: clamp(pl.asksPerHour, 1, 60, d.pipeline.asksPerHour),
       researchPerDay: clamp(pl.researchPerDay, 1, 20, d.pipeline.researchPerDay),
+      designPerHour: clamp(pl.designPerHour, 1, 30, d.pipeline.designPerHour),
       policy: oneOf(pl.policy, ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'] as const, d.pipeline.policy),
       verifyEachItem: pl.verifyEachItem === true,
       timeoutsMin: {

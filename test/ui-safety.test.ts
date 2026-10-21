@@ -99,7 +99,7 @@ test('ui/style.css: no @import and no external url()', () => {
 
 test('no code for controls whose backend is not built yet (M8-U §2.0; each slice removes its own entry)', () => {
   const app = code(read('app.js'));
-  for (const id of ['runMode', '/api/run-mode', '/api/models', '/api/accounts', '/api/briefs', 'roleViews']) {
+  for (const id of ['runMode', '/api/run-mode', '/api/models', '/api/accounts']) {
     assert.ok(!app.includes(id), `ui/app.js mentions ${id}`);
   }
 });

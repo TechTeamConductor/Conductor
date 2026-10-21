@@ -10,6 +10,9 @@ import { createProviders, mutatedProviderForTests, providerLabel } from './provi
 import type { Provider, ProviderId } from './providers/types.ts';
 import type { Complexity, Role } from './roles.ts';
 import { advances, route, type States } from './routing.ts';
+import { redact } from '../redact.ts';
+import { selectionForTool, type ResolvedSel } from '../models/select.ts';
+import type { CatalogView } from '../models/types.ts';
 
 export interface ReadOnlyReq {
   /** Which job this is — the router resolves the provider chain from the configured roles. */
@@ -30,6 +33,18 @@ export interface ReadOnlyReq {
   states: States;
   /** Called when a candidate hits a usage limit — even when the chain advances — so the engine records the pause. */
   onLimit?: (info: LimitInfo) => void;
+  /**
+   * M8-2: the role whose model/effort selection applies (defaults to `role`). Selection ONLY — it never changes the route, candidates,
+   * profile, tools, init predicate, turns, timeouts, cwd or env (M8-6 Security S2). Set from code constants only.
+   */
+  selRole?: Role;
+  /** M8-6 (Security S3): NARROWING-ONLY filter over `route()`'s candidates — it never adds a provider. Empty after filtering ⇒ zero spawns. */
+  onlyProviders?: readonly ProviderId[];
+  /**
+   * M8-2 N4: server-only — run on each tool's DEFAULT model (no role effort). Model selection only, under the same S3 discipline as
+   * `selRole`; wins over `selRole` when both are set (R2-N1).
+   */
+  toolDefaultOnly?: true;
 }
 export type AgentOutcome = AgentResult & { agent: ProviderId; fellBack?: boolean; /** the chain head this stage should have run on, when `fellBack` */ from?: ProviderId };
 
@@ -51,11 +66,19 @@ export class Agents {
   private versions = new Map<string, Promise<string>>();
   private extraEnv: Record<string, string>;
   private providers: Record<ProviderId, Provider>;
+  private catalog: (tool: ProviderId) => CatalogView | null;
+  private onUnknownModel: (tool: ProviderId) => void;
 
-  constructor(getConfig: () => Config, opts: { clock?: Clock; extraEnv?: Record<string, string> } = {}) {
+  /**
+   * `catalog` (M8-2): the synchronous, memory-only model view per tool (runtime wires ModelService.view); default none ⇒ tool defaults.
+   * `onUnknownModel`: called when a run with an explicit --model failed and the CLI itself said the model is unknown (S10).
+   */
+  constructor(getConfig: () => Config, opts: { clock?: Clock; extraEnv?: Record<string, string>; catalog?: (tool: ProviderId) => CatalogView | null; onUnknownModel?: (tool: ProviderId) => void } = {}) {
     this.getConfig = getConfig;
     this.clock = opts.clock ?? systemClock;
     this.extraEnv = opts.extraEnv ?? {};
+    this.catalog = opts.catalog ?? (() => null);
+    this.onUnknownModel = opts.onUnknownModel ?? (() => undefined);
     this.providers = createProviders({ getConfig, clock: this.clock, extraEnv: this.extraEnv });
   }
 
@@ -67,6 +90,34 @@ export class Agents {
   /** TEST SEAM: replace a provider with a sealed, edited copy (throws outside a test run). */
   _testMutate(id: ProviderId, mutate: (draft: Provider) => void): void {
     this.providers = { ...this.providers, [id]: mutatedProviderForTests(this.providers[id], mutate) };
+  }
+
+  /** M8-2: wire model discovery after construction (the runtime builds the ModelService after the Agents). */
+  attachModels(o: { catalog: (tool: ProviderId) => CatalogView | null; onUnknownModel: (tool: ProviderId) => void }): void {
+    this.catalog = o.catalog;
+    this.onUnknownModel = o.onUnknownModel;
+  }
+
+  /** M8-2: what `tool` runs with for `role` (the B2 binding rule, re-validated against the current catalog at every call). */
+  selectionFor(role: Role, tool: ProviderId, opts: { toolDefaultOnly?: boolean } = {}): ResolvedSel {
+    let cat: CatalogView | null = null;
+    try {
+      cat = this.catalog(tool);
+    } catch {
+      cat = null; // a broken catalog source never blocks a run: tool defaults
+    }
+    return selectionForTool(role, tool, this.getConfig(), cat, opts);
+  }
+
+  /** M8-2 S10: a run that carried a --model the CLI rejected asks discovery (rate-limited there) for a fresh list. */
+  noteRunResult(tool: ProviderId, sel: ResolvedSel | undefined, res: AgentResult): void {
+    if (res.cliRejectedModel === true && sel?.modelArg !== undefined) {
+      try {
+        this.onUnknownModel(tool);
+      } catch {
+        /* never fails a run */
+      }
+    }
   }
 
   /** `<bin> --version`, cached per binary. */
@@ -103,14 +154,25 @@ export class Agents {
       if (r.kind === 'paused') return { ok: false, ...none, agent: r.provider, errorKind: 'limit', error: r.reason, limit: { provider: r.provider, resetsAt: r.pauseUntil, message: r.reason } };
       return { ok: false, ...none, errorKind: 'spawn', error: r.reason };
     }
+    if (req.onlyProviders) {
+      const only = req.onlyProviders;
+      r.candidates = r.candidates.filter((c) => only.includes(c.id));
+      if (!r.candidates.length) return { ok: false, text: '', exitCode: null, agent: head, errorKind: 'spawn', error: `This step can only run on ${only.map((id) => providerLabel(id)).join(' or ')}, and none of them is available for it.` };
+    }
     for (let i = 0; i < r.candidates.length; i++) {
       const cand = r.candidates[i]!;
       const provider = this.providers[cand.id];
       if (i === 0 && cand.id !== head) {
-        const why = r.skipped.find((s) => s.id === head)?.why ?? `${providerLabel(head)} is unavailable`;
+        // M8-6 m4: a head filtered out by `onlyProviders` is not "unavailable" — say why this step runs where it does
+        const why = req.onlyProviders && !req.onlyProviders.includes(head) ? `This step runs on ${req.onlyProviders.map((id) => providerLabel(id)).join(' or ')} only` : r.skipped.find((s) => s.id === head)?.why ?? `${providerLabel(head)} is unavailable`;
         req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: `${why} — ${provider.label} is doing this read-only step${tierNote(cand.tier)}.` });
       }
-      const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor });
+      // M8-2 (S3): `selRole`/`toolDefaultOnly` pick the model/effort ONLY — route, gates, candidates, provider method, profile, turns and the
+      // init check above and below all key off `req.role`.
+      const sel = this.selectionFor(req.selRole ?? req.role, cand.id, { toolDefaultOnly: req.toolDefaultOnly === true });
+      for (const n of sel.notes) req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: redact(n, req.secrets ?? []) });
+      const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor, sel });
+      this.noteRunResult(cand.id, sel, res);
       const last = i === r.candidates.length - 1;
       if (res.ok || last || !advances(res.errorKind)) return { ...res, agent: cand.id, fellBack: i > 0 || cand.id !== head, from: i > 0 || cand.id !== head ? head : undefined };
       if (res.errorKind === 'limit') req.onLimit?.(res.limit ?? { provider: cand.id, resetsAt: null, message: res.error ?? 'limit' });

@@ -4,6 +4,7 @@ import type { EmitEvent } from '../claude.ts';
 import type { Clock } from '../../util.ts';
 import type { Schema } from '../json.ts';
 import type { StageName } from '../../types.ts';
+import type { ResolvedSel } from '../../models/select.ts';
 
 /** Registry-driven: add a provider by adding a registry entry; nothing else names providers in a ternary. */
 export type ProviderId = 'claude' | 'cursor' | 'codex';
@@ -30,6 +31,8 @@ export interface ReadOnlyRunReq {
   secrets?: string[];
   /** Multiplies the turn cap (retry after error_max_turns). */
   maxTurnsFactor?: number;
+  /** M8-2: the resolved model/effort for this tool (data only). Absent ⇒ the tool-default resolution. */
+  sel?: ResolvedSel;
 }
 
 /** Deep Research: Claude with web tools only, in an empty scratch directory. */
@@ -41,6 +44,10 @@ export interface ResearchRunReq {
   onEvent: (ev: EmitEvent) => void;
   signal?: AbortSignal;
   secrets?: string[];
+  /** M8-2: the research row's resolved selection (Claude). */
+  sel?: ResolvedSel;
+  /** M8-6: Standard (default — today's exact argv) or Deep. Only `--max-turns` and the wall clock differ (RESEARCH_DEPTH). */
+  depth?: 'standard' | 'deep';
 }
 
 export interface BuildRunReq {
@@ -52,6 +59,8 @@ export interface BuildRunReq {
   onEvent: (ev: EmitEvent) => void;
   signal?: AbortSignal;
   secrets?: string[];
+  /** M8-2: the builder's resolved selection, forwarded untouched by the envelope. */
+  sel?: ResolvedSel;
 }
 
 /** What a provider's own guard looks like after `prepare` (recorded on the run as guardSha / guardEnvOnly). */

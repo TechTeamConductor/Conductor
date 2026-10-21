@@ -850,8 +850,12 @@ export class Stages {
       return this.toNeedsHuman(key, rt.reason, 'build');
     }
     const builder = this.c.agents.provider(rt.candidates[0]!.id);
+    // M8-2: the role's model/effort for the tool that actually builds (B2: a choice made for another tool is not applied)
+    const sel = this.c.agents.selectionFor(role, builder.id);
+    for (const n of sel.notes) this.note(key, 'build', redact(n, secrets));
     const out = await runBuild({
       provider: builder,
+      sel,
       repoPath: repo.path,
       worktree: run.worktree,
       baseSha: run.baseSha,
@@ -871,6 +875,7 @@ export class Stages {
         if (prep.note) this.note(key, 'build', prep.note);
       },
       onResult: (res) => {
+        this.c.agents.noteRunResult(builder.id, sel, res);
         this.finishSession(key, res);
         this.refundIfLimit(key, res);
         if (res.ok) this.patch(key, (r) => void (r.buildFails = 0));

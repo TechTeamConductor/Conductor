@@ -1,10 +1,12 @@
 import type { AgentResult } from '../types.ts';
 import { redact } from '../redact.ts';
 import { truncate } from '../util.ts';
-import type { AgentCallBase, EmitEvent } from './claude.ts';
+import { UNKNOWN_MODEL_RE, type AgentCallBase, type EmitEvent } from './claude.ts';
 import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
 import { BROKEN_RE, NETWORK_RE } from './providers/probe.ts';
+import { cursorModelArgs } from './model-args.ts';
+export { cursorModelArgs };
 
 export interface CursorCall extends AgentCallBase {
   /** build = writes files (`--force`); ask/plan = read-only modes. */
@@ -17,7 +19,8 @@ export function buildCursorArgs(c: Pick<CursorCall, 'mode' | 'cwd' | 'model'>): 
   if (c.mode === 'build') args.push('--force');
   else args.push('--mode', c.mode);
   args.push('--trust', '--output-format', 'stream-json', '--workspace', c.cwd);
-  if (c.model) args.push('--model', c.model);
+  // M8-2: a listed id only (resolution checks membership; the helper re-checks the id rule); last, as always; [] when unset
+  args.push(...cursorModelArgs({ model: c.model }));
   return args;
 }
 
@@ -152,7 +155,9 @@ export async function runCursor(call: CursorCall): Promise<AgentResult> {
 
   const failed = !result || result.is_error === true || (proc.code !== 0 && proc.code !== null);
   if (failed) {
-    if (!result && proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, errorKind: 'spawn', error: `cursor agent is installed but does not start: ${truncate(redact(proc.stderrTail, secrets).trim(), 400)}` };
+    // M8-2 S10: structural only — no result event, a --model was sent, and the CLI's own stderr says the model is unknown
+    const rejected = !result && cursorModelArgs({ model: call.model }).length > 0 && UNKNOWN_MODEL_RE.test(proc.stderrTail) ? ({ cliRejectedModel: true } as const) : {};
+    if (!result && proc.code !== 0 && BROKEN_RE.test(proc.stderrTail)) return { ...base, ...rejected, errorKind: 'spawn', error: `cursor agent is installed but does not start: ${truncate(redact(proc.stderrTail, secrets).trim(), 400)}` };
     // M12: classify from what the CLI itself reported (stderr, or a SHORT error result) — never from long model-written prose,
     // which a hostile repo/prompt could use to fake a "limit" and stall every run.
     const probe = `${result?.is_error === true && finalText.length <= 500 ? finalText : ''}\n${proc.stderrTail}`;
@@ -167,6 +172,7 @@ export async function runCursor(call: CursorCall): Promise<AgentResult> {
     if (!result && NETWORK_RE.test(proc.stderrTail)) return { ...base, errorKind: 'network', error: `cursor could not reach the network: ${truncate(redact(proc.stderrTail, secrets).trim(), 300)}` };
     return {
       ...base,
+      ...rejected,
       errorKind: 'agent',
       error: truncate(redact((proc.stderrTail || finalText || `agent exited with code ${proc.code}`).trim(), secrets), 500),
     };

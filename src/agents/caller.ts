@@ -7,6 +7,7 @@ import type { EmitEvent } from './claude.ts';
 import type { Schema } from './json.ts';
 import type { Role } from './roles.ts';
 import type { States } from './routing.ts';
+import type { ProviderId } from './providers/types.ts';
 import type { LimitInfo } from '../types.ts';
 import { truncate } from '../util.ts';
 
@@ -23,6 +24,10 @@ export interface CallAgentReq {
   signal?: AbortSignal;
   onLimit?: (l: LimitInfo) => void;
   name: string;
+  /** M8-2 model/effort selection role (code constants only; selection never changes routing or the profile — M8-6 S2). */
+  selRole?: Role;
+  /** M8-6 S3: narrowing-only provider filter forwarded to `Agents.readOnly`. */
+  onlyProviders?: readonly ProviderId[];
 }
 export type CallAgentResult =
   | { kind: 'ok'; json: unknown; agent: string; fellBackFrom?: string }
@@ -51,6 +56,8 @@ export async function callAgent(req: CallAgentReq): Promise<CallAgentResult> {
       signal: req.signal,
       secrets: req.secrets,
       maxTurnsFactor: turnsFactor,
+      ...(req.selRole ? { selRole: req.selRole } : {}),
+      ...(req.onlyProviders ? { onlyProviders: req.onlyProviders } : {}),
     });
     if (res.ok) {
       const errs = req.validate(res.json);

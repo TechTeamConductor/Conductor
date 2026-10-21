@@ -1,7 +1,11 @@
 // Native board model (M1a). Pure data types — no behaviour. See .techteam/plans/workspace-v2-m1.md §2.
 
-/** 2: items may be authored by `user-ask` / `ask-convert` / `research` — an older build refuses such a snapshot (no downgrade after Quick Ask is used). */
-export const BOARD_SCHEMA_VERSION = 2;
+/**
+ * 2: items may be authored by `user-ask` / `ask-convert` / `research` — an older build refuses such a snapshot (no downgrade after Quick Ask is used).
+ * 3 (M8-6): items may be authored by `design` ("Design the work"). A writable open stamps the snapshot to this version BEFORE any write
+ * (backup first, see `Board.open`), so an older build refuses the board with NewerVersionError instead of mistaking a new op for a torn tail.
+ */
+export const BOARD_SCHEMA_VERSION = 3;
 
 /** `lane` (not "column": `BoardColumn` already names a dashboard type). Humans may set only HUMAN_LANES; Conductor owns the rest. */
 export type Lane = 'backlog' | 'todo' | 'active' | 'needs_you' | 'review' | 'done' | 'canceled';
@@ -11,12 +15,30 @@ export const HUMAN_LANES: readonly Lane[] = ['backlog', 'todo', 'done', 'cancele
 export type ItemKind = 'work' | 'ask' | 'research' | 'subtask' | 'bug';
 export const USER_KINDS: readonly ItemKind[] = ['work', 'ask', 'research', 'subtask'];
 /**
- * Who wrote a thing. `user-ask`, `ask-convert` and `research` are SERVER-ASSIGNED (never accepted from an HTTP body): a card started from a
- * Quick Ask the user ticked "let Conductor make this change" on / a card made from an ask answer (model text, untrusted) / from research.
+ * Who wrote a thing. `user-ask`, `ask-convert`, `research` and `design` are SERVER-ASSIGNED (never accepted from an HTTP body): a card started
+ * from a Quick Ask the user ticked "let Conductor make this change" on / a card made from an ask answer (model text, untrusted) / from
+ * research / a part of a "Design the work" brief (M8-6: model text, untrusted).
  */
-export type Actor = 'user' | 'conductor' | 'import' | 'user-ask' | 'ask-convert' | 'research';
-/** Actors whose text is model-derived and therefore tainted + redacted. */
-export const TAINTED_ACTORS: readonly Actor[] = ['import', 'ask-convert', 'research'];
+export type Actor = 'user' | 'conductor' | 'import' | 'user-ask' | 'ask-convert' | 'research' | 'design';
+/**
+ * THE one table of actors (M8-6 S9): every list below is derived from it, so the journal loader's allow-list, the taint set (forced plan
+ * approval) and the redaction set always change together. `tainted` = text is not the user's own ⇒ `run.untrusted`; `redact` = the board
+ * redacts the actor's text on write.
+ */
+export const ACTOR_INFO: Readonly<Record<Actor, { tainted: boolean; redact: boolean }>> = Object.freeze({
+  user: { tainted: false, redact: false },
+  conductor: { tainted: false, redact: true },
+  import: { tainted: true, redact: false },
+  'user-ask': { tainted: false, redact: false },
+  'ask-convert': { tainted: true, redact: true },
+  research: { tainted: true, redact: true },
+  design: { tainted: true, redact: true },
+});
+export const ACTORS: readonly Actor[] = Object.freeze(Object.keys(ACTOR_INFO) as Actor[]);
+/** Actors whose text is model-derived (or imported) and therefore tainted: their cards' plans always wait for a human. */
+export const TAINTED_ACTORS: readonly Actor[] = Object.freeze(ACTORS.filter((a) => ACTOR_INFO[a].tainted));
+/** Actors whose text the board redacts on write (agent-derived text never reaches the board unredacted, H3). */
+export const REDACTED_ACTORS: readonly Actor[] = Object.freeze(ACTORS.filter((a) => ACTOR_INFO[a].redact));
 
 export interface Project {
   id: string;

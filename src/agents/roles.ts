@@ -1,6 +1,9 @@
 // Roles and their configuration (M2). A role is a job; providers are who may do it, in order.
 import type { ProviderId } from './providers/types.ts';
 import { isProviderId, staticBuildEligible } from './providers/static.ts';
+import { modelIdOk } from '../models/sanitize.ts';
+import { isEffort, type EffortToken } from '../models/levels.ts';
+export type { EffortToken };
 
 export const ROLES = ['requirements', 'context', 'planning', 'architecture', 'implementation', 'review', 'verification', 'debugging', 'documentation', 'research'] as const;
 export type Role = (typeof ROLES)[number];
@@ -37,7 +40,26 @@ export const ROLE_LABEL: Readonly<Record<Role, string>> = Object.freeze({
   research: 'Research',
 });
 
-export interface RoleConfig {
+/**
+ * A role's model choice (config v6, M8-2 §2.1). Every field is optional; unset = "Tool default" / "the tool decides".
+ * Binding rule (B2): model, custom, fast and thinking belong to `tool`, the tool they were chosen for, and are applied ONLY when that tool
+ * runs. Any other tool (a fallback, a complexity pick, a head changed by another path) gets its own default with the effort fitted.
+ */
+export interface RoleModelSel {
+  /** The tool the choice was made for. Present whenever model/custom/fast/thinking is (server-derived). */
+  tool?: ProviderId;
+  /** Claude/Codex: a discovered model id or a custom id. Cursor: a discovered family (or, with custom, a listed id). modelIdOk(tool, …). */
+  model?: string;
+  /** The user typed the id ("Custom model id…"); only with `model`. */
+  custom?: true;
+  /** A role-level wish, fitted to whichever tool runs. */
+  effort?: EffortToken;
+  /** Cursor only in this slice. */
+  fast?: true;
+  thinking?: true;
+}
+
+export interface RoleConfig extends RoleModelSel {
   /** Ordered: the first healthy, eligible provider runs; the next ones are the fallbacks. */
   providers: ProviderId[];
   /** Per plan complexity, a provider to try FIRST (never lowers the isolation tier; must itself be eligible). */
@@ -112,9 +134,45 @@ export function normalizeRoles(input: unknown, report: (msg: string) => void = (
       }
       if (Object.keys(picks).length) cfg.autoByComplexity = picks;
     }
+    Object.assign(cfg, normalizeRoleSel(rc, (m) => report(`${role}: ${m}`)));
     out[role] = cfg;
   }
   return out;
+}
+
+/**
+ * The model fields of one role entry from UNTRUSTED input, shape only (no catalog at load time; use-time resolution re-checks everything —
+ * S19). Built from literals, never spread. Dropped values are reported WITHOUT the value (hand-edited text can be anything).
+ */
+export function normalizeRoleSel(rc: Record<string, unknown>, report: (msg: string) => void = () => undefined): RoleModelSel {
+  const get = (k: string): unknown => (Object.hasOwn(rc, k) ? rc[k] : undefined);
+  const out: RoleModelSel = {};
+  const effort = get('effort');
+  if (isEffort(effort)) out.effort = effort;
+  else if (effort !== undefined && effort !== null) report('dropped the effort (not a known level)');
+  const rawTool = get('tool');
+  const model = get('model');
+  const wantsModel = (model !== undefined && model !== null) || get('custom') === true || get('fast') === true || get('thinking') === true;
+  if (!wantsModel) return out;
+  if (!isProviderId(rawTool)) {
+    report('dropped the model choice (it does not say which tool it was chosen for)');
+    return out;
+  }
+  if (model !== undefined && model !== null) {
+    if (modelIdOk(rawTool, model)) {
+      out.model = model;
+      if (get('custom') === true) out.custom = true;
+    } else report(`dropped the model (not a valid ${rawTool} model id)`);
+  }
+  if (get('fast') === true) out.fast = true;
+  if (get('thinking') === true) out.thinking = true;
+  if (out.model !== undefined || out.fast || out.thinking) out.tool = rawTool;
+  return out;
+}
+
+/** The tool a role's model choice is judged against and bound to (B2, N1): Claude for `research`, else the chain head. */
+export function selTool(role: Role, providers: readonly ProviderId[]): ProviderId {
+  return role === 'research' ? 'claude' : (providers[0] ?? 'claude');
 }
 
 /** v1/v3 compatibility: the first claude|cursor provider of a chain (what the old `stages.*` meant). */

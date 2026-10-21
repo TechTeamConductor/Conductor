@@ -18,6 +18,10 @@ export interface JournalLoad {
   ops: JournalOp[];
   /** Bytes of an unparsable final line that were ignored (and truncated when opened for writing). */
   tornBytes: number;
+  /** Version stamped in the snapshot on disk (legacy unstamped = 1); null when there is no snapshot file. */
+  snapshotVersion: number | null;
+  /** Bytes in the journal file after load (0 = empty or absent). */
+  journalBytes: number;
 }
 
 function fsyncDir(dir: string): void {
@@ -159,7 +163,7 @@ export class Journal {
     if (snapshot) this.validateSnapshot(snapshot);
     this.size = existsSync(this.journalFile) ? statSync(this.journalFile).size : 0;
     if (!this.readOnly) this.cleanStaleTemps();
-    return { snapshot, ops, tornBytes };
+    return { snapshot, ops, tornBytes, snapshotVersion: snap.existed ? snap.fromVersion : null, journalBytes: this.size };
   }
 
   /** Structural validation of one journal line (S-5): shape, then entity fields. Returns null for anything that is not a valid operation. */

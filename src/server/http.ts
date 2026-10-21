@@ -217,8 +217,11 @@ export class DashboardServer {
   private json(res: http.ServerResponse, status: number, body: unknown, extra: Record<string, string | string[]> = {}): void {
     this.send(res, status, JSON.stringify(body), 'application/json; charset=utf-8', extra);
   }
-  private fail(res: http.ServerResponse, status: number, code: string, message: string): void {
-    this.json(res, status, { error: { code, message } });
+  /** `{ error: { code, message, field?, …extra } }` — field omitted when undefined (M8-2 B1e); extra can never override code/message/field. */
+  private fail(res: http.ServerResponse, status: number, code: string, message: string, field?: string, extra?: Record<string, unknown>): void {
+    const ex: Record<string, unknown> = {};
+    if (extra && typeof extra === 'object') for (const [k, v] of Object.entries(extra)) if (k !== 'code' && k !== 'message' && k !== 'field' && k !== '__proto__') ex[k] = v;
+    this.json(res, status, { error: { ...ex, code, message, ...(field !== undefined ? { field } : {}) } });
   }
 
   private async readBody(req: http.IncomingMessage): Promise<{ ok: true; body: any } | { ok: false; status: number; code: string; message: string }> {
@@ -322,7 +325,7 @@ export class DashboardServer {
       }
       return this.json(res, r.status ?? 200, r.json ?? { ok: true });
     } catch (e) {
-      if (e instanceof ApiFail) return this.fail(res, e.status, e.code, e.message);
+      if (e instanceof ApiFail) return this.fail(res, e.status, e.code, e.message, e.field, e.extra);
       log.error(`api ${method} ${path} failed: ${errMsg(e)}`);
       return this.fail(res, 500, 'internal', 'Something went wrong inside Conductor (details are in the log).');
     }

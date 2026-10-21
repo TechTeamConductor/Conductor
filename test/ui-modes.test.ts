@@ -24,6 +24,11 @@ interface Modes {
   rolesPatch(roles: Roles, changes: Record<string, string>): { roles: Record<string, RoleEntry> };
   acksNeeded(roles: Roles, choices: Choices, patch: { roles: Record<string, RoleEntry> }): { provider: string; roles: string[]; rows: string[] }[];
   withAck(patch: { roles: Record<string, RoleEntry> }, ids: string[]): { roles: Record<string, RoleEntry>; acknowledge?: string[] };
+  selFields(sel: unknown): { model: string | null; custom: boolean; effort: string | null; fast: boolean; thinking: boolean };
+  selOf(entry: unknown, tool: string): { model: string | null; custom: boolean; effort: string | null; fast: boolean; thinking: boolean };
+  sameSel(a: unknown, b: unknown): boolean;
+  withSel(patch: { roles: Record<string, RoleEntry> }, roles: unknown, sels: Record<string, unknown>): { roles: Record<string, any> };
+  moreNote(total: unknown, shown: number, what: string): string;
   safeHttp(u: string): string | null;
   safeAttr(name: string, value: unknown): string | null;
   toolJobs(roles: Roles, provider: string): string;
@@ -280,4 +285,46 @@ test('"No repository" never sticks where the mode does not allow it (code review
   assert.deepEqual(pick('ask', many), { name: null, how: 'none' });
   assert.deepEqual(pick('work', many), { name: null, how: 'unresolved' }, 'Build: never "none"; the UI then asks which repo');
   assert.deepEqual(pick('work', many, { lastUsed: 'beta' }), { name: 'beta', how: 'last' }, 'Build falls back to Auto resolution');
+});
+
+// ───────── M8-2 model choices ─────────
+test('M8-2 selOf: a choice made for another tool keeps only the effort (B2 binding)', () => {
+  const e = { providers: ['cursor'], tool: 'claude', model: 'opus', custom: false, effort: 'high', fast: false, thinking: false };
+  assert.deepEqual(j(M.selOf(e, 'cursor')), { model: null, custom: false, effort: 'high', fast: false, thinking: false });
+  assert.deepEqual(j(M.selOf(e, 'claude')), { model: 'opus', custom: false, effort: 'high', fast: false, thinking: false });
+  assert.deepEqual(j(M.selOf({ providers: ['claude'] }, 'claude')), { model: null, custom: false, effort: null, fast: false, thinking: false });
+  assert.equal(M.sameSel({ model: 'opus' }, { model: 'opus', custom: false, effort: null }), true);
+  assert.equal(M.sameSel({ model: 'opus' }, { model: 'opus', effort: 'low' }), false);
+  assert.deepEqual(j(M.selFields({ custom: true })), { model: null, custom: false, effort: null, fast: false, thinking: false }, 'custom without a model is not custom');
+});
+
+test('M8-2 withSel: every role of the row gets the same fields, tool left out, others untouched, inputs never mutated', () => {
+  const roles: any = defaults();
+  roles.debugging = { providers: ['cursor'], tool: 'cursor', model: 'gpt-5.2', autoByComplexity: { L: 'cursor' }, extra: 1 };
+  const before = j(roles);
+  const patch = M.rolesPatch(roles, { plan: 'cursor' });
+  const p0 = j(patch);
+  const out = M.withSel(patch, roles, { build: { model: 'gpt-5.3-codex', effort: 'high', fast: true }, plan: { model: null, effort: 'low' } });
+  assert.deepEqual(j(roles), before);
+  assert.deepEqual(j(patch), p0);
+  for (const r of ['implementation', 'debugging', 'documentation']) {
+    assert.equal(out.roles[r].model, 'gpt-5.3-codex', r);
+    assert.equal(out.roles[r].effort, 'high');
+    assert.equal(out.roles[r].fast, true);
+    assert.equal(out.roles[r].thinking, false);
+    assert.equal('tool' in out.roles[r], false, 'the server derives tool');
+  }
+  assert.deepEqual(j(out.roles.debugging.autoByComplexity), { L: 'cursor' }, 'every other field is echoed');
+  assert.equal(out.roles.debugging.extra, 1);
+  assert.deepEqual(j(out.roles.planning.providers), ['cursor'], 'the tool change from rolesPatch is kept');
+  assert.equal(out.roles.planning.effort, 'low');
+  assert.equal(out.roles.review, undefined, 'rows without a choice are not sent');
+});
+
+test('M8-6 S14/F1 moreNote: "+N more … not listed" only when the true total exceeds the capped list', () => {
+  assert.equal(M.moreNote(130, 100, 'pages opened'), '+30 more pages opened, not listed');
+  assert.equal(M.moreNote(50, 50, 'searches'), '');
+  assert.equal(M.moreNote(undefined, 10, 'searches'), '', 'older reports have no total');
+  assert.equal(M.moreNote('999', 10, 'searches'), '', 'a non-number total is ignored');
+  assert.equal(M.moreNote(1.5, 0, 'searches'), '');
 });

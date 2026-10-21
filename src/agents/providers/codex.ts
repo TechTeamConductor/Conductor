@@ -9,7 +9,10 @@ import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import type { VerificationBinding } from './verification.ts';
 import { join } from 'node:path';
 import type { AgentResult, StageName } from '../../types.ts';
-import { CODEX_MODEL_RE, resolveBin } from '../../config.ts';
+import { resolveBin } from '../../config.ts';
+import { codexModelArgs } from '../model-args.ts';
+import { toolDefaultResolved } from '../../models/select.ts';
+export { codexModelArgs };
 import { redact } from '../../redact.ts';
 import { sha256, truncate } from '../../util.ts';
 import { codexEnv } from '../env.ts';
@@ -37,12 +40,17 @@ export function versionAtLeast(found: string, min: string): boolean {
 
 // ───────────── argv (constants only) ─────────────
 export interface CodexArgvOpts {
-  /** Validated by CODEX_MODEL_RE; anything else is ignored. */
+  /** Validated by the narrow rule (modelIdOk('codex'), = CODEX_MODEL_RE); anything else is ignored. */
   model?: string;
+  /** M8-2: a token from EFFORT_TOKENS, sent as the one literal `-c model_reasoning_effort="<tok>"`; anything else is ignored. */
+  effort?: string;
   outFile: string;
 }
 /**
- * The ONLY way a Codex command line is built. No user-, repo- or config-derived string except the validated model name.
+ * The ONLY way a Codex command line is built. No user-, repo- or config-derived string except the validated model name and the effort
+ * token (M8-2, Security S6 + the N9 ruling): the variable tail is exactly `--model=<id>` and/or the pair `-c`, `model_reasoning_effort="<tok>"`
+ * (a literal from CODEX_EFFORT_ARG), inserted immediately before `-o`. No other selection-derived `-c` key or flag exists; adding one voids
+ * the N9 ruling and goes back to Security. CODEX_ARGV_DIGEST stays computed over the constant argv without model or effort.
  * Absent on purpose (a test asserts it): the bypass/yolo/full-auto flags, --add-dir, --search, --profile, any other sandbox mode,
  * `--skip-git-repo-check`, and `--output-schema`: Codex sends that schema as a strict structured-output format and Conductor's stage schemas
  * (optional properties, no additionalProperties:false) are probably rejected by it — unverifiable without a real binary, so the JSON instruction in the
@@ -63,7 +71,7 @@ export function buildCodexArgs(o: CodexArgvOpts): string[] {
     '-c', 'shell_environment_policy.ignore_default_excludes=false',
     '-c', 'shell_environment_policy.exclude=["CODEX_*","*KEY*","*TOKEN*","*SECRET*","*PASSWORD*"]',
   ];
-  if (o.model && CODEX_MODEL_RE.test(o.model)) args.push(`--model=${o.model}`);
+  args.push(...codexModelArgs({ model: o.model, effort: o.effort }));
   args.push('-o', o.outFile, '-'); // `-` = the prompt comes from stdin
   return args;
 }
@@ -194,6 +202,8 @@ export interface CodexCall {
   stage: ReadOnlyRunReq['stage'];
   schema?: Schema;
   model?: string;
+  /** M8-2: re-checked by codexModelArgs (EFFORT_TOKENS only). */
+  effort?: string;
   extraEnv: Record<string, string>;
   idleMs: number;
   hardMs: number;
@@ -248,7 +258,7 @@ export async function runCodexReadOnly(call: CodexCall): Promise<AgentResult> {
       const outFile = join(tmp.dir, 'last-message.txt');
       const { proc, fold } = await spawnCodex({
         bin: call.bin,
-        args: buildCodexArgs({ model: call.model, outFile }),
+        args: buildCodexArgs({ model: call.model, effort: call.effort, outFile }),
         cwd: call.cwd,
         env: codexEnv({ codexHome: home, home: scratchHome.dir }, call.extraEnv),
         prompt: call.prompt,
@@ -364,8 +374,9 @@ export function codexProvider(d0: ProviderDeps): Provider {
       const bin = resolveBin(cfg.agents.codex.bin);
       if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Codex CLI "${cfg.agents.codex.bin}" not found. Install it (npm i -g @openai/codex), then sign in to Conductor's private home (see docs/TROUBLESHOOTING.md).` };
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
+      const sel = req.sel && req.sel.tool === 'codex' ? req.sel : toolDefaultResolved(cfg, 'codex'); // a selection for another tool is never applied here (CR-N2)
       return runCodexReadOnly({
-        bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, schema: req.schema, model: cfg.agents.codex.model, extraEnv: d.extraEnv,
+        bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, schema: req.schema, model: sel.modelArg, effort: sel.effortArg, extraEnv: d.extraEnv,
         idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
         signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
       });

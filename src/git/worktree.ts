@@ -709,7 +709,8 @@ const PROTECTED_DIR_SEGMENTS = new Set(['.claude', '.cursor', '.codex', '.agents
 // instruction/config files that tools auto-load or execute (security review M6)
 const PROTECTED_FILE_NAMES = new Set(['.mcp.json', 'agents.md', 'agents.override.md', 'claude.md', 'claude.local.md', 'gemini.md', '.envrc', '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs', '.cursorrules', '.windsurfrules', 'lefthook.yml', '.pre-commit-config.yaml']);
 
-function isProtectedPath(p: string): boolean {
+/** Exported for display only (M8-6: brief files flagged before Send) — no logic change. */
+export function isProtectedPath(p: string): boolean {
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!.toLowerCase(); // case-insensitive: macOS volumes are

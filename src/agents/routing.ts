@@ -18,7 +18,10 @@ export interface ProviderState {
   auth: 'ok' | 'not-logged-in' | 'unknown';
   /** CLI-reported usage limit: epoch ms until which the provider is paused, or null. */
   pausedUntil: number | null;
-  /** Present only when the provider can run web research in an isolated profile (M5). */
+  /**
+   * Present only when the provider can run web research in an isolated profile (M5). Intentionally never set in production until F11
+   * (M8-2 S11): Deep Research runs through `claude.runResearch` directly; making research routable needs its own Security design.
+   */
   webResearchIsolated?: boolean;
 }
 export type States = Readonly<Record<ProviderId, ProviderState>>;

@@ -124,7 +124,7 @@ test('apply: a complete v2 folder appears with one rename; v1 is untouched (even
 
   // config v3 + state
   const cfg = JSON.parse(readFileSync(join(to, 'config.json'), 'utf8'));
-  assert.equal(cfg.version, 5);
+  assert.equal(cfg.version, 6); // M8-2: config v6 (the v1 import runs migrations[5])
   assert.equal(cfg.linear, undefined);
   assert.equal(cfg.legacy.linear.teamKey, 'ENG');
   assert.equal(cfg.pipeline.planApproval, 'auto', 'v1 defaults upgraded');

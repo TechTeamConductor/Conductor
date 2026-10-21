@@ -60,8 +60,9 @@ test('argv: constants plus one validated model name — the exact pinned list, p
   for (const m of ['--yolo', 'a b', 'x;rm -rf /', '-x', '', '../../etc', 'a'.repeat(65), 'm\nn', '$(id)']) {
     assert.ok(!buildCodexArgs({ model: m, outFile: '/o' }).some((x) => x.startsWith('--model')), JSON.stringify(m));
   }
-  assert.equal(normalizeConfig({ agents: { codex: { model: 'good-model:1' } } }).agents.codex.model, 'good-model:1');
-  assert.equal(normalizeConfig({ agents: { codex: { model: '--yolo' } } }).agents.codex.model, undefined);
+  // M8-2 v6: the old free-text key becomes toolModels.codex (custom) when it passes the narrow rule, else it is never used
+  assert.deepEqual(normalizeConfig({ agents: { codex: { model: 'good-model:1' } } }).toolModels.codex, { model: 'good-model:1', custom: true });
+  assert.equal(normalizeConfig({ agents: { codex: { model: '--yolo' } } }).toolModels.codex, undefined);
 });
 
 test('a run: prompt on STDIN, private CODEX_HOME + scratch HOME, minimal env, temp files in a 0700 dir outside the worktree, everything cleaned up', async () => {

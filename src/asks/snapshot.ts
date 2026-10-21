@@ -11,7 +11,12 @@ export const SNAPSHOT_LIMITS = Object.freeze({ totalBytes: 500 * 1024 * 1024, fi
 const AGENT_CONFIG = /(?:^|\/)(?:\.claude|\.cursor|\.codex|\.agents|\.husky|\.windsurf|\.github\/copilot)(?:\/|$)|(?:^|\/)(?:\.mcp\.json|\.cursorrules|\.windsurfrules)$/i;
 export class SnapshotTooLarge extends Error {}
 
-export interface Snapshot { dir: string; files: number; symlinks: number; gitlinks: number; skippedLarge: number; skippedNames: number; omittedConfig: number; commit: string }
+export type SnapshotEntry = 'file' | 'symlink' | 'gitlink' | 'omitted';
+export interface Snapshot {
+  dir: string; files: number; symlinks: number; gitlinks: number; skippedLarge: number; skippedNames: number; omittedConfig: number; commit: string;
+  /** M8-6 N7 (additive; Quick Ask ignores it): every committed path (NFKC) → what became of it. `file` = a regular blob written here. */
+  index: Map<string, SnapshotEntry>;
+}
 
 /** A repository path that may be materialised, else null. */
 export function safeEntryName(p: string): string | null {
@@ -23,25 +28,27 @@ export function safeEntryName(p: string): string | null {
   return p;
 }
 
-export async function buildSnapshot(src: GitSource, commit: string, opts: { parent?: string } = {}): Promise<Snapshot> {
+export async function buildSnapshot(src: GitSource, commit: string, opts: { parent?: string; prefix?: 'conductor-ask-' | 'conductor-brief-'; tooLarge?: string } = {}): Promise<Snapshot> {
   if (!isObjectId(commit)) throw new Error('not a commit id');
   const { entries } = await src.lsTreeRecursive(commit);
   let files = 0, symlinks = 0, gitlinks = 0, skippedLarge = 0, skippedNames = 0, omittedConfig = 0, total = 0;
   const chosen: { e: TreeEntry; name: string }[] = [];
+  const index = new Map<string, SnapshotEntry>();
+  const mark = (p: string, v: SnapshotEntry) => { if (index.size < SNAPSHOT_LIMITS.files * 2) index.set(p.normalize('NFKC'), v); };
   for (const e of entries) {
-    if (e.mode === '120000') { symlinks++; continue; }
-    if (e.type === 'commit' || e.mode === '160000') { gitlinks++; continue; }
-    if (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755')) continue;
+    if (e.mode === '120000') { symlinks++; mark(e.path, 'symlink'); continue; }
+    if (e.type === 'commit' || e.mode === '160000') { gitlinks++; mark(e.path, 'gitlink'); continue; }
+    if (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755')) { mark(e.path, 'omitted'); continue; }
     const name = safeEntryName(e.path);
     if (!name) { skippedNames++; continue; }
-    if (AGENT_CONFIG.test(name)) { omittedConfig++; continue; }
+    if (AGENT_CONFIG.test(name)) { omittedConfig++; mark(name, 'omitted'); continue; }
     const size = e.size ?? 0;
-    if (size > SNAPSHOT_LIMITS.blobBytes) { skippedLarge++; continue; }
+    if (size > SNAPSHOT_LIMITS.blobBytes) { skippedLarge++; mark(name, 'omitted'); continue; }
     total += size;
-    if (total > SNAPSHOT_LIMITS.totalBytes || chosen.length + 1 > SNAPSHOT_LIMITS.files) throw new SnapshotTooLarge('too large for Quick Ask — use Engineering Work');
+    if (total > SNAPSHOT_LIMITS.totalBytes || chosen.length + 1 > SNAPSHOT_LIMITS.files) throw new SnapshotTooLarge(opts.tooLarge ?? 'too large for Quick Ask — use Engineering Work');
     chosen.push({ e, name });
   }
-  const dir = mkdtempSync(join(opts.parent ?? tmpdir(), 'conductor-ask-'));
+  const dir = mkdtempSync(join(opts.parent ?? tmpdir(), opts.prefix ?? 'conductor-ask-'));
   chmodSync(dir, 0o700);
   try {
     let i = 0;
@@ -52,19 +59,20 @@ export async function buildSnapshot(src: GitSource, commit: string, opts: { pare
       const blobs = await src.catBuffers(batch.map((b) => b.e.sha), SNAPSHOT_LIMITS.blobBytes);
       for (const { e, name } of batch) {
         const data = blobs.get(e.sha);
-        if (!data) { skippedLarge++; continue; }
+        if (!data) { skippedLarge++; mark(name, 'omitted'); continue; }
         const target = resolve(dir, name);
-        if (!target.startsWith(dir + sep)) { skippedNames++; continue; }
+        if (!target.startsWith(dir + sep)) { skippedNames++; mark(name, 'omitted'); continue; }
         mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
         const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
         try { writeSync(fd, data); } finally { closeSync(fd); }
         files++;
+        mark(name, 'file');
       }
     }
   } catch (e) {
     rmSync(dir, { recursive: true, force: true });
     throw e;
   }
-  return { dir, files, symlinks, gitlinks, skippedLarge, skippedNames, omittedConfig, commit };
+  return { dir, files, symlinks, gitlinks, skippedLarge, skippedNames, omittedConfig, commit, index };
 }
 export const removeSnapshot = (s: Snapshot): void => rmSync(s.dir, { recursive: true, force: true });
