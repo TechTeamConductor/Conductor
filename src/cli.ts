@@ -9,12 +9,14 @@ import { loadConfig, resolveBin } from './config.ts';
 import { runCodexCanary } from './agents/providers/canary.ts';
 import { addRecord } from './agents/providers/verification.ts';
 import { CURSOR_GUARD_JSON } from './git/worktree.ts';
-import { ensureHome, paths } from './paths.ts';
+import { assertHomeIsUsable, ensureHome, paths } from './paths.ts';
+import { ModelService } from './models/service.ts';
+import type { CatalogView } from './models/types.ts';
 import { acquireLock, LockHeldError, readLock } from './lock.ts';
 import { migrate, MigrateError } from './migrate.ts';
 import { configureLog, logger, pruneLogs } from './log.ts';
 import { createRuntime, VERSION } from './runtime.ts';
-import { isolationProbe, probe, runChecks } from './doctor.ts';
+import { agentHealth, isolationProbe, probe, runChecks } from './doctor.ts';
 import { installService, serviceStatus, uninstallService, plistPath } from './service.ts';
 import { startDemo } from './demo.ts';
 import { errMsg, sha256 } from './util.ts';
@@ -40,6 +42,7 @@ Usage: conductor <command>
   service install    keep Conductor running in the background (launchd)   [--dry-run]
   service uninstall  remove the background service
   service status
+  models             show the models each tool offers   [--refresh] [--json]
   migrate            import a Conductor v1 data folder into a NEW v2 folder, side by side   [--from <dir>] [--to <dir>] [--apply]
   uninstall          remove the background service   [--purge removes the data folder]
   version
@@ -94,6 +97,8 @@ async function main(): Promise<void> {
       return service();
     case 'migrate':
       return migrateCmd();
+    case 'models':
+      return modelsCmd();
     case 'uninstall':
       return uninstall();
     default:
@@ -166,6 +171,7 @@ async function start(): Promise<void> {
   lock.update({ port });
   await rt.server.listenControl(paths.control());
   rt.engine.start();
+  rt.warmUp(); // R2-N1: one background zero-quota health read, so a headless start discovers models too
   const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
   const url = `http://127.0.0.1:${port}`;
   console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C. Reopen the dashboard any time with:  npm run open\n`);
@@ -181,6 +187,49 @@ async function start(): Promise<void> {
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+/** Same allow-listed view as GET /api/models (S14). */
+function printModels(views: CatalogView[]): void {
+  if (flag('--json')) return void console.log(JSON.stringify({ providers: views }, null, 2));
+  for (const v of views) {
+    const when = v.fetchedAt ? new Date(v.fetchedAt).toLocaleString() : '—';
+    const count = v.models ? `${v.models.length} model(s)` : 'no list';
+    console.log(`${v.provider.padEnd(7)} ${v.state.padEnd(11)} ${count.padEnd(14)} fetched ${when}   CLI ${v.cliVersion ?? '—'}${v.signedIn === false ? '   (signed out)' : ''}`);
+    if (v.reason) console.log(`        ${v.reason}`);
+  }
+}
+
+async function modelsCmd(): Promise<void> {
+  assertHomeIsUsable();
+  ensureHome();
+  configureLog({ level: 'error' });
+  const cfg = loadConfig();
+  const svc = () => new ModelService({ getConfig: () => cfg });
+  if (!flag('--refresh')) return printModels(svc().viewAll());
+  // N6/R2-N4: never discover beside a running server (its in-memory view would go stale). acquireLock refuses while a live server holds
+  // it (readLock + pid-alive inside); we then hold it ourselves for the duration of our refresh, so a server starting meanwhile cannot race us.
+  let lock: ReturnType<typeof acquireLock>;
+  try {
+    lock = acquireLock(paths.lock());
+  } catch (e) {
+    if (e instanceof LockHeldError) {
+      console.log('Conductor is running — use Refresh models in Settings. The saved lists:\n');
+      return printModels(svc().viewAll());
+    }
+    throw e;
+  }
+  try {
+    const s = svc();
+    for (const p of ['claude', 'cursor'] as const) {
+      const h = await agentHealth(cfg, p);
+      s.noteVersion(p, h.version ?? null); // records the version the catalog is stamped with (Cursor's list has none)
+      await s.refresh(p, 'manual');
+    }
+    printModels(s.viewAll());
+  } finally {
+    lock.release();
+  }
 }
 
 async function openCmd(): Promise<void> {

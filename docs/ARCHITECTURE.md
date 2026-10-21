@@ -91,9 +91,42 @@ v2 keeps its data in **`~/.conductor-v2`** (override with `CONDUCTOR_HOME`), mar
 
 Nothing in your working tree or branches. It does add: a git **worktree** per task (`<repo parent>/.conductor-v2-worktrees/<repo>/<KEY>`, branch `conductor-v2/<key>`), refs under `refs/conductor-v2/<KEY>/` (base + recoverable backups), and a few lines in the repo's shared **`.git/info/exclude`** (`/.conductor/`, `node_modules`, copied env files, `/.cursor/cli.json`) so those never show up in `git status`. v1's `conductor/…` branches, `refs/conductor/…` and `.conductor-worktrees` are never touched by v2. `uninstall` does not remove any of it; delete the lines by hand if you want.
 
+## Model discovery (M8-1)
+
+`src/models/` asks each installed CLI which models it offers. Nothing is hard-coded: a test checks that no model id from the recorded fixtures appears in `src/` or `ui/`. In this slice nothing consumes the catalogue for argv (that is M8-2), so no stage command line changes; `test/argv-golden.test.ts` pins today's full argv.
+- **Adapters, constants-only argv.**
+  - Claude runs `claude -p --input-format stream-json --output-format stream-json --verbose --safe-mode --strict-mcp-config --disable-slash-commands --no-session-persistence`. It gets ONE `initialize` control request on stdin, then EOF, and never a prompt. Only `models` and `account` are read from the reply. From `account`, only `signedIn` and `plan` are kept.
+  - A turn tripwire watches the output: any `assistant` / `user` / `result` / `stream_event` / `rate_limit_event` / `system:init` line kills the process group, and nothing is cached. The child is also killed as soon as the reply is parsed.
+  - Cursor runs `agent --list-models`; lines of the form `id - Label` are parsed, and its reasons are fixed text.
+  - **Codex** has a parser only (`CODEX_DISCOVERY_ENABLED = false`, a code constant). Nothing looks up, prepares or spawns Codex. Enabling it is a separate Security gate.
+- **Sanitiser** (`sanitize.ts`, a leaf module; `config.ts` re-exports its id rule as `CODEX_MODEL_RE`).
+  - `cleanText`: NFC, then strip `\p{Cc}` `\p{Cf}` `\p{Zl}` `\p{Zp}` `\p{Co}` and lone surrogates, collapse whitespace, truncate by code point.
+  - Ids are checked **raw**, never repaired, through `modelIdOk(provider, id)`, which picks a rule per provider (Security S9 widening ruling W1–W7):
+    - Cursor and Codex use `MODEL_ID_BASE_RE`: first character alphanumeric, so an id can never read as an option; then `[A-Za-z0-9._:/-]`, ≤ 64 characters. Codex's `CODEX_MODEL_RE` is this same rule.
+    - Claude uses `CLAUDE_MODEL_RE`: the base rule plus one optional `[a-z0-9]{1,8}` bracket suffix, ≤ 74 characters. This is because Claude 2.1.304 lists an `<id>[1m]` context-size variant when run with Conductor's env.
+    - Brackets are Cursor's parameter syntax, so a bracketed Cursor id is refused. Any further widening goes back to Security.
+  - Efforts must be in `EFFORT_TOKENS`.
+  - Parsing is field by field and own-property only.
+  - `scrubIdentity` runs on every reason and log detail. It strips the refresh's exact email/organisation, any email shape, and absolute paths.
+- **Process.**
+  - Discovery reuses the existing env allow-lists (`claudeEnv` / `cursorEnv`), with a 15 s idle + hard deadline (≈ 21 s worst case with the SIGTERM→SIGKILL grace and pipe drain).
+  - `runProcess`'s optional `maxOutputBytes` caps output at 2 MB raw, plus a 512 KB per-line cap. Overflow is always `unavailable`, even if a reply arrived first.
+  - Every discovery runs in the one stable folder `<home>/run/discovery`. It must be a real 0700 folder owned by the user. It is emptied without following links before each spawn and cleaned after reaping; only the leftover count is logged. One service-wide queue serialises all discoveries.
+  - Inside `npm test` the service refuses to spawn unless a `spawn` dependency was injected.
+- **Cache** (`cache.ts`): `<home>/models/<provider>/<account>.json`.
+  - The path is built only from the provider enum and the account regex, and is asserted inside `models/`. Folders are 0700 and owned by the user.
+  - Reads go through `O_NOFOLLOW` + `fstat` (regular file, ≤ 4 MB), then `version === 1`. Any other version, or a missing one, means corrupt: the file is quarantined, with ≤ 3 copies kept. A newer version is left untouched, and the fresh list stays in memory only.
+  - Every field is re-validated. `provider`/`account` must match the path, and a `fetchedAt` in the future is shown stale. Families are always recomputed. Writes are atomic (temp + rename, 0600, version stamped) after a newer-version check made through the same no-follow handle. `saveVersioned` is not used, because its own check re-reads the path following links. Folder modes are tightened through an `O_NOFOLLOW` handle (`fchmod`), and the path is then re-checked to still be the same folder.
+- **Service** (`service.ts`, wired in `runtime.ts`).
+  - `view()`/`viewAll()` are memory-only (default-account caches are read once at construction) and never wait for a discovery. `refresh()` lets a second call join the one in flight per (provider, account); a manual refresh inside 10 s returns the cached view.
+  - Automatic triggers (startup after the first REAL health read, a version change, M8-2's `noteUnknownModel`) are rate-limited: ≤ 1 per 5 min after a failure and ≤ 1 per distinct CLI version per process. A runtime with injected health (tests, demo) never discovers by itself.
+  - `conductor start` and the desktop sidecar do one background health read after `listen` (`Runtime.warmUp`). `Runtime.close()` stops discovery (process-group kill).
+  - CLI: `conductor models [--refresh] [--json]`. It does not refresh while a server holds the lock, and holds the lock during its own refresh.
+- **Known footprint:** each Claude discovery writes the user's Claude config dir (`.claude.json` and a backup), the same as every read-only stage does. Measured live on 2026-10-21 over two refreshes: the `~/.claude.json` project-key count and the `~/.claude/projects` entry count did not change, and no entry for the discovery folder was added. Cursor runs with the real HOME, which sign-in needs.
+
 ## Files on disk (`~/.conductor-v2`)
 
-`home.json` · `config.json` (0600) · `state.json` · `board/{snapshot.json, journal.ndjson, board.lock}` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock, sessions.json}`.
+`home.json` · `config.json` (0600) · `state.json` · `board/{snapshot.json, journal.ndjson, board.lock}` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock, sessions.json, discovery/}` · `models/<provider>/<account>.json` (model lists; a cache — an empty `models/` counts as skeleton, a cache file makes the home "hold data" for `migrate`, like `run/`).
 
 ## Known limits (v2 so far)
 - **Codex has never run against a real binary here** (this machine's install is broken): its argv pins, event shapes and canary are written from the vendor documentation and tested against a scripted stand-in (`fixtures/fake-codex.mjs`). A project-level `.codex/` layer that the real CLI loads despite `--ignore-user-config` will make the canary report `blocked` — the intended safe outcome. There is no Codex API-key mode (login in the private home only) until the environment policy can be proven on a working binary.

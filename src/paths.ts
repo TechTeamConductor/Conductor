@@ -10,8 +10,12 @@ export function conductorHome(): string {
   if (process.env.NODE_TEST_CONTEXT) throw new Error('CONDUCTOR_HOME is not set inside a test run — refusing to use the real ~/.conductor-v2. Run tests with `npm test` (it loads test/preload.ts).');
   return join(homedir(), '.conductor-v2'); // v2's own home: running this code can never touch the v1 data in ~/.conductor
 }
-/** The empty folders a v2 start creates; a home holding only these (and home.json) holds no data. Shared by the home check and the importer. */
-export const HOME_SKELETON: ReadonlySet<string> = new Set(['logs', 'run', 'runs', 'board', 'providers', 'projects']);
+/**
+ * The empty folders a v2 start creates; a home holding only these (and home.json) holds no data. Shared by the home check and the importer.
+ * `models` (M8-1 model-discovery cache): an EMPTY `models/` is skeleton; once a cache file exists the home counts as holding data, exactly
+ * like `run/` — the cache can always be rebuilt. `ensureHome` does not create it (the cache code creates it 0700 on first write).
+ */
+export const HOME_SKELETON: ReadonlySet<string> = new Set(['logs', 'run', 'runs', 'board', 'providers', 'projects', 'models']);
 export const paths = {
   home: () => conductorHome(),
   config: () => join(conductorHome(), 'config.json'),
@@ -24,6 +28,10 @@ export const paths = {
   runtime: () => join(conductorHome(), 'run'),
   lock: () => join(conductorHome(), 'run', 'lock.json'),
   control: () => join(conductorHome(), 'run', 'control.sock'),
+  /** Model-discovery cache: `<home>/models/<provider>/<account>.json` (M8-1). */
+  models: () => join(conductorHome(), 'models'),
+  /** The one stable, always-emptied working folder every model discovery runs in (M8-1 R2-2/C1). */
+  discovery: () => join(conductorHome(), 'run', 'discovery'),
 };
 /**
  * v2 data folders carry a `home.json` marker. A non-empty folder WITHOUT it is a v1 (or foreign) data folder: v2 refuses to

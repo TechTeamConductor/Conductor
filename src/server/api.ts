@@ -29,6 +29,7 @@ import { inspectRepo } from '../git/worktree.ts';
 import { errMsg, truncate } from '../util.ts';
 import { OpenError, openRun, type ExecFn } from './open.ts';
 import type { Auth } from './auth.ts';
+import type { CatalogView } from '../models/types.ts';
 
 export class ApiFail extends Error {
   status: number;
@@ -64,6 +65,11 @@ export interface ApiDeps {
   /** The Codex isolation canary (spends quota). Absent ⇒ the endpoint answers 501. */
   canary?(id: 'codex'): Promise<CanaryReport>;
   openExec?: ExecFn;
+  /** Model discovery (M8-1). Absent ⇒ the /api/models endpoints answer 501. */
+  models?: {
+    viewAll(): CatalogView[];
+    refresh(provider: ProviderId, trigger?: 'manual'): Promise<CatalogView>;
+  };
 }
 
 const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
@@ -325,6 +331,11 @@ export class Api {
     return { key, repo };
   }
 
+  private modelsSvc(): NonNullable<ApiDeps['models']> {
+    if (!this.d.models) throw new ApiFail(501, 'not_available', 'Model discovery is not available here.');
+    return this.d.models;
+  }
+
   private asksSvc(): AskService {
     if (!this.d.asks) throw new ApiFail(501, 'not_available', 'Quick Ask is not available here.');
     return this.d.asks;
@@ -384,6 +395,7 @@ export class Api {
       if (path === '/api/board') return { json: this.boardView() };
       if (path === '/api/providers') return { json: { providers: this.providers(await this.cachedHealth()) } };
       if (path === '/api/roles') return { json: this.roles() };
+      if (path === '/api/models') return { json: { providers: this.modelsSvc().viewAll() } };
       if (path === '/api/asks') return { json: { asks: this.asksSvc().list() } };
       if ((m = /^\/api\/asks\/([^/]+)$/.exec(path))) {
         const id = safeDecode(m[1]!);
@@ -466,6 +478,18 @@ export class Api {
       return { json: { ok: true } };
     }
     if (method === 'POST' && path === '/api/auth/logout') return { json: { ok: true }, logout: true };
+    if (method === 'POST' && path === '/api/models/refresh') {
+      // S13: strict — a plain object whose only own key may be `provider`, a registry id; an empty body means every provider
+      const svc = this.modelsSvc();
+      if (!isPlain(body) || Object.getPrototypeOf(body) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
+      for (const k of Object.getOwnPropertyNames(body)) if (k !== 'provider') throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      const has = Object.hasOwn(body, 'provider');
+      if (has && !isProviderId(body.provider)) throw new ApiFail(400, 'bad_request', '"provider" must be claude, cursor or codex.');
+      const targets: ProviderId[] = has ? [body.provider as ProviderId] : [...PROVIDER_IDS];
+      // started, never awaited: a hung discovery cannot hold the request (the client polls GET /api/models while `refreshing`)
+      for (const p of targets) void svc.refresh(p, 'manual').catch(() => undefined);
+      return { status: 202, json: { providers: svc.viewAll() } };
+    }
 
     if (method === 'POST' && path === '/api/tasks') {
       const title = str(body.title, 'title', 200).trim();

@@ -99,6 +99,8 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
     canary: opts.canary ?? (async () => ({ verdict: 'inconclusive' as const, items: [{ id: 'setup', outcome: 'inconclusive' as const, detail: 'Codex is not part of the demo.' }], binding: null, ranAt: Date.now() })),
     openExec: async () => undefined,
     notify: () => undefined,
+    // model discovery follows the demo's own scenario (fake CLIs + FAKE_DIR); with injected health it never starts by itself
+    models: { extraEnv: { FAKE_DIR: fakeDir } },
   });
   cfgHolder.current = rt.cfgRef.current;
   const port = await rt.server.listen(opts.port ?? 4318);

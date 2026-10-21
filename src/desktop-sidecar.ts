@@ -31,6 +31,7 @@ async function main(): Promise<void> {
   const port = await rt.server.listen(0);
   lock.update({ port });
   rt.engine.start();
+  rt.warmUp(); // R2-N1: one background zero-quota health read, so model discovery starts without a window asking for health
   const shutdown = async (): Promise<void> => {
     try {
       await rt.close();
