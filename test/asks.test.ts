@@ -124,7 +124,13 @@ test('Quick Ask: limits (per hour, two at once), unknown repo, bad bodies, cance
     await a.idle();
     assert.equal(a.get(r3.id)!.status, 'failed');
     assert.match(a.get(r3.id)!.error!, /usage limit/);
-    assert.throws(() => a.start({ question: 'four' }), (e: any) => e.status === 429 && e.code === 'limit');
+    // M8-3 (AC4): a mid-call limit ends `limited` and REFUNDS the counter (2 of 3 used again), so one more ask fits before the cap
+    assert.equal(a.get(r3.id)!.errorKind, 'limited');
+    assert.equal(a.get(r3.id)!.refunded, true);
+    h.scenario({ claude: { '*': { ask: [{}] } } });
+    a.start({ question: 'four' });
+    await a.idle();
+    assert.throws(() => a.start({ question: 'five' }), (e: any) => e.status === 429 && e.code === 'limit');
   } finally { await h.cleanup(); }
 });
 

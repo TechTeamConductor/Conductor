@@ -12,6 +12,9 @@ import { ROLES, cursorFollowsClaude, defaultRoles, firstReadOnlyProvider, normal
 import type { ProviderId } from './agents/providers/types.ts';
 import { MODEL_ID_BASE_RE, modelIdOk } from './models/sanitize.ts';
 import { PROVIDER_LABEL } from './agents/providers/types.ts';
+import { defaultAccounts, normalizeAccounts } from './accounts/store.ts';
+import { effectiveLimitRule, isLimitRule, type LimitRule } from './accounts/limit-rule.ts';
+import { isCompleteAuto } from './policy/policy.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
@@ -120,14 +123,28 @@ export function legacyModelNotices(cfg: Config): { tool: ProviderId; message: st
   }
   return out;
 }
-export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 6, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5, 5: migrateConfigV5ToV6 } };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'toolModels', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
+/**
+ * v6 → v7 (M8-3 §2.1, D-C): accounts per tool (every tool gets exactly its `default` account = today's sign-in, today's env) and
+ * `pipeline.limitRule = 'switch'`, which with one `default` account per tool is exactly today's chain walk. Idempotent: an existing
+ * `accounts` block / a valid `limitRule` (a hand edit) is kept and normalised later.
+ */
+export function migrateConfigV6ToV7(raw: any): any {
+  const src = isPlainObj(raw) ? raw : {};
+  const pl = isPlainObj(src.pipeline) ? src.pipeline : {};
+  return {
+    ...src,
+    accounts: Object.hasOwn(src, 'accounts') ? src.accounts : defaultAccounts(),
+    pipeline: { ...pl, limitRule: isLimitRule(pl.limitRule) ? pl.limitRule : 'switch' },
+  };
+}
+export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 7, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5, 5: migrateConfigV5ToV6, 6: migrateConfigV6ToV7 } };
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'toolModels', 'accounts', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
 /** Board project keys (also the context store directory names): 2–6 capital letters. */
 export const PROJECT_SETTINGS_KEY_RE = /^[A-Z]{2,6}$/;
 
 export function defaultConfig(): Config {
   return {
-    version: 6,
+    version: 7,
     ui: { port: 4327, openBrowser: true }, // v1 uses 4317: both can run side by side
     repos: [],
     agents: {
@@ -137,6 +154,7 @@ export function defaultConfig(): Config {
     },
     roles: defaultRoles(),
     toolModels: {},
+    accounts: defaultAccounts(),
     projects: Object.create(null),
     pipeline: {
       maxParallel: 2,
@@ -156,6 +174,8 @@ export function defaultConfig(): Config {
       designPerHour: 10,
       policy: 'full-auto',
       verifyEachItem: false,
+      limitRule: 'switch',
+      runMode: 'per-settings',
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
   };
@@ -183,7 +203,7 @@ export function normalizeConfig(input: unknown): Config {
   const withRoles = i.roles === undefined && (i.stages !== undefined || pl.onClaudeLimit !== undefined) ? migrateConfigV3ToV4(i) : i;
   if (v1 && to.idle === 10) to.idle = 15;
   const cfg: Config = {
-    version: 6,
+    version: 7,
     ui: {
       port: clamp(i.ui?.port, 1024, 65535, d.ui.port),
       openBrowser: i.ui?.openBrowser !== false,
@@ -208,6 +228,7 @@ export function normalizeConfig(input: unknown): Config {
     },
     roles: normalizeRoles((withRoles as any).roles, (m) => log.warn(`config roles: ${m}`)),
     toolModels: normalizeToolModels((withRoles as any).toolModels, (m) => log.warn(`config ${m}`)),
+    accounts: normalizeAccounts((withRoles as any).accounts, (m) => log.warn(`config ${m}`)),
     projects: normalizeProjects((withRoles as any).projects),
     pipeline: {
       maxParallel: clamp(pl.maxParallel, 1, 6, d.pipeline.maxParallel),
@@ -227,6 +248,10 @@ export function normalizeConfig(input: unknown): Config {
       designPerHour: clamp(pl.designPerHour, 1, 30, d.pipeline.designPerHour),
       policy: oneOf(pl.policy, ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'] as const, d.pipeline.policy),
       verifyEachItem: pl.verifyEachItem === true,
+      limitRule: oneOf<LimitRule>(pl.limitRule, ['switch', 'same', 'wait'] as const, d.pipeline.limitRule),
+      // M8-4 C3: exact values only; anything else (missing, wrong case, padded, non-string) is Per settings, the safe side
+      runMode: oneOf(pl.runMode, ['per-settings', 'complete-auto'] as const, d.pipeline.runMode),
+      ...(typeof pl.runModeChangedAt === 'number' && Number.isFinite(pl.runModeChangedAt) && pl.runModeChangedAt > 0 ? { runModeChangedAt: pl.runModeChangedAt } : {}),
       timeoutsMin: {
         plan: clamp(to.plan, 1, 240, d.pipeline.timeoutsMin.plan),
         review: clamp(to.review, 1, 120, d.pipeline.timeoutsMin.review),
@@ -295,10 +320,15 @@ function normRepo(r: RepoConfig): RepoConfig {
  * refuse to start and must not write). A corrupt file is kept aside as `config.json.corrupt-<ts>` and defaults are used.
  */
 let backupBeforeNextSave = false;
+/** M8-3 (code review N3): true only when the last load read an EXISTING config file of the current version — the accounts sweep runs only then. */
+let loadedCleanly = false;
+export const configLoadedCleanly = (): boolean => loadedCleanly;
 export function loadConfig(): Config {
+  loadedCleanly = false;
   try {
     const l = loadVersioned<Record<string, any>>(paths.config(), CONFIG_SPEC, () => ({}));
     backupBeforeNextSave = l.existed && l.fromVersion < CONFIG_SPEC.current; // an older file is rewritten in the new shape on the next save → keep the original first
+    loadedCleanly = l.existed && l.fromVersion === CONFIG_SPEC.current;
     return normalizeConfig(l.data);
   } catch (e) {
     if (e instanceof CorruptFileError) {
@@ -341,6 +371,12 @@ export function toSettings(cfg: Config): Settings {
       review: firstReadOnlyProvider(cfg.roles.review.providers),
       verify: firstReadOnlyProvider(cfg.roles.verification.providers),
     },
+    // M8-3 (C1): the stored rule (a settings-view reader, allowed) and the rule the engine applies right now
+    limitRule: cfg.pipeline.limitRule,
+    limitRuleEffective: effectiveLimitRule(cfg),
+    // M8-4 (C4): stored mode, and what it overrides right now (the stored fields above are always reported as stored)
+    runMode: cfg.pipeline.runMode,
+    overriddenByRunMode: isCompleteAuto(cfg) ? ['planApproval', 'policy', 'limitRule'] : [],
   };
 }
 
@@ -394,6 +430,7 @@ export function applySettings(cfg: Config, patch: Partial<Settings>): Config {
       ...(patch.maxLoops !== undefined ? { maxLoops: patch.maxLoops } : {}),
       ...(patch.maxParallel !== undefined ? { maxParallel: patch.maxParallel } : {}),
       ...(patch.noGates !== undefined ? { noGates: patch.noGates } : {}),
+      ...(isLimitRule(patch.limitRule) ? { limitRule: patch.limitRule } : {}),
     },
   });
 }

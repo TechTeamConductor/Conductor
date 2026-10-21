@@ -10,6 +10,8 @@ import type { States } from './routing.ts';
 import type { ProviderId } from './providers/types.ts';
 import type { LimitInfo } from '../types.ts';
 import { truncate } from '../util.ts';
+import type { LimitRule } from '../accounts/limit-rule.ts';
+import type { AccountRef } from '../accounts/types.ts';
 
 export interface CallAgentReq {
   agents: Agents;
@@ -28,6 +30,9 @@ export interface CallAgentReq {
   selRole?: Role;
   /** M8-6 S3: narrowing-only provider filter forwarded to `Agents.readOnly`. */
   onlyProviders?: readonly ProviderId[];
+  /** M8-3 (C1): REQUIRED — `effectiveLimitRule(cfg)` (code review B1); and the per-attempt account callback (removal ⇒ abort). */
+  rule: LimitRule;
+  onCandidate?: (ref: AccountRef) => void;
 }
 export type CallAgentResult =
   | { kind: 'ok'; json: unknown; agent: string; fellBackFrom?: string }
@@ -58,6 +63,8 @@ export async function callAgent(req: CallAgentReq): Promise<CallAgentResult> {
       maxTurnsFactor: turnsFactor,
       ...(req.selRole ? { selRole: req.selRole } : {}),
       ...(req.onlyProviders ? { onlyProviders: req.onlyProviders } : {}),
+      rule: req.rule,
+      ...(req.onCandidate ? { onCandidate: req.onCandidate } : {}),
     });
     if (res.ok) {
       const errs = req.validate(res.json);

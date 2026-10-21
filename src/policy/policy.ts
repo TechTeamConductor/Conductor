@@ -6,12 +6,28 @@ export type Policy = 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-st
 export const POLICIES: readonly Policy[] = ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'];
 export const isPolicy = (v: unknown): v is Policy => typeof v === 'string' && (POLICIES as readonly string[]).includes(v);
 
-/** The effective policy of a project: its own setting, else the legacy `planApproval: manual`, else the global default (`full-auto` = v1 behaviour). */
-export function effectivePolicy(cfg: Config, projectKey: string | null): Policy {
+/**
+ * M8-4 (C2): the global run mode. EXACT equality only — a missing field or any other value (wrong case, padding, non-string) is
+ * Per settings, the safe side.
+ */
+export const isCompleteAuto = (cfg: Config): boolean => cfg?.pipeline?.runMode === 'complete-auto';
+
+/** The STORED policy of a project: its own setting, else the legacy `planApproval: manual`, else the global default (`full-auto` = v1 behaviour). */
+export function storedPolicy(cfg: Config, projectKey: string | null): Policy {
   const own = projectKey ? cfg.projects?.[projectKey]?.policy : undefined;
   if (isPolicy(own)) return own;
   if (cfg.pipeline.planApproval === 'manual') return 'approve-plan';
   return isPolicy(cfg.pipeline.policy) ? cfg.pipeline.policy : 'full-auto';
+}
+
+/** The policy that applies right now: `full-auto` under Complete auto (M8-4 overlay; the stored value is never written), else the stored one. */
+export function effectivePolicy(cfg: Config, projectKey: string | null): Policy {
+  return isCompleteAuto(cfg) ? 'full-auto' : storedPolicy(cfg, projectKey);
+}
+
+/** The legacy per-repo "first plan waits" rule (`planApproval: 'first'`), switched off by Complete auto (it is not a forced hold). */
+export function effectiveFirstPlanHold(cfg: Config, approvedCount: number): boolean {
+  return !isCompleteAuto(cfg) && cfg.pipeline.planApproval === 'first' && approvedCount === 0;
 }
 
 export interface ApprovalInput {
@@ -45,4 +61,17 @@ export function decideApproval(i: ApprovalInput): ApprovalDecision {
   if (i.firstPlanHold) reasons.push('first plan for this repo');
   const auto = reasons.length === 0;
   return { auto, reasons, risks: auto ? [] : risks, forcedHold };
+}
+
+/**
+ * M8-4 N8: did Complete auto make the difference? True when the effective decision is `auto` but the STORED settings (the same forced
+ * inputs, the stored policy and first-plan rule) would have held the plan. Pure: two `decideApproval` calls; forced inputs are the
+ * caller's, unchanged.
+ */
+export function decidedByRunMode(cfg: Config, input: Omit<ApprovalInput, 'policy' | 'firstPlanHold'>, projectKey: string | null, approvedCount: number): boolean {
+  if (!isCompleteAuto(cfg)) return false;
+  const effective = decideApproval({ ...input, policy: effectivePolicy(cfg, projectKey), firstPlanHold: effectiveFirstPlanHold(cfg, approvedCount) });
+  if (!effective.auto) return false;
+  const stored = decideApproval({ ...input, policy: storedPolicy(cfg, projectKey), firstPlanHold: cfg.pipeline.planApproval === 'first' && approvedCount === 0 });
+  return !stored.auto;
 }

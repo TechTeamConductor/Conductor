@@ -6,6 +6,7 @@ import { PROVIDER_LABEL, type AuthResult, type Provider, type ProviderDeps, type
 import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
 import { toolDefaultResolved } from '../../models/select.ts';
+import { childEnv } from '../../accounts/env.ts';
 
 const minutes = (n: number) => n * 60_000;
 /** M5 ceiling for any research session's `--max-turns` (Security S14: asserted below). */
@@ -63,12 +64,19 @@ export function claudeProvider(d: ProviderDeps): Provider {
       const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
       const depth = req.depth === 'deep' ? RESEARCH_DEPTH.deep : RESEARCH_DEPTH.standard;
       if (depth.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('research --max-turns above the ceiling');
-      return runClaude({
-        bin, cwd: req.cwd, prompt: req.prompt, stage: 'plan', name: req.name, schema: req.schema, profile: 'research',
-        maxTurns: depth.maxTurns, isolation: 'safe-mode', model: sel.modelArg, effort: sel.effortArg,
-        env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(depth.hardMin),
-        signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
-      });
+      // M8-3: the account's env (default ⇒ claudeEnv(d.extraEnv), byte-identical); pre-flight + assertion fail closed with zero spawn
+      const ce = childEnv('claude', req.account, d.extraEnv);
+      if (!ce.ok) return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: ce.error };
+      try {
+        return await runClaude({
+          bin, cwd: req.cwd, prompt: req.prompt, stage: 'plan', name: req.name, schema: req.schema, profile: 'research',
+          maxTurns: depth.maxTurns, isolation: 'safe-mode', model: sel.modelArg, effort: sel.effortArg,
+          env: ce.env, idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(depth.hardMin),
+          signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
+        });
+      } finally {
+        ce.release();
+      }
     },
     async runReadOnly(req: ReadOnlyRunReq) {
       const cfg = d.getConfig();
@@ -78,12 +86,18 @@ export function claudeProvider(d: ProviderDeps): Provider {
       const baseTurns = cfg.agents.claude.maxTurns[key];
       const maxTurns = Math.round(baseTurns * (req.maxTurnsFactor ?? 1));
       const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
-      return runClaude({
-        bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema,
-        maxTurns, isolation: cfg.agents.claude.isolation, model: sel.modelArg, effort: sel.effortArg,
-        env: claudeEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
-        signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
-      });
+      const ce = childEnv('claude', req.account, d.extraEnv);
+      if (!ce.ok) return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: ce.error };
+      try {
+        return await runClaude({
+          bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema,
+          maxTurns, isolation: cfg.agents.claude.isolation, model: sel.modelArg, effort: sel.effortArg,
+          env: ce.env, idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
+          signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
+        });
+      } finally {
+        ce.release();
+      }
     },
   };
 }

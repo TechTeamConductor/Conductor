@@ -162,17 +162,18 @@ test('B2b DELETE while sending ⇒ 409; index pruning skips running/sending reco
   } finally { await h.cleanup(); }
 });
 
-test('AC-6.7 cards are untrusted: plan waits for approval under every policy (run modes: M8-4 not landed — policies only)', async () => {
-  // TODO(M8-4): add the run-mode axis (Per settings / Complete auto) once `pipeline.runMode` exists; M8-4's own matrix iterates TAINTED_ACTORS.
-  for (const policy of ['full-auto', 'approve-risky', 'approve-plan', 'manual-stages'] as const) {
-    const h = await makeHarness({ config: (c) => void (c.pipeline.policy = policy) });
+test('AC-6.7 cards are untrusted: plan waits for approval under every policy × both run modes (M8-4), as a forced hold', async () => {
+  for (const runMode of ['per-settings', 'complete-auto'] as const) for (const policy of ['full-auto', 'approve-risky', 'approve-plan', 'manual-stages'] as const) {
+    const h = await makeHarness({ config: (c) => { c.pipeline.policy = policy; c.pipeline.runMode = runMode; } });
     try {
       const { briefs, id } = await ready(h);
       const r = await briefs.send(id, { parts: ['P1'] });
       const key = (r.json as any).keys[0];
       await h.settle();
-      assert.equal(h.run(key).untrusted, true, policy);
-      assert.equal(h.run(key).status, 'awaiting_approval', policy);
+      const where = `${runMode} ${policy}`;
+      assert.equal(h.run(key).untrusted, true, where);
+      assert.equal(h.run(key).status, 'awaiting_approval', where);
+      assert.equal(h.run(key).forcedHold, true, where);
     } finally { await h.cleanup(); }
   }
 });

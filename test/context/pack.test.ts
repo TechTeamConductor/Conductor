@@ -184,7 +184,7 @@ test('live facts are computed from git at the given commit; a repeat costs two g
 // ───────────────────────── config v5 ─────────────────────────
 
 test('config v5: per-project settings are validated — keys are project keys, own properties only, every value clamped; v4 files migrate to an empty set', () => {
-  assert.equal(defaultConfig().version, 6); // M8-2: config v6
+  assert.equal(defaultConfig().version, 7); // M8-3: config v7 (M8-2 took v6)
   assert.deepEqual({ ...defaultConfig().projects }, {});
   assert.deepEqual({ ...migrateConfigV4ToV5({ version: 4, pipeline: {} }).projects }, {});
   assert.deepEqual(migrateConfigV4ToV5({ projects: [1] }).projects, {});

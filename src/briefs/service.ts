@@ -15,6 +15,7 @@ import { join, resolve, sep } from 'node:path';
 import type { Agents } from '../agents/provider.ts';
 import { callAgent } from '../agents/caller.ts';
 import { route, type States } from '../agents/routing.ts';
+import { effectiveLimitRule } from '../accounts/limit-rule.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { Config, LimitInfo, RepoConfig } from '../types.ts';
 import { GitReader } from '../context/gitread.ts';
@@ -93,13 +94,15 @@ export interface BriefDeps {
   };
   /** M8-3 accounts gate (absent until M8-3 lands ⇒ the route/pause fallback, C3). */
   accountsGate?: (role: 'requirements' | 'context') => { ok: true } | { ok: false; retryAt: number | null; message: string };
+  /** M8-3 (code review B1): record a usage-limit pause on the account a mid-call hop left. */
+  accountPause?: (ref: { provider: import('../agents/providers/types.ts').ProviderId; id: string }, until: number, reason: string) => void;
   /** Test seam: called at named points (`send:after-card-<n>`); a test may throw. */
   fault?: (point: string) => void;
   /** Scratch parent (default `os.tmpdir()`); snapshot/scratch dirs are made here with the owned prefix. */
   scratchParent?: string;
 }
 
-interface Running { ac: AbortController; promise: Promise<void>; scratch: string | null }
+interface Running { ac: AbortController; promise: Promise<void>; scratch: string | null; /** M8-3: the account of the current attempt (removal ⇒ abort) */ account?: string; removed?: boolean }
 
 export class BriefService {
   private d: BriefDeps;
@@ -213,7 +216,7 @@ export class BriefService {
     };
   }
   /** End states shared by both kinds. `refundable` ⇒ a structural limit end (S11): the counter this brief took is given back once. */
-  private fail(id: string, why: string, secrets: string[], opts: { kind?: 'limited' | 'failed' | 'interrupted'; retryAt?: number | null; events?: string[] } = {}): void {
+  private fail(id: string, why: string, secrets: string[], opts: { kind?: 'limited' | 'failed' | 'interrupted'; retryAt?: number | null; events?: string[]; refund?: boolean } = {}): void {
     this.patch(id, (r) => {
       r.status = 'failed';
       r.error = truncate(redact(sanitizeLine(why, BRIEF_LIMITS.error), secrets), BRIEF_LIMITS.error);
@@ -221,13 +224,32 @@ export class BriefService {
       if (opts.retryAt !== undefined) r.retryAt = opts.retryAt;
       for (const s of r.steps) if (s.state === 'running') s.state = 'failed';
       if (opts.events) r.events = opts.events;
-      if (opts.kind === 'limited' && r.takenKey && !r.refunded) {
+      if ((opts.kind === 'limited' || opts.refund === true) && r.takenKey && !r.refunded) {
         refund('designPerHour', { key: r.takenKey });
         r.refunded = true;
       }
     });
   }
+  /** M8-3 (code review B1): a mid-call hop past a limited account records that ACCOUNT's pause (later stages and asks skip it). */
+  private pauseFromLimit(l: LimitInfo): void {
+    if (!l.account || !this.d.accountPause) return;
+    const now = this.now();
+    this.d.accountPause({ provider: l.provider, id: l.account }, l.resetsAt && l.resetsAt > now ? l.resetsAt : now + 15 * 60_000, l.message);
+  }
+  /** M8-3 S8 step 2: abort and await every brief call running on a removed account; each ends failed "the account was removed", refunded. */
+  async abortAccount(ref: { provider: string; id: string }): Promise<number> {
+    const k = `${ref.provider}:${ref.id}`;
+    const hit = [...this.running.values()].filter((r) => r.account === k);
+    for (const r of hit) {
+      r.removed = true;
+      r.ac.abort();
+    }
+    await Promise.allSettled(hit.map((r) => r.promise));
+    return hit.length;
+  }
   private aborted(id: string, secrets: string[]): void {
+    const run = this.running.get(id);
+    if (run?.removed) return this.fail(id, 'The account this was running on was removed. Try again to run it on another account.', secrets, { kind: 'failed', refund: true }); // code review N5: refunded, but not a limit
     if (this.closing) return this.fail(id, 'Interrupted: Conductor was shut down while this brief was being written.', secrets, { kind: 'interrupted' });
     const r = loadBrief(id);
     if (r && r.status === 'running') this.markCanceled(r);
@@ -285,7 +307,7 @@ export class BriefService {
       let lastErrs: string[] = [];
       let validations = 0;
       const out = await callAgent({
-        agents: this.d.agents, role: 'requirements', states: this.d.routeStates(), prompt, schema: WORK_BRIEF_SCHEMA, cwd: snap.dir,
+        agents: this.d.agents, role: 'requirements', states: this.d.routeStates(), prompt, schema: WORK_BRIEF_SCHEMA, cwd: snap.dir, rule: effectiveLimitRule(this.d.getConfig()), onLimit: (l) => this.pauseFromLimit(l), onCandidate: (ref) => void (run.account = `${ref.provider}:${ref.id}`),
         validate: (j) => { validations++; lastErrs = validateWorkBrief(j); return lastErrs; },
         secrets, signal: ac.signal, name: `conductor design ${id}`, onEvent: this.eventSink(events, secrets),
       });
@@ -321,6 +343,7 @@ export class BriefService {
       } else if (out.kind === 'aborted') {
         this.aborted(id, secrets);
       } else if (out.kind === 'paused') {
+        this.pauseFromLimit(out.limit); // M8-3: the limited account is paused (later calls skip it)
         this.fail(id, this.limitedWhy(out.limit), secrets, { kind: 'limited', retryAt: out.limit.resetsAt, events });
       } else if (out.kind === 'offline') {
         this.fail(id, 'There is no network right now — try again when it is back.', secrets, { events });
@@ -353,7 +376,7 @@ export class BriefService {
       let lastErrs: string[] = [];
       let validations = 0;
       const out = await callAgent({
-        agents: this.d.agents, role: 'context', selRole: RESEARCH_BRIEF_SEL_ROLE, onlyProviders: RESEARCH_BRIEF_PROVIDERS, states: this.d.routeStates(), prompt, schema: RESEARCH_BRIEF_SCHEMA, cwd: scratch,
+        agents: this.d.agents, role: 'context', selRole: RESEARCH_BRIEF_SEL_ROLE, onlyProviders: RESEARCH_BRIEF_PROVIDERS, states: this.d.routeStates(), prompt, schema: RESEARCH_BRIEF_SCHEMA, cwd: scratch, rule: effectiveLimitRule(this.d.getConfig()), onLimit: (l) => this.pauseFromLimit(l), onCandidate: (ref) => void (run.account = `${ref.provider}:${ref.id}`),
         validate: (j) => { validations++; lastErrs = validateResearchBrief(j, rec0.line); return lastErrs; },
         secrets, signal: ac.signal, name: `conductor research brief ${id}`, onEvent: this.eventSink(events, secrets),
       });
@@ -364,6 +387,7 @@ export class BriefService {
       } else if (out.kind === 'aborted') {
         this.aborted(id, secrets);
       } else if (out.kind === 'paused') {
+        this.pauseFromLimit(out.limit); // M8-3: the limited account is paused (later calls skip it)
         this.fail(id, this.limitedWhy(out.limit), secrets, { kind: 'limited', retryAt: out.limit.resetsAt, events });
       } else if (out.kind === 'offline') {
         this.fail(id, 'There is no network right now — try again when it is back.', secrets, { events });

@@ -28,6 +28,18 @@ export function isBuildIsolationVerified(id: ProviderId): boolean {
   return buildBaseline(id)?.grandfathered === true;
 }
 
+/**
+ * M8-3 D-G / Security S17: the grandfathered Cursor no-push baseline was proven with the REAL HOME and config. A named Cursor account runs with
+ * its own private HOME — a changed isolation profile — so it may NOT build until L5 (cursor-nopush under an account HOME, plus a loosened
+ * cli-config.json variant) passes. This flips ONLY in its own commit, reviewed by Security. It is a code constant, never a runtime record.
+ */
+export const CURSOR_ACCOUNT_HOME_BUILD_VERIFIED = false;
+/** May this (tool, account) build? The default account: always (its tool's own build gate applies as today). Named: never for Claude/Codex. */
+export function accountBuildOk(id: ProviderId, isDefault: boolean): boolean {
+  if (isDefault) return true;
+  return id === 'cursor' && CURSOR_ACCOUNT_HOME_BUILD_VERIFIED;
+}
+
 /** The read-only isolation tier each provider ships with (code constants; a later commit adds the add-only canary result for Codex). */
 export type ReadOnlyTier = 'verified' | 'partial' | 'unverified' | 'blocked';
 const TIERS: Readonly<Partial<Record<ProviderId, ReadOnlyTier>>> = Object.freeze({

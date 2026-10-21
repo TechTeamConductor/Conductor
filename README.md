@@ -82,6 +82,10 @@ Every job has a **role** (planning, review, verification, implementation, debugg
 - **Usage limits are handled:** when Claude says "weekly limit", **Cursor takes over the read-only stages automatically** (setting `onClaudeLimit`); repeated limits back off (15 min → 6 h).
 - **Which Claude?** Conductor calls the `claude` command-line tool, which is signed in separately from the Claude desktop app. `npm run doctor` shows which account and plan it uses.
 
+## Several accounts per tool (M8-3)
+
+Settings → "Accounts and limits", or `conductor accounts list | add <claude|cursor> --name "Work" | check [<id>] | move <id> up|down | remove <id> [--keep-signin]`. Your own sign-in is the `default` account and nothing changes for it. At a usage limit, Conductor moves to the next account, then to the next tool, but only to a tool that is in that job's list. You can change this to "same tool only" or "wait". Signing extra accounts in (`conductor accounts login <id>`) is not enabled yet: it waits for a live check. Read "Accounts per tool" in `docs/ARCHITECTURE.md` before you add one.
+
 ## Commands
 
 ```

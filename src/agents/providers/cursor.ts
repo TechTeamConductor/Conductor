@@ -8,6 +8,8 @@ import { PROVIDER_LABEL, type AuthResult, type BuildPrep, type BuildRunReq, type
 import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
 import { toolDefaultResolved } from '../../models/select.ts';
+import { assertAccountEnv, AccountIsolationError, accountEnv, childEnv, dropForNamedBuild, isNamed, isolationMessage } from '../../accounts/env.ts';
+import { acquireAccount } from '../../accounts/profile.ts';
 
 const minutes = (n: number) => n * 60_000;
 
@@ -45,11 +47,17 @@ export function cursorProvider(d: ProviderDeps): Provider {
       if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.` };
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
       const sel = req.sel && req.sel.tool === 'cursor' ? req.sel : toolDefaultResolved(cfg, 'cursor'); // a selection for another tool is never applied here (CR-N2)
-      return runCursor({
-        bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema, mode: 'ask',
-        model: sel.modelArg, env: cursorEnv(d.extraEnv), idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
-        signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
-      });
+      const ce = childEnv('cursor', req.account, d.extraEnv, (text) => req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text }));
+      if (!ce.ok) return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: ce.error };
+      try {
+        return await runCursor({
+          bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema, mode: 'ask',
+          model: sel.modelArg, env: ce.env, idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
+          signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
+        });
+      } finally {
+        ce.release();
+      }
     },
     build: {
       guard: true,
@@ -65,12 +73,34 @@ export function cursorProvider(d: ProviderDeps): Provider {
           return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Cursor CLI "${cfg.agents.cursor.bin}" not found. Install it (curl https://cursor.com/install -fsS | bash) or set agents.cursor.bin.` };
         }
         const sel = req.sel && req.sel.tool === 'cursor' ? req.sel : toolDefaultResolved(cfg, 'cursor'); // a selection for another tool is never applied here (CR-N2)
-        return runCursor({
-          bin, cwd: req.cwd, prompt: req.prompt, stage: 'build', name: req.name, mode: 'build',
-          model: sel.modelArg, env: cursorEnv({ ...d.extraEnv, ...req.env }),
-          idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin.build),
-          signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
-        });
+        // M8-3 (B5, S1, R2-1): default ⇒ today's exact composition. Named ⇒ the account env (pre-flight inside), then the envelope-resolved
+        // fragment, then the envelope's git env with HOME/CURSOR_*/AGENT_CLI_*/XDG_* dropped; the BINDING assertion runs on the final env.
+        let env: Record<string, string>;
+        let release = () => undefined as void;
+        try {
+          if (isNamed(req.account)) {
+            env = { ...accountEnv('cursor', req.account, d.extraEnv), ...(req.accountEnv ?? {}), ...dropForNamedBuild(req.env) };
+            assertAccountEnv('cursor', req.account, env);
+            release = acquireAccount(req.account);
+          } else {
+            env = cursorEnv({ ...d.extraEnv, ...req.env });
+            if (req.accountEnv !== undefined) throw new AccountIsolationError('an added account setting on the main account');
+            assertAccountEnv('cursor', req.account, env);
+          }
+        } catch (e) {
+          const cls = e instanceof AccountIsolationError ? e.cls : 'an account folder that could not be checked';
+          return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: isolationMessage('added Cursor', cls) };
+        }
+        try {
+          return await runCursor({
+            bin, cwd: req.cwd, prompt: req.prompt, stage: 'build', name: req.name, mode: 'build',
+            model: sel.modelArg, env,
+            idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin.build),
+            signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
+          });
+        } finally {
+          release();
+        }
       },
       verifyGuard(prep, { worktree }) {
         return W.checkCursorGuard(worktree, prep.guardSha);

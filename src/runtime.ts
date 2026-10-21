@@ -3,7 +3,7 @@ import { BriefService, type BriefDeps } from './briefs/service.ts';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Config, Run } from './types.ts';
-import { defaultConfig, loadConfig, loadState, normalizeConfig, resolveBin, saveConfig, saveState, type PersistentState } from './config.ts';
+import { configLoadedCleanly, defaultConfig, loadConfig, loadState, normalizeConfig, resolveBin, saveConfig, saveState, type PersistentState } from './config.ts';
 import { ensureHome, paths } from './paths.ts';
 import { RunStore } from './store.ts';
 import { Board } from './board/index.ts';
@@ -18,7 +18,11 @@ import { defaultSecretStore, dropSecret, type SecretStore } from './secrets.ts';
 import { notify as osNotify } from './notify.ts';
 import type { ExecFn } from './server/open.ts';
 import { ModelService, type ModelServiceDeps } from './models/service.ts';
+import { claudeEnv, cursorEnv } from './agents/env.ts';
 import { logger } from './log.ts';
+import { AccountService } from './accounts/service.ts';
+import { effectiveLimitRule } from './accounts/limit-rule.ts';
+import { DEFAULT_ACCOUNT } from './accounts/types.ts';
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 export const VERSION = '0.2.0-dev';
@@ -57,6 +61,8 @@ export interface Runtime {
   server: DashboardServer;
   /** Model discovery (absent when `models: false`). */
   models: ModelService | null;
+  /** M8-3: accounts per tool (the shared strict handlers of the API, the control socket and the CLI). */
+  accounts: AccountService;
   /**
    * One background, zero-quota health read (R2-N1): `conductor start` and the desktop sidecar call it after `listen`, so a headless start
    * still discovers models. Never awaited by anything; never throws.
@@ -69,9 +75,11 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   ensureHome();
   const cfgRef = { current: opts.config ?? (opts.ephemeral ? normalizeConfig(defaultConfig()) : loadConfig()) };
   const getConfig = () => cfgRef.current;
+  // M8-4 B1: persist FIRST, then swap memory. A failed write (assertNotNewer, pre-upgrade backup, disk) throws before the swap, so memory
+  // and disk always agree and a refused save changes nothing (every writer: settings, roles, projects, run mode).
   const save = (c: Config) => {
-    cfgRef.current = c;
     if (!opts.ephemeral) saveConfig(c);
+    cfgRef.current = c;
   };
   const store = new RunStore(paths.runs());
   const ownBoard = !opts.board;
@@ -87,15 +95,29 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     serverRef?.toast('info', `${t}: ${m}`);
   };
   const mlog = logger('models');
+  // M8-3: the account service is created below; discovery reaches it lazily (envFor = accountEnv + pre-flight + assertion; S9 lease)
+  let accountsRef: AccountService | null = null;
+  const discoveryExtra = (opts.models ? opts.models.extraEnv : undefined) ?? {};
   const models = opts.models === false ? null : new ModelService({
     getConfig,
     extraEnv: {},
     bins: () => ({ claude: resolveBin(getConfig().agents.claude.bin), cursor: resolveBin(getConfig().agents.cursor.bin) }),
     log: mlog,
+    // default ⇒ claudeEnv/cursorEnv(extraEnv) exactly as M8-1; named ⇒ the account env (never before the service exists)
+    envFor: (p, a) => {
+      if (!accountsRef) {
+        if (a !== DEFAULT_ACCOUNT) throw new Error('accounts are not ready');
+        return accountEnvDefault(p, discoveryExtra);
+      }
+      return accountsRef.envFor(p, a, discoveryExtra);
+    },
+    accountIds: (p) => (p === 'codex' ? [DEFAULT_ACCOUNT] : (getConfig().accounts?.[p] ?? []).map((m) => m.id)),
+    afterDiscovery: (p, a) => accountsRef?.afterDiscovery(p, a),
     ...(opts.models ?? {}),
   });
   // M8-2: stage argv is resolved against the discovered lists (memory-only view, never awaited) and a CLI-rejected --model asks for a refresh
-  if (models) agents.attachModels({ catalog: (t) => models.view(t), onUnknownModel: (t) => models.noteUnknownModel(t) });
+  // M8-3: per ACCOUNT (the M8-1 cache is keyed (provider, account); `default.json` carries over unchanged)
+  if (models) agents.attachModels({ catalog: (t, a) => (a === undefined ? models.view(t) : models.view(t, a)), onUnknownModel: (t, a) => (a === undefined ? models.noteUnknownModel(t) : models.noteUnknownModel(t, a)) });
   // automatic discovery only when health is REAL (B1): an injected health (tests, demo) never starts a discovery by itself
   const autoDiscovery = !!models && !opts.health;
   const engine = new Engine({ getConfig, setConfig: save, store, board, agents, notify, persistent, secrets: () => [], offlineFetcher: globalThis.fetch as any });
@@ -123,7 +145,11 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     }
     return { ...agentsNow, warnings };
   };
-  const asks = new AskService({ getConfig, agents, routeStates: () => engine.routeStates(), freshHealth: () => engine.freshHealth(), secrets: () => [],
+  const asks = new AskService({ getConfig, agents, routeStates: (role) => engine.routeStates(role), freshHealth: () => engine.freshHealth(), secrets: () => [],
+    accountsGate: (role) => engine.accountsGate(role),
+    limitRule: () => effectiveLimitRule(getConfig()),
+    accountPause: (ref, until, reason) => engine.recordAccountPause(ref, until, reason),
+    notify,
     networkState: () => engine.probe.check(),
     fastPathBusy: (repo) => store.list().some((r) => r.fastPath && r.repo === repo && !['ready', 'finished', 'aborted', 'needs_human'].includes(r.status)),
     cards: { create: (i) => { const p = engine.ensureProjectForRepo(i.repo); const it = board.createItem({ projectId: p.id, title: i.title, description: i.description, kind: 'work', lane: 'todo', idemKey: i.idemKey }, i.actor); engine.tickSoon(); return { key: it.key }; } } });
@@ -137,11 +163,33 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     networkState: () => engine.probe.check(),
     asks,
     cards: designCards(engine, board, getConfig),
+    accountPause: (ref, until, reason) => engine.recordAccountPause(ref, until, reason),
+    // M8-3 / M8-6 C3: a Home call never queues — only a LIMIT pause refuses here (409 limited + retryAt); other routing refusals keep M8-6's checks
+    accountsGate: (role) => {
+      const g = engine.accountsGate(role);
+      return g.ok || g.kind !== 'paused' ? { ok: true } : { ok: false, retryAt: g.retryAt, message: `${g.reason} — try again after the limit resets.` };
+    },
   });
   briefs.sweepScratch();
   briefs.failInterrupted();
   void briefs.resumeSending();
+  const accounts = new AccountService({
+    getConfig,
+    saveConfig: save,
+    engine,
+    ...(models ? { models } : {}),
+    health: () => lastHealth?.value ?? null,
+    extraEnv: discoveryExtra,
+    abortCalls: async (ref) => (await asks.abortAccount(ref)) + (await briefs.abortAccount(ref)),
+  });
+  accountsRef = accounts;
+  // code review N3: never sweep account folders after a config recovery (quarantined, missing, migrated or injected config) — they may hold
+  // live sign-ins that the restored config would still name
+  if (!opts.ephemeral && !opts.config && configLoadedCleanly()) accounts.sweep();
+  // N6: every named account is checked at startup (M8-1's serialised queue); each completion invalidates + ticks the engine
+  if (models && Object.values(getConfig().accounts ?? {}).some((l) => l.some((m) => m.id !== DEFAULT_ACCOUNT))) void accounts.checkAll();
   const apiRef = new Api({
+    accounts,
     asks,
     briefs,
     engine,
@@ -161,7 +209,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   const server = new DashboardServer({ api: apiRef, auth, store, engine, uiDir: opts.uiDir ?? join(ROOT, 'ui') });
   serverRef = server;
   return {
-    cfgRef, engine, store, board, api: apiRef, auth, server, models,
+    cfgRef, engine, store, board, api: apiRef, auth, server, models, accounts,
     warmUp() {
       void readAgents()
         .then((v) => {
@@ -179,6 +227,10 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   };
 }
 export { dropSecret };
+
+function accountEnvDefault(p: 'claude' | 'cursor', extra: Record<string, string>): Record<string, string> {
+  return p === 'claude' ? claudeEnv(extra) : cursorEnv(extra);
+}
 
 /**
  * The ONLY writer of `design` cards (S9): the actor is fixed here, and the facade passes exactly kind work / lane todo / parentId null /

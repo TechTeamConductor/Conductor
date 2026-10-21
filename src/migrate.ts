@@ -231,6 +231,9 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
     if (!v1Config || typeof v1Config !== 'object' || Array.isArray(v1Config)) throw new MigrateError('bad_config', `${cfgPath} is not a JSON object; nothing was changed.`);
   }
   const cfg = normalizeConfig(loadVersionedInMemory(v1Config, cfgPath));
+  // M8-4 N2: imported data is untrusted input — a hand-edited file never arrives with Complete auto on (turning it on needs PUT /api/run-mode + confirm)
+  cfg.pipeline.runMode = 'per-settings';
+  delete cfg.pipeline.runModeChangedAt;
   report.repos = cfg.repos.map((r) => r.name);
   report.willRun = willRun(cfg.repos, cfg.agents);
   let v1State: any = {};

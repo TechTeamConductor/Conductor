@@ -38,7 +38,7 @@ const without = (a: string[]): string[] => {
 async function ro(h: Harness, o: { role: any; key: string; selRole?: any; toolDefaultOnly?: true; states?: States; secrets?: string[]; events?: EmitEvent[] }) {
   return h.agents.readOnly({
     role: o.role, stage: 'plan', cwd: h.repoDir, prompt: `# Stage: PLAN\nIssue key: ${o.key}\nTitle: sel`, schema, name: `conductor ${o.key} plan`,
-    onEvent: (e) => o.events?.push(e), states: o.states ?? h.engine.routeStates(), secrets: o.secrets ?? [],
+    onEvent: (e) => o.events?.push(e), states: o.states ?? h.engine.routeStates(), secrets: o.secrets ?? [], rule: 'switch',
     ...(o.selRole ? { selRole: o.selRole } : {}), ...(o.toolDefaultOnly ? { toolDefaultOnly: true as const } : {}),
   });
 }

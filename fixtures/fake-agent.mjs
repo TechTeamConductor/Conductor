@@ -6,6 +6,13 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, 
 import { dirname, join, resolve } from 'node:path';
 
 const argv = process.argv.slice(2);
+// M8-3: a named Cursor account is HOME=<home>/accounts/cursor/<id> + the file store (tests only)
+const acct = process.env.AGENT_CLI_CREDENTIAL_STORE === 'file' && /\/accounts\/cursor\/[^/]+$/.test(process.env.HOME ?? '') ? (process.env.HOME ?? '').split('/').pop() : 'default';
+if (argv[0] === 'logout' || argv[0] === 'login') {
+  const d = process.env.FAKE_DIR || '';
+  if (d) { mkdirSync(d, { recursive: true }); appendFileSync(join(d, 'calls.jsonl'), JSON.stringify({ who: 'cursor', mode: argv[0], argv, acct, acctEnv: { HOME: process.env.HOME ?? null, AGENT_CLI_CREDENTIAL_STORE: process.env.AGENT_CLI_CREDENTIAL_STORE ?? null, CURSOR_CONFIG_DIR: process.env.CURSOR_CONFIG_DIR ?? null }, at: Date.now() }) + '\n'); }
+  process.exit(0);
+}
 if (argv.includes('--version')) {
   console.log('2026.10.19-fake');
   process.exit(0);
@@ -107,7 +114,7 @@ const list = mine[slot];
 const step = Array.isArray(list) ? (list[Math.min(idx, list.length - 1)] ?? {}) : {};
 
 if (dir) {
-  appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'cursor', argv, stage: slot, key, idx, cwd: process.cwd(), workspace, envKeys: Object.keys(process.env), env: pickEnv(), promptBytes: prompt.length }) + '\n');
+  appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'cursor', argv, stage: slot, key, idx, cwd: process.cwd(), workspace, envKeys: Object.keys(process.env), env: pickEnv(), acct, acctEnv: { HOME: process.env.HOME ?? null, AGENT_CLI_CREDENTIAL_STORE: process.env.AGENT_CLI_CREDENTIAL_STORE ?? null, CURSOR_CONFIG_DIR: process.env.CURSOR_CONFIG_DIR ?? null }, promptBytes: prompt.length }) + '\n');
   if (step.savePrompt || process.env.FAKE_SAVE_PROMPTS) writeFileSync(join(dir, `prompt-cursor-${key}-${slot}-${idx}.txt`), prompt);
 }
 function pickEnv() {

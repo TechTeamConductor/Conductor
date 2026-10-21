@@ -326,11 +326,27 @@
     return n('opened') + ' opened · ' + n('listed') + ' listed · ' + n('unverified') + ' unverified';
   }
 
+  /** M8-3: the limit rule, in the words the Settings panel and the accounts popover use (N7: "only if it is in that job's list"). */
+  const LIMIT_RULE_LABEL = { switch: 'Next account, then another tool', same: 'Next account of the same tool', wait: 'Wait for the first account' };
+  const LIMIT_RULE_HINT = {
+    switch: 'At a usage limit, work moves to the next account of the same tool, then to another tool only if it is in that job\'s list.',
+    same: 'At a usage limit, work moves to the next account of the same tool. It never moves to another tool.',
+    wait: 'At a usage limit, work waits for the first account of the tool to reset.',
+  };
+  /** N5: a chip says "Switched" only for a limit move; any other move (signed out, missing, removed) says what it was. */
+  function movedChip(m) {
+    if (!m || typeof m !== 'object') return null;
+    if (m.reason === 'limit') return { label: m.restarted ? 'Restarted on next account' : 'Switched', title: String(m.note || '') };
+    if (m.reason === 'removed') return { label: 'Restarted', title: String(m.note || '') };
+    return { label: 'Moved', title: String(m.note || '') };
+  }
+
   const deepFreeze = (o) => { if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const k of Object.keys(o)) deepFreeze(o[k]); } return o; };
   globalThis.ConductorModes = deepFreeze({
     detectMode, MODE_META, NONE, noneAllowed, matchRepo, resolveRepo, taskFromText, TITLE_MAX,
     ROLE_ROWS, leadOf, setLead, roleEdit, rolesPatch, acksNeeded, withAck, safeHttp, safeAttr, toolJobs, colHints, flowText,
     selFields, selOf, sameSel, withSel, moreNote,
     RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
+    LIMIT_RULE_LABEL, LIMIT_RULE_HINT, movedChip,
   });
 })();

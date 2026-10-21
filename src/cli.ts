@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { AgentHealth } from './types.ts';
-import { loadConfig, resolveBin } from './config.ts';
+import { loadConfig, resolveBin, saveConfig } from './config.ts';
 import { runCodexCanary } from './agents/providers/canary.ts';
 import { addRecord } from './agents/providers/verification.ts';
 import { CURSOR_GUARD_JSON } from './git/worktree.ts';
@@ -20,6 +20,8 @@ import { agentHealth, isolationProbe, probe, runChecks } from './doctor.ts';
 import { installService, serviceStatus, uninstallService, plistPath } from './service.ts';
 import { startDemo } from './demo.ts';
 import { errMsg, sha256 } from './util.ts';
+import { accountsCli, socketClient } from './accounts/cli.ts';
+import { AccountService } from './accounts/service.ts';
 
 const log = logger('cli');
 const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,6 +45,7 @@ Usage: conductor <command>
   service uninstall  remove the background service
   service status
   models             show the models each tool offers   [--refresh] [--json]
+  accounts           more sign-ins per tool: list | add | login | check | move | remove   (conductor accounts help)
   migrate            import a Conductor v1 data folder into a NEW v2 folder, side by side   [--from <dir>] [--to <dir>] [--apply]
   uninstall          remove the background service   [--purge removes the data folder]
   version
@@ -99,6 +102,8 @@ async function main(): Promise<void> {
       return migrateCmd();
     case 'models':
       return modelsCmd();
+    case 'accounts':
+      return accountsCmd();
     case 'uninstall':
       return uninstall();
     default:
@@ -169,7 +174,14 @@ async function start(): Promise<void> {
     process.exit(1);
   }
   lock.update({ port });
-  await rt.server.listenControl(paths.control());
+  try {
+    await rt.server.listenControl(paths.control());
+  } catch (e) {
+    // S11 / code review N2: a run folder that is not private ⇒ NO control socket (the dashboard still starts); `conductor accounts` then refuses
+    // (its direct mode cannot take the lock this server holds), so there is never a second config writer
+    log.warn(`control socket not opened: ${errMsg(e)}`);
+    console.error(`Note: the control socket was not opened (${errMsg(e)}). \`conductor open\` and \`conductor accounts\` cannot reach this server until the folder is fixed.`);
+  }
   rt.engine.start();
   rt.warmUp(); // R2-N1: one background zero-quota health read, so a headless start discovers models too
   const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
@@ -230,6 +242,31 @@ async function modelsCmd(): Promise<void> {
   } finally {
     lock.release();
   }
+}
+
+/** M8-3 §2.8 / S13: through the running server's control socket, or directly under the lock (held for the whole command). */
+async function accountsCmd(): Promise<void> {
+  assertHomeIsUsable();
+  ensureHome();
+  configureLog({ level: 'error' });
+  const running = readLock();
+  const control = running && existsSync(paths.control()) ? socketClient(paths.control()) : null;
+  const code = await accountsCli(argv.slice(1), {
+    control,
+    direct: async () => {
+      const lock = acquireLock(paths.lock()); // LockHeldError ⇒ a server started meanwhile: the command fails, nothing is written
+      let cfg = loadConfig();
+      let ref: AccountService | null = null;
+      // discovery for a named account gets the account env (pre-flight + assertion) and holds its S9 lease until the child was reaped
+      const models = new ModelService({ getConfig: () => cfg, envFor: (p, a) => ref!.envFor(p, a), afterDiscovery: (p, a) => ref?.afterDiscovery(p, a) });
+      const svc = new AccountService({ getConfig: () => cfg, saveConfig: (c) => { saveConfig(c); cfg = c; }, models });
+      ref = svc;
+      return { svc, release: () => { models.stop(); lock.release(); } };
+    },
+    out: (l) => console.log(l),
+    err: (l) => console.error(l),
+  });
+  process.exitCode = code;
 }
 
 async function openCmd(): Promise<void> {

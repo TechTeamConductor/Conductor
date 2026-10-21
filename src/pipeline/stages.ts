@@ -19,7 +19,7 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
-import { decideApproval, effectivePolicy } from '../policy/policy.ts';
+import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectivePolicy } from '../policy/policy.ts';
 import { projectKeyOf } from '../context/service.ts';
 import { buildGraph, graphBudgets, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
 import { GraphBuilder } from './graph-build.ts';
@@ -30,6 +30,7 @@ import type { Role } from '../agents/roles.ts';
 import type { Consumer } from '../context/pack.ts';
 import { OFFLINE_EPISODE_CAP, OFFLINE_RUN_CEILING_MS, backoffFor } from '../net/offline.ts';
 import { route } from '../agents/routing.ts';
+import { DEFAULT_ACCOUNT, type AccountRef } from '../accounts/types.ts';
 import type { PipelineCtx } from './context.ts';
 import { ITEM_NOTE_SCHEMA, PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
@@ -39,7 +40,7 @@ const PROTECTED = '.claude/**, .cursor/**, .codex/**, .agents/**, .mcp.json, AGE
 
 type ReadOnlyStage = 'plan' | 'plan_review' | 'verify';
 /** What a read-only call asks the run to do when it cannot continue (applied at once, or deferred so concurrent calls make ONE transition). */
-export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo } | { type: 'offline'; message: string };
+export type Hold = { type: 'human'; reason: string; origin: NextStep } | { type: 'pause'; limit: LimitInfo; role?: Role } | { type: 'offline'; message: string };
 type Called = { kind: 'ok'; json: unknown; result: AgentResult; agent: ProviderId } | { kind: 'stop'; hold?: Hold };
 
 /** Eligibility for the Quick Ask fast path is decided on the PLANNER's plan: small, ≤ 3 files, plain relative paths, nothing protected or secret-looking. */
@@ -106,7 +107,7 @@ export class Stages {
       patch: (k, fn) => this.patch(k, fn),
       note: (k, st, t) => this.note(k, st, t),
       toNeedsHuman: (k, reason, origin, comment) => this.toNeedsHuman(k, reason, origin, comment),
-      pauseForLimit: (k, l) => this.pauseForLimit(k, l),
+      pauseForLimit: (k, l, role) => this.onLimitHit(k, l, role),
       finishSession: (k, res) => this.finishSession(k, res),
       refundIfLimit: (k, res) => this.refundIfLimit(k, res),
       emitter: (k, st, loop, rev) => this.emitter(k, st, loop, rev),
@@ -227,48 +228,95 @@ export class Stages {
     this.c.notify(`${key} needs you`, truncate(reason, 160));
   }
 
-  /** A candidate hit a usage limit but the chain moved on: remember the pause so later stages skip that provider until it resets. */
+  /** A candidate hit a usage limit but the chain moved on: remember the pause (on THAT account) so later stages skip it until it resets. */
   recordLimitPause(limit: LimitInfo): void {
+    // the account comes from the candidate the CALLER ran, never from provider output (§2.3); a missing one is a programming error
+    if (!limit.account) throw new Error('usage-limit pause without an account');
     const now = this.c.clock.now();
     const until = limit.resetsAt && limit.resetsAt > now ? limit.resetsAt : now + 15 * 60_000;
-    this.c.providerPause(limit.provider, until, limit.message);
+    this.c.providerPause({ provider: limit.provider, id: limit.account }, until, limit.message);
+  }
+
+  /** "Claude" with one sign-in; "Claude · Work" with several (labels only). */
+  private who(ref: AccountRef): string {
+    return this.c.agents.accountLabel(ref.provider, ref.id);
   }
 
   /**
-   * Pause (never fail) on a provider usage limit. With a known reset time we wait for it; with an unknown one
-   * (Cursor) we back off 15 m → 30 m → 1 h → 2 h → 4 h → 6 h. One board comment and one notification per limit
-   * *episode* (a streak of consecutive rejections), and rejected attempts never count toward the run budget.
+   * M8-3 `onLimitHit` (was pauseForLimit): record the ACCOUNT's pause, re-route the role under `effectiveLimitRule`; a candidate the rule
+   * allows ⇒ the stage starts again at once on it (same `next`, `moved.restarted`); none ⇒ pause until the route's earliest reset — with a
+   * known reset time we wait for it, with an unknown one we back off 15 m → 6 h. One board comment and one notification per limit
+   * *episode*; only episodes that END IN A PAUSE count toward the cap (B3b); rejected attempts never count toward the run budget.
    */
-  async pauseForLimit(key: string, limit: LimitInfo): Promise<void> {
+  async onLimitHit(key: string, limit: LimitInfo, role?: Role): Promise<void> {
+    if (!limit.account) throw new Error('usage-limit pause without an account');
     const now = this.c.clock.now();
     const before = this.run(key);
+    const ref: AccountRef = { provider: limit.provider, id: limit.account };
+    const who = this.who(ref);
     const streak = (before.limitStreak ?? 0) + 1;
     const episode = streak === 1 ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
-    if (episode > 6) {
-      // M12: a run that keeps getting rejected (or a provider that keeps faking limits) must not stall silently forever
-      return this.toNeedsHuman(key, `This task has hit a usage limit ${episode - 1} separate times. Check your ${providerLabel(limit.provider)} plan limits, then move it to To do to retry.`, before.next);
-    }
     const known = !!limit.resetsAt && limit.resetsAt > now;
     const backoffMin = Math.min(360, 15 * 2 ** (streak - 1));
     const until = known ? limit.resetsAt! : now + backoffMin * 60_000;
-    this.c.providerPause(limit.provider, until, limit.message);
+    this.c.providerPause(ref, until, limit.message);
+    const cfg = this.c.cfg();
+    const rt = role ? route({ role, complexity: before.complexity, roles: cfg.roles, states: this.c.routeStates(role), now, label: providerLabel, rule: this.c.limitRule() }) : null;
+    const next = rt?.ok ? rt.candidates[0]! : null;
+    if (next && next.crossOnLimit) {
+      // restart at once on the next account / chain tool the rule allows (the attempt was refunded by the caller)
+      const nextWho = this.who({ provider: next.id, id: next.account });
+      const kind = next.id === ref.provider ? 'account' : 'tool';
+      const note = `${who} reached its usage limit — this step starts again on ${nextWho}.`;
+      this.patch(key, (r) => {
+        r.status = 'queued';
+        r.limitStreak = streak;
+        r.limitEpisode = episode;
+        r.moved = { kind, restarted: true, note, at: now, reason: 'limit' };
+        r.history.push({ ts: now, text: note });
+      });
+      this.c.emit(key, { agent: 'conductor', stage: this.run(key).stage ?? 'engine', kind: 'note', text: note });
+      if (streak === 1) {
+        const tier = kind === 'tool' ? this.tierSentence(next.id) : '';
+        await this.c.effects.comment(key, `limit:ep${episode}`, `🤖 **${who} reached its usage limit; this step continued on ${nextWho}.**${tier} Nothing is lost.`);
+        this.c.notify('Usage limit reached', `${who} — continuing on ${nextWho}`);
+      }
+      this.c.tickSoon();
+      return;
+    }
+    const pauseUntil = rt && !rt.ok && rt.kind === 'paused' ? rt.pauseUntil : until;
+    // B3b: an episode that ends in a pause is counted once; more than 6 of them ⇒ a human looks (a provider faking limits cannot stall forever)
+    const pauses = (before.limitPauses ?? 0) + (before.limitPausedEpisode === episode ? 0 : 1);
+    if (pauses > 6) {
+      return this.toNeedsHuman(key, `This task has hit a usage limit ${pauses - 1} separate times. Check your ${who} plan limits, then move it to To do to retry.`, before.next);
+    }
     this.patch(key, (r) => {
       r.status = 'paused';
-      r.pausedUntil = until;
+      r.pausedUntil = pauseUntil;
       r.pauseReason = truncate(limit.message, 300);
+      r.pauseKind = 'limit';
       r.limitStreak = streak;
       r.limitEpisode = episode;
+      r.limitPauses = pauses;
+      r.limitPausedEpisode = episode;
       if (streak === 1) r.history.push({ ts: now, text: `Paused: ${limit.provider} usage limit — resuming automatically` });
     });
-    this.c.emit(key, { agent: limit.provider, stage: this.run(key).stage ?? 'engine', kind: 'error', text: `Usage limit reached — paused until ${new Date(until).toLocaleString()}` });
+    this.c.emit(key, { agent: limit.provider, stage: this.run(key).stage ?? 'engine', kind: 'error', text: `Usage limit reached — paused until ${new Date(pauseUntil).toLocaleString()}` });
     if (streak === 1) {
+      const knownAt = pauseUntil > now && (known || pauseUntil !== until);
       await this.c.effects.comment(
         key,
-        `pause:ep${episode}`,
-        `🤖 **Paused — ${providerLabel(limit.provider)} usage limit reached.** Conductor will resume automatically${known ? ` after ${new Date(until).toLocaleString()}` : ' (it retries with growing gaps until the limit lifts)'}. Nothing is lost.`,
+        `limit:ep${episode}`,
+        `🤖 **Paused — ${who} usage limit reached.** Conductor will resume automatically${knownAt ? ` after ${new Date(pauseUntil).toLocaleString()}` : ' (it retries with growing gaps until the limit lifts)'}. Nothing is lost.`,
       );
       this.c.notify('Usage limit reached', `${limit.provider} — Conductor resumes automatically`);
     }
+  }
+
+  /** The isolation-tier sentence of the fallback comment (kept when a limit episode comment replaces it). */
+  private tierSentence(id: ProviderId): string {
+    const tier = this.c.routeStates()[id]?.tier;
+    return tier === 'partial' ? " It ran in ask mode, which has weaker isolation than Claude's fail-closed tool lock-down." : tier === 'unverified' ? ' Its isolation has not been verified on this machine.' : '';
   }
 
   /**
@@ -299,6 +347,7 @@ export class Stages {
       r.status = 'paused';
       r.pausedUntil = now + wait;
       r.pauseReason = 'offline';
+      r.pauseKind = 'offline';
       r.offline = { episodes, streak, totalMs: o.totalMs + wait, pausedAt: now };
       if (streak === 1) r.history.push({ ts: now, text: 'Paused: no network — resuming automatically when it is back' });
     });
@@ -392,10 +441,13 @@ export class Stages {
       });
       const cfg = this.c.cfg();
       await this.c.freshHealth();
+      const role: Role = opts.role ?? (stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification');
       const res = await this.c.agents.readOnly({
-        role: opts.role ?? (stage === 'plan' ? 'planning' : stage === 'plan_review' ? 'review' : 'verification'),
+        role,
         complexity: run.complexity,
-        states: this.c.routeStates(),
+        states: this.c.routeStates(role),
+        rule: this.c.limitRule(),
+        onCandidate: (ref) => this.c.noteCandidate(key, ref),
         onLimit: (info) => this.recordLimitPause(info),
         stage,
         cwd,
@@ -408,15 +460,15 @@ export class Stages {
         maxTurnsFactor: turnsFactor,
       });
       if (await this.looksOffline(res)) res.errorKind = 'network';
+      const merged = await this.limitEpisodeFromHops(key, stage, res);
       this.finishSession(key, res);
       this.refundIfLimit(key, res);
-      if (res.fellBack && res.from && res.from !== res.agent) {
+      if (res.fellBack && res.from && res.from !== res.agent && !merged) {
         // a visible, durable trace on the card when a read-only step ran on a different (possibly weaker-isolation) provider than configured
-        const tier = this.c.routeStates()[res.agent]?.tier;
-        const note = tier === 'partial' ? " It ran in ask mode, which has weaker isolation than Claude's fail-closed tool lock-down." : tier === 'unverified' ? " Its isolation has not been verified on this machine." : '';
-        await this.c.effects.comment(key, `fallback:${stage}:${run.loop}:${res.agent}`, `🤖 **${providerLabel(res.agent)} did the ${stage.replace('_', ' ')} step instead of ${providerLabel(res.from)}.**${note}`);
+        await this.c.effects.comment(key, `fallback:${stage}:${run.loop}:${res.agent}`, `🤖 **${providerLabel(res.agent)} did the ${stage.replace('_', ' ')} step instead of ${providerLabel(res.from)}.**${this.tierSentence(res.agent)}`);
       }
-      if (res.quota) this.c.recordQuota(res.agent, res.quota);
+      if (res.moved) this.patch(key, (r) => void (r.moved = { kind: res.moved!.kind, restarted: false, note: truncate(res.moved!.note, 300), at: this.c.clock.now(), ...(res.moved!.reason ? { reason: res.moved!.reason } : {}) }));
+      if (res.quota) this.c.recordQuota({ provider: res.agent, id: res.account ?? DEFAULT_ACCOUNT }, res.quota);
       this.writePromptAudit(key, `${opts.label ?? stage}-${run.loop}-${attempt}`, prompt + corrective);
       if (res.ok) {
         const errs = validate(res.json);
@@ -431,7 +483,7 @@ export class Stages {
       }
       switch (res.errorKind) {
         case 'limit':
-          return stop({ type: 'pause', limit: res.limit ?? { provider: res.agent, resetsAt: null, message: res.error ?? 'limit' } });
+          return stop({ type: 'pause', role, limit: { ...(res.limit ?? { resetsAt: null, message: res.error ?? 'limit' }), provider: res.agent, account: res.account ?? DEFAULT_ACCOUNT } });
         case 'aborted':
           return stop();
         case 'network':
@@ -472,7 +524,38 @@ export class Stages {
     if (!hold) return;
     if (hold.type === 'human') return this.toNeedsHuman(key, hold.reason, hold.origin);
     if (hold.type === 'offline') return this.pauseForOffline(key, hold.message);
-    return this.pauseForLimit(key, hold.limit);
+    return this.onLimitHit(key, hold.limit, hold.role);
+  }
+
+  /**
+   * B3a: a read-only call that switched account/tool on a LIMIT and then produced a result opens ONE episode — one board comment (merged with
+   * the fallback comment when the tool changed) and one notify. Later hops of the same episode add history lines only. A call that ENDS in a
+   * limit leaves the episode to `onLimitHit` (its pause comment says what happened). Returns true when the fallback comment was merged.
+   */
+  private async limitEpisodeFromHops(key: string, stage: ReadOnlyStage, res: { ok: boolean; errorKind?: string; agent: ProviderId; account?: string; from?: ProviderId; fellBack?: boolean; hops?: { from: AccountRef; to: AccountRef; kind: string }[] }): Promise<boolean> {
+    const hops = (res.hops ?? []).filter((h) => h.kind === 'limit');
+    if (!hops.length) return false;
+    const now = this.c.clock.now();
+    const to: AccountRef = { provider: res.agent, id: res.account ?? DEFAULT_ACCOUNT };
+    this.patch(key, (r) => {
+      for (const h of hops) r.history.push({ ts: now, text: `${this.who(h.from)} reached its usage limit — continued on ${this.who(h.to)}` });
+    });
+    if (res.errorKind === 'limit') return false;
+    const before = this.run(key);
+    const opening = (before.limitStreak ?? 0) === 0;
+    const episode = opening ? (before.limitEpisode ?? 0) + 1 : before.limitEpisode ?? 1;
+    this.patch(key, (r) => {
+      r.limitStreak = (r.limitStreak ?? 0) + hops.length;
+      r.limitEpisode = episode;
+    });
+    const toolChanged = !!(res.fellBack && res.from && res.from !== res.agent);
+    if (!opening) return toolChanged;
+    const fromWho = this.who(hops[0]!.from);
+    const toWho = this.who(to);
+    const fallback = toolChanged ? ` ${providerLabel(res.agent)} did the ${stage.replace('_', ' ')} step instead of ${providerLabel(res.from!)}.${this.tierSentence(res.agent)}` : '';
+    await this.c.effects.comment(key, `limit:ep${episode}`, `🤖 **${fromWho} reached its usage limit; this step continued on ${toWho}.**${fallback}`);
+    this.c.notify('Usage limit reached', `${fromWho} — continuing on ${toWho}`);
+    return toolChanged;
   }
 
   private writePromptAudit(key: string, name: string, text: string): void {
@@ -713,20 +796,25 @@ export class Stages {
     // a big decomposition is a big change of plan: more than 8 items always waits for a person (the union of the items' files is the plan's
     // file list, so the protected-path rule above already covers every item)
     const bigGraph = itemsOf(plan).length > GRAPH_BIG_ITEMS;
-    const policy = effectivePolicy(cfg, projectKeyOf(run.key));
+    const project = projectKeyOf(run.key);
+    // M8-4: the run-mode overlay changes ONLY the policy and first-plan inputs (policy.ts); the forced inputs below never depend on it
+    const forced = { protectedPaths: touchesProtected, untrusted: run.untrusted === true, bigGraph };
     const decision = decideApproval({
       plan,
-      policy,
-      forced: { protectedPaths: touchesProtected, untrusted: run.untrusted === true, bigGraph },
-      firstPlanHold: cfg.pipeline.planApproval === 'first' && approved === 0,
+      policy: effectivePolicy(cfg, project),
+      forced,
+      firstPlanHold: effectiveFirstPlanHold(cfg, approved),
     });
     if (decision.auto) {
+      const byMode = decidedByRunMode(cfg, { plan, forced }, project, approved);
       this.patch(key, (r) => {
         r.planApproved = true;
         r.approvedBy = 'auto';
         r.next = 'build';
         r.holdReasons = undefined;
         r.risks = undefined;
+        r.forcedHold = undefined;
+        if (byMode) r.history.push({ ts: this.c.clock.now(), text: 'Plan approved automatically (Complete auto)' });
         this.attachGraph(r, plan);
       });
       await this.c.effects.flush(key);
@@ -739,6 +827,7 @@ export class Stages {
       r.next = 'approval';
       r.holdReasons = decision.reasons;
       r.risks = decision.risks;
+      r.forcedHold = decision.forcedHold; // M8-4: stored so "Approve waiting plans" can tell forced holds apart (absent = forced)
       r.history.push({ ts: this.c.clock.now(), text: 'Waiting for plan approval' });
       // K1: the status change and its board effects are ONE write
       Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'plan_ready' } }, secrets);
@@ -842,20 +931,30 @@ export class Stages {
     // branch scans) is the envelope's job; the stage only records facts and routes the outcome.
     await this.c.freshHealth();
     const role = isFix ? 'debugging' : 'implementation';
-    const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: this.c.routeStates(), now: this.c.clock.now(), label: providerLabel });
+    const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: this.c.routeStates(role), now: this.c.clock.now(), label: providerLabel, rule: this.c.limitRule() });
     if (!rt.ok) {
-      // nothing may build this card: either every eligible provider is at a limit (wait, v1 semantics) or none is eligible (zero spawns, a human decides)
+      // nothing may build this card: either every eligible account is at a limit (wait, v1 semantics) or none is eligible (zero spawns, a human decides)
       this.patch(key, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1)));
-      if (rt.kind === 'paused') return this.pauseForLimit(key, { provider: rt.provider, resetsAt: rt.pauseUntil, message: rt.reason });
+      if (rt.kind === 'paused') return this.onLimitHit(key, { provider: rt.provider, account: rt.account, resetsAt: rt.pauseUntil, message: rt.reason }, role);
       return this.toNeedsHuman(key, rt.reason, 'build');
     }
-    const builder = this.c.agents.provider(rt.candidates[0]!.id);
-    // M8-2: the role's model/effort for the tool that actually builds (B2: a choice made for another tool is not applied)
-    const sel = this.c.agents.selectionFor(role, builder.id);
+    const cand = rt.candidates[0]!;
+    const builder = this.c.agents.provider(cand.id);
+    const account: AccountRef = { provider: cand.id, id: cand.account };
+    this.c.noteCandidate(key, account);
+    if (cand.moved && !run.moved?.restarted) { // a restart's own note (limit / removal) is the more precise record: keep it
+      const sk = rt.skipped.find((x) => x.id === (cfg.roles[role].providers[0] ?? cand.id));
+      const note = `${sk?.why ?? 'The first choice is unavailable'} — ${this.who(account)} is building.`;
+      this.note(key, 'build', note);
+      this.patch(key, (r) => void (r.moved = { kind: cand.moved!, restarted: false, note: truncate(note, 300), at: this.c.clock.now(), ...(sk?.kind ? { reason: sk.kind } : {}) }));
+    }
+    // M8-2: the role's model/effort for the tool that actually builds (B2: a choice made for another tool is not applied) — M8-3: against THIS account's list
+    const sel = this.c.agents.selectionFor(role, builder.id, { account: cand.account });
     for (const n of sel.notes) this.note(key, 'build', redact(n, secrets));
     const out = await runBuild({
       provider: builder,
       sel,
+      ...(cand.account !== DEFAULT_ACCOUNT ? { account } : {}),
       repoPath: repo.path,
       worktree: run.worktree,
       baseSha: run.baseSha,
@@ -875,7 +974,7 @@ export class Stages {
         if (prep.note) this.note(key, 'build', prep.note);
       },
       onResult: (res) => {
-        this.c.agents.noteRunResult(builder.id, sel, res);
+        this.c.agents.noteRunResult(builder.id, sel, res, cand.account);
         this.finishSession(key, res);
         this.refundIfLimit(key, res);
         if (res.ok) this.patch(key, (r) => void (r.buildFails = 0));
@@ -885,7 +984,7 @@ export class Stages {
       case 'held':
         return this.toNeedsHuman(key, out.reason, 'build');
       case 'failed':
-        return this.handleBuildFailure(key, out.res, out.provider);
+        return this.handleBuildFailure(key, out.res, out.provider, cand.account, role);
       case 'hook':
         // hook failure = feedback, never a hang
         this.patch(key, (r) => {
@@ -944,12 +1043,12 @@ export class Stages {
     }
   }
 
-  private async handleBuildFailure(key: string, res: AgentResult, provider: ProviderId): Promise<void> {
+  private async handleBuildFailure(key: string, res: AgentResult, provider: ProviderId, account: string = DEFAULT_ACCOUNT, role?: Role): Promise<void> {
     const label = providerLabel(provider);
     const run = this.run(key);
     switch (res.errorKind) {
       case 'limit':
-        return this.pauseForLimit(key, res.limit ?? { provider, resetsAt: null, message: res.error ?? 'limit' });
+        return this.onLimitHit(key, { ...(res.limit ?? { resetsAt: null, message: res.error ?? 'limit' }), provider, account }, role);
       case 'aborted':
         return;
       case 'network':
@@ -1293,6 +1392,7 @@ export class Stages {
       r.approvedBy = by;
       r.status = 'queued';
       r.next = 'build';
+      r.forcedHold = undefined; // M8-4 (N1): holdReasons stay as today; the view hides them outside awaiting_approval
       r.history.push({ ts: this.c.clock.now(), text: `Plan approved (${by})` });
       this.attachGraph(r, plan);
     });

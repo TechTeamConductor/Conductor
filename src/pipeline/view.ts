@@ -143,6 +143,12 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
     canPark: !['finished', 'aborted', 'parked'].includes(st),
     canFinish: !['finished', 'aborted'].includes(st),
     ...(run.graph ? { taskProgress: graphProgress(run) } : {}),
+    // M8-4 (C4/N3c/N3e): only meaningful while waiting. ABSENT on the run counts as forced (a run held before M8-4) — fail closed.
+    forcedHold: st === 'awaiting_approval' ? run.forcedHold !== false : false,
+    risky: st === 'awaiting_approval' ? (run.risks?.length ?? 0) > 0 : false,
+    // M8-3: labels only (never a path); `moved.reason` keeps the real skip kind (N5)
+    account: run.account ? { provider: run.account.provider, id: run.account.id, name: run.account.name } : null,
+    moved: run.moved ? { kind: run.moved.kind, restarted: run.moved.restarted, note: run.moved.note, at: run.moved.at, ...(run.moved.reason ? { reason: run.moved.reason } : {}) } : null,
   };
 }
 

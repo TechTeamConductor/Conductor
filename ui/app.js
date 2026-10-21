@@ -347,6 +347,8 @@ function normalizeState(d) {
   d.engine.providerPause = d.engine.providerPause || {};
   d.settings = Object.assign({ planApproval: 'auto', planReview: 'auto', maxLoops: 3, maxParallel: 2, onClaudeLimit: 'wait', noGates: 'warn' }, d.settings || {});
   d.settings.stages = Object.assign({ plan: 'claude', review: 'claude', verify: 'claude' }, d.settings.stages || {});
+  // M8-3: feature-detected — an older server has no `accounts`
+  d.accounts = Array.isArray(d.accounts) ? d.accounts.filter((a) => a && typeof a.id === 'string' && typeof a.provider === 'string') : null;
   return d;
 }
 function normalizeDetail(d) {
@@ -485,6 +487,7 @@ function onStateEvent(d) {
   if (Array.isArray(d.cards)) S.state.cards = d.cards;
   if (d.engine) { S.state.engine = Object.assign({}, S.state.engine, d.engine); S.state.engine.providerPause = S.state.engine.providerPause || {}; }
   if (d.quota) S.state.quota = d.quota;
+  if (Array.isArray(d.accounts)) S.state.accounts = d.accounts;
   if (d.now) S.offset = d.now - Date.now();
   renderLive();
   if (S.view === 'board') boardPoke(false);
@@ -524,7 +527,47 @@ function buildHeader() {
   HDR.conn = h('span', { class: 'conn', hidden: true }, HDR.connIcon, HDR.connLbl);
   HDR.newBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-label': 'New task', onclick: () => openNewTask() }, icon('plus'), h('span', { class: 'btn-label-hide' }, 'New task'));
   HDR.setBtn = h('button', { type: 'button', class: 'btn btn-icon', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings() }, icon('sliders'));
-  top.append(brand, HDR.nav, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.newBtn, HDR.setBtn);
+  // M8-3: accounts popover (labels and states only — never an email or a path)
+  HDR.acctN = h('span', { class: 'nav-badge', hidden: true });
+  HDR.acctBtn = h('button', { type: 'button', class: 'btn btn-icon acct-btn', 'aria-label': 'Accounts', title: 'Accounts', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', hidden: true, onclick: () => toggleAcctPop() }, icon('lock'), HDR.acctN);
+  HDR.acctPop = h('div', { class: 'acct-pop', role: 'dialog', 'aria-label': 'Accounts', hidden: true });
+  top.append(brand, HDR.nav, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.newBtn, HDR.acctBtn, HDR.setBtn, HDR.acctPop);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !HDR.acctPop.hidden) closeAcctPop(true); });
+  document.addEventListener('click', (e) => { if (!HDR.acctPop.hidden && !HDR.acctPop.contains(e.target) && !HDR.acctBtn.contains(e.target)) closeAcctPop(false); });
+}
+/* ───────────────────────── M8-3 accounts ───────────────────────── */
+const ACCT_STATUS = { ready: 'Ready', 'in-use': 'In use', 'at-limit': 'At its limit', 'not-signed-in': 'Not signed in', 'not-installed': 'Not installed', checking: 'Checking…', unknown: 'Unknown', unavailable: 'Unavailable' };
+const ACCT_CLS = { ready: 'st-ready', 'in-use': 'st-building', 'at-limit': 'st-paused', 'not-signed-in': 'st-needs', 'not-installed': 'st-needs', checking: 'st-planning', unknown: '', unavailable: 'st-needs' };
+const accountsOf = (tool) => ((S.state && S.state.accounts) || []).filter((a) => a.provider === tool);
+/** "Claude" with one sign-in; "Claude · Work" with several (the server's own rule). */
+function acctLabel(a) { return a.isDefault && accountsOf(a.provider).length <= 1 ? (AGENT_LABEL[a.provider] || a.provider) : (AGENT_LABEL[a.provider] || a.provider) + ' · ' + a.name; }
+function acctStatusNode(a) {
+  const until = a.status === 'at-limit' && a.until ? [' until ', fmtWhen(a.until)] : [];
+  return h('span', { class: 'st st-sm ' + (ACCT_CLS[a.status] || '') }, ACCT_STATUS[a.status] || a.status, ...until);
+}
+/** Codex is listed only while it holds a job (its accounts are dormant). */
+const acctShown = (a) => a.provider !== 'codex' || ((S.state.providers || []).find((p) => p.id === 'codex') || {}).inUse === true;
+function toggleAcctPop() { if (HDR.acctPop.hidden) openAcctPop(); else closeAcctPop(true); }
+function openAcctPop() {
+  const list = (S.state && S.state.accounts) || [];
+  HDR.acctPop.replaceChildren(
+    h('h3', null, 'Accounts'),
+    h('ul', { class: 'acct-list' }, list.filter(acctShown).map((a) => h('li', { class: 'acct-row' }, h('span', { class: 'acct-name' }, acctLabel(a)), acctStatusNode(a)))),
+    h('p', { class: 'muted' }, M.LIMIT_RULE_HINT[(S.state.settings && S.state.settings.limitRuleEffective) || 'switch'] || ''),
+    h('button', { type: 'button', class: 'btn btn-sm', onclick: () => { closeAcctPop(false); openSettings('accounts'); } }, icon('sliders'), h('span', null, 'Manage accounts')));
+  HDR.acctPop.hidden = false;
+  HDR.acctBtn.setAttribute('aria-expanded', 'true');
+  const b = HDR.acctPop.querySelector('button'); if (b) b.focus();
+}
+function closeAcctPop(focus) { HDR.acctPop.hidden = true; HDR.acctBtn.setAttribute('aria-expanded', 'false'); if (focus) HDR.acctBtn.focus(); }
+function updateAcctButton(wizard) {
+  const list = S.state.accounts;
+  toggleHidden(HDR.acctBtn, wizard || !list);
+  if (!list) return;
+  const lim = list.filter((a) => a.status === 'at-limit').length;
+  toggleHidden(HDR.acctN, !lim);
+  setText(HDR.acctN, lim || '');
+  HDR.acctBtn.title = lim ? (lim === 1 ? '1 account is at its usage limit' : lim + ' accounts are at their usage limit') : 'Accounts';
 }
 function engineView(eng) {
   const pp = eng.providerPause || {};
@@ -542,6 +585,7 @@ function engineView(eng) {
 }
 function updateHeader(wizard) {
   const st = S.state;
+  updateAcctButton(wizard);
   toggleHidden(HDR.version, !st.version);
   setText(HDR.version, st.version ? 'v' + st.version : '');
   toggleHidden(HDR.engine, wizard);
@@ -639,6 +683,17 @@ function computeBanners(wizard) {
       : `Stages that need ${AGENT_LABEL[a] || a} wait. Nothing is lost, runs resume by themselves.`);
     out.push({ id: 'pp-' + a, cls: 'b-limit', icon: 'clock', title: `${AGENT_LABEL[a] || a} usage limit`, text: ' — resuming automatically at ' + fmtWhen(p.until), until: p.until, lines });
   }
+  // M8-3: one account at its limit while the tool still has a free one ⇒ work continues elsewhere (labels only)
+  for (const tool of ['claude', 'cursor', 'codex']) {
+    if (pp[tool]) continue;
+    const lim = accountsOf(tool).filter((a) => a.status === 'at-limit');
+    if (!lim.length) continue;
+    const soonest = Math.min(...lim.map((a) => a.until || Infinity));
+    out.push({ id: 'acct-lim-' + tool, cls: 'b-info', icon: 'clock', title: lim.map(acctLabel).join(', ') + (lim.length === 1 ? ' is at its usage limit' : ' are at their usage limit'),
+      text: ' — work continues on the next account the limit rule allows.', until: Number.isFinite(soonest) ? soonest : undefined });
+  }
+  const broken = ((st.accounts) || []).filter((a) => a.status === 'unavailable' && !a.isDefault && a.provider !== 'codex');
+  if (broken.length) out.push({ id: 'acct-bad', cls: 'b-error', icon: 'warn', title: broken.length === 1 ? 'An account cannot be used' : broken.length + ' accounts cannot be used', text: '', lines: broken.map((a) => acctLabel(a) + ': ' + (a.note || 'Unavailable.')), list: true, action: { label: 'Accounts', href: '#/', onclick: () => openSettings('accounts') } });
   const cardKeys = new Set((st.cards || []).map((c) => c.key));
   const hidden = (eng.ignored || []).filter((i) => !cardKeys.has(i.key));
   if (hidden.length) {
@@ -689,7 +744,7 @@ function renderBanners(wizard) {
     }
     return h('div', { class: 'banner ' + b.cls, role: 'group', 'aria-label': b.title, data: { id: b.id } },
       icon(b.icon), body,
-      b.action ? h('a', { class: 'btn btn-sm', href: b.action.href }, b.action.label) : null,
+      b.action ? (b.action.onclick ? h('button', { type: 'button', class: 'btn btn-sm', onclick: b.action.onclick }, b.action.label) : h('a', { class: 'btn btn-sm', href: b.action.href }, b.action.label)) : null,
       b.dismiss ? h('button', { type: 'button', class: 'btn btn-ghost btn-icon btn-sm', 'aria-label': 'Dismiss: ' + b.title, data: { dismiss: b.dismiss }, onclick: () => {
         S.dismissed.add(b.dismiss); storeSet('dismiss:' + b.dismiss, '1'); renderBanners(isWizard()); tick();
       } }, icon('x')) : null);
@@ -2111,7 +2166,10 @@ function createCard(key) {
   p.bugs = h('span', { class: 'chip is-bad', hidden: true }, icon('bug'), p.bugsT);
   p.unv = h('span', { class: 'badge tone-warn', hidden: true, title: 'No reliable gates: regressions cannot be ruled out' }, icon('warn'), 'Unverified');
   p.dc = designChips();
-  p.meta = h('div', { class: 'card-meta' }, p.dc.part, p.dc.model, p.repo, p.loop, p.bugs, p.unv);
+  // M8-3: the account of the current/last stage (only when its tool has several) and the last automatic move (N5 wording)
+  p.acctT = h('span'); p.acct = h('span', { class: 'chip', hidden: true }, icon('lock'), p.acctT);
+  p.movedT = h('span'); p.moved = h('span', { class: 'chip', hidden: true }, icon('repeat'), p.movedT);
+  p.meta = h('div', { class: 'card-meta' }, p.dc.part, p.dc.model, p.repo, p.acct, p.moved, p.loop, p.bugs, p.unv);
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
@@ -2168,7 +2226,13 @@ function updateCard(el, r) {
   if (r.bugsOpen > 0) setText(p.bugsT, plural(r.bugsOpen, 'open bug'));
   toggleHidden(p.unv, !r.unverified);
   setDesignChips(p.dc, cardOrigin(r.key));
-  toggleHidden(p.meta, p.dc.part.hidden && p.dc.model.hidden && p.repo.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
+  const acc = r.account && typeof r.account.name === 'string' && accountsOf(r.account.provider).length > 1 ? r.account : null;
+  toggleHidden(p.acct, !acc);
+  if (acc) { setText(p.acctT, acc.name); p.acct.title = 'Account: ' + (AGENT_LABEL[acc.provider] || acc.provider) + ' · ' + acc.name; }
+  const mv = r.moved && !['ready', 'closed'].includes(r.column) ? M.movedChip(r.moved) : null;
+  toggleHidden(p.moved, !mv);
+  if (mv) { setText(p.movedT, mv.label); p.moved.title = mv.title; }
+  toggleHidden(p.meta, p.dc.part.hidden && p.dc.model.hidden && p.repo.hidden && p.acct.hidden && p.moved.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
 
   const showApprove = !!r.canApprove;
   const showRetry = !!r.canRetry && r.column === 'needs_human';
@@ -3307,7 +3371,71 @@ function openNewTask() {
   title.focus();
 }
 
-function openSettings() {
+/**
+ * M8-3 Settings → "Accounts and limits": every sign-in of each tool in the order Conductor tries them. Actions apply at once (they are not part of
+ * Save). Labels via text nodes only; no email, no path; the sign-in command is built by the server from constants + the id.
+ */
+function accountsPanel() {
+  const root = h('div', { class: 'acct-panel' });
+  const err = h('p', { class: 'err', role: 'alert', hidden: true });
+  const act = async (fn, ok) => {
+    err.hidden = true;
+    try { await fn(); if (ok) toast('good', ok); } catch (e) { setText(err, (e && e.message) || 'Something went wrong.'); err.hidden = false; }
+    try { await loadState(); } catch { /* keep the old view */ }
+    fill();
+  };
+  const reorder = (tool, id, dir) => {
+    const ids = accountsOf(tool).map((a) => a.id);
+    const i = ids.indexOf(id); const j = dir === 'up' ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    return act(() => api('PUT', '/api/accounts/order', { provider: tool, ids }));
+  };
+  const toolSel = h('select', { class: 'select', 'aria-label': 'Tool' }, h('option', { value: 'claude' }, 'Claude'), h('option', { value: 'cursor' }, 'Cursor'));
+  const nameIn = h('input', { class: 'input', type: 'text', maxlength: '40', placeholder: 'A short name, e.g. Work', 'aria-label': 'Account name', autocomplete: 'off' });
+  const addBtn = h('button', { type: 'button', class: 'btn btn-sm', onclick: () => {
+    const name = nameIn.value.trim();
+    if (!name) { setText(err, 'Give the account a short name.'); err.hidden = false; nameIn.focus(); return; }
+    act(async () => { await api('POST', '/api/accounts', { provider: toolSel.value, name }); nameIn.value = ''; }, 'Account added. It is not signed in yet.');
+  } }, icon('plus'), h('span', null, 'Add account'));
+  const fill = () => {
+    const list = S.state.accounts;
+    if (!list) { root.replaceChildren(h('p', { class: 'muted' }, 'This Conductor does not support several accounts per tool.')); return; }
+    const tools = ['claude', 'cursor', ...(acctShown({ provider: 'codex' }) ? ['codex'] : [])];
+    root.replaceChildren(
+      ...tools.map((tool) => {
+        const rows = accountsOf(tool);
+        return h('div', { class: 'acct-tool' }, h('h4', null, AGENT_LABEL[tool] || tool),
+          h('ol', { class: 'acct-list' }, rows.map((a, i) => h('li', { class: 'acct-row' },
+            h('span', { class: 'acct-name' }, a.isDefault ? a.name + ' (your sign-in)' : a.name), acctStatusNode(a),
+            a.provider === 'cursor' && a.buildReady === false ? h('span', { class: 'chip', title: 'Builds on added Cursor accounts stay off until their build isolation is checked' }, 'Read-only work only') : null,
+            h('span', { class: 'spacer' }),
+            h('button', { type: 'button', class: 'btn btn-ghost btn-icon btn-sm', 'aria-label': 'Move ' + a.name + ' up', disabled: i === 0, onclick: () => reorder(tool, a.id, 'up') }, icon('arrow-up')),
+            h('button', { type: 'button', class: 'btn btn-ghost btn-icon btn-sm acct-down', 'aria-label': 'Move ' + a.name + ' down', disabled: i === rows.length - 1, onclick: () => reorder(tool, a.id, 'down') }, icon('arrow-up')),
+            a.isDefault || tool === 'codex' ? null : h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => act(() => api('POST', `/api/accounts/${enc(a.id)}/check`, {})) }, 'Check'),
+            a.isDefault ? null : h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => {
+              if (!window.confirm(`Remove ${acctLabel(a)}? Conductor signs it out, deletes its private folder and restarts any step running on it.`)) return;
+              act(async () => { const r = await api('DELETE', `/api/accounts/${enc(a.id)}`); if (r && r.note) toast('warn', r.note); }, 'Account removed.');
+            } }, 'Remove'),
+            !a.isDefault && a.status === 'not-signed-in' ? h('p', { class: 'muted acct-signin' }, 'Signing in extra accounts is not enabled yet (awaiting a live check). Later: ', h('code', null, a.signInCommand)) : null,
+            a.note ? h('p', { class: 'muted' }, a.note) : null))));
+      }),
+      h('div', { class: 'acct-add' }, h('h4', null, 'Add an account'),
+        h('div', { class: 'row-2' }, toolSel, nameIn), addBtn,
+        h('ul', { class: 'muted acct-disclose' },
+          h('li', null, 'The account signs in with the tool\'s own login and keeps it in a private folder under the Conductor home. For Cursor this is a plaintext file (auth.json, 0600), not the Keychain: code that the Cursor builder or repository checks run can read it as your user, just as it can read your other files. Add only accounts you accept that for, and revoke sessions if a build looked hostile.'),
+          h('li', null, 'Under "Next account, then another tool", work from any project may run on any listed account, including a personal one. If a project must stay on one organisation\'s account, choose "same tool" or "wait", or do not add the account.'),
+          h('li', null, 'Removing an account deletes its folder and tries to sign it out; Claude may keep a Keychain item for a folder that no longer exists.'),
+          h('li', null, 'Builds on added Cursor accounts stay off until their build isolation is checked; repositories that need a private registry or an SSH remote may fail on them later.'))),
+      err);
+  };
+  fill();
+  return { el: root, fill };
+}
+
+/** The server supports the M8-3 limit rule (feature detection). */
+const cur0 = (st) => typeof st.limitRule === 'string';
+function openSettings(focus) {
   const s = S.state.settings;
   const sel = (opts, val) => { const el = h('select', { class: 'select' }, opts.map(([v, l]) => h('option', { value: v }, l))); el.value = val; return el; };
   const num = (min, max, val) => h('input', { class: 'input', type: 'number', min, max, step: '1', inputmode: 'numeric', value: String(val) });
@@ -3318,7 +3446,16 @@ function openSettings() {
     maxParallel: num(1, 8, s.maxParallel),
     onClaudeLimit: sel([['wait', 'Wait until the limit resets'], ['cursor', 'Use Cursor for read-only stages']], s.onClaudeLimit),
     noGates: sel([['warn', 'Continue, marked Unverified'], ['block', 'Block the run']], s.noGates),
+    limitRule: sel(Object.entries(M.LIMIT_RULE_LABEL), s.limitRule || 'switch'),
   };
+  const ruleHint = h('p', { class: 'muted', role: 'status' });
+  const syncRuleHint = () => {
+    const eff = s.limitRuleEffective && s.limitRuleEffective !== c.limitRule.value && c.limitRule.value === s.limitRule ? s.limitRuleEffective : c.limitRule.value;
+    setText(ruleHint, (M.LIMIT_RULE_HINT[c.limitRule.value] || '') + (eff !== c.limitRule.value ? ' The run mode currently applies "' + M.LIMIT_RULE_LABEL[eff] + '".' : ''));
+  };
+  c.limitRule.addEventListener('change', syncRuleHint);
+  syncRuleHint();
+  const accts = accountsPanel();
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
   const showErr = (m) => { setText(err, m); err.hidden = false; };
   const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save changes');
@@ -3383,6 +3520,7 @@ function openSettings() {
       planApproval: c.planApproval.value, planReview: c.planReview.value,
       maxLoops: Number(c.maxLoops.value), maxParallel: Number(c.maxParallel.value),
       onClaudeLimit: c.onClaudeLimit.value, noGates: c.noGates.value,
+      ...(cur0(s) ? { limitRule: c.limitRule.value } : {}),
     };
     const cur = S.state.settings;
     const patch = {};
@@ -3430,8 +3568,10 @@ function openSettings() {
     group('Who does what',
       h('p', { class: 'who-intro' }, 'Pick the tool, the model and how hard it should think for each job. Each tool names its models and levels differently, so the choices change with the tool. Some tools cannot take some jobs yet; the reason is shown when you pick one. These are global settings: they apply to every request and every card.'),
       whoList, tdHolder),
-    group('Usage limits',
-      fld('When Claude hits its usage limit', c.onClaudeLimit), limitNote),
+    h('div', { id: 'set-accounts' }, group('Accounts and limits',
+      fld('At a usage limit', c.limitRule), ruleHint,
+      fld('When Claude hits its usage limit (which tools a job may use)', c.onClaudeLimit, 'Adds or removes Cursor as the fallback of the read-only jobs. With "same tool" or "wait" it is used only when Claude cannot run at all.'), limitNote,
+      accts.el)),
     group('Limits',
       h('div', { class: 'row-2' }, fld('Fix loops', c.maxLoops, 'Build and verify rounds before Conductor asks you.'), fld('Parallel runs', c.maxParallel, 'Runs working at the same time.')),
       fld('When a repo has no tests or lint', c.noGates, 'Unverified runs are flagged on the board.')),
@@ -3440,6 +3580,7 @@ function openSettings() {
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
   fillWho();
   dlg.showModal();
+  if (focus === 'accounts') { const g = dlg.querySelector('#set-accounts'); if (g) g.scrollIntoView({ block: 'start' }); }
   loadRoles().then(() => { if (dlg.open && !Object.keys(draft).length && !Object.values(editors).some((e) => e.value())) fillWho(); });
 }
 

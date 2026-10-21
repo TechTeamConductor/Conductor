@@ -6,6 +6,8 @@
 // ───────────────────────────── primitives ─────────────────────────────
 import type { ProviderId } from './agents/providers/types.ts';
 import type { Roles } from './agents/roles.ts';
+import type { LimitRule } from './accounts/limit-rule.ts';
+import type { Accounts, AccountRef } from './accounts/types.ts';
 export type { ProviderId };
 export type StageName = 'plan' | 'plan_review' | 'build' | 'verify';
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit';
@@ -292,12 +294,38 @@ export interface Run {
   /** Why the plan is waiting for approval, and the risk-rule hits that need an explicit confirmation (M6). */
   holdReasons?: string[];
   risks?: { rule: string; detail: string }[];
+  /**
+   * M8-4: the current hold is FORCED (large change, protected files, unverified source, more than 8 tasks) — no setting or run mode
+   * removes it. Written by the approval gate on hold, cleared on approval. ABSENT means forced (a run held before M8-4): no loader or
+   * migration defaults it to `false`.
+   */
+  forcedHold?: boolean;
   /** Started from a Quick Ask with "make this change if it is small" ticked (M5): plan review is skipped, approval is NOT (see Stages.approvalGate). Assigned by server code only. */
   fastPath?: boolean;
   /** Offline bookkeeping (M4): pause episodes and the cumulative time spent offline. */
   offline?: { episodes: number; streak: number; totalMs: number; pausedAt?: number };
   /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
   restartTimes?: number[];
+  /** M8-3: the account the current (or last) stage ran on — label only, never a path. */
+  account?: AccountRef & { name: string };
+  /** M8-3: the last automatic move (static wording + labels + the real skip reason, N5). */
+  moved?: RunMove;
+  /** M8-3 (B3c): why a `paused` run waits. Absent on records written before M8-3 (treated as a limit unless the reason is `offline`). */
+  pauseKind?: 'limit' | 'offline';
+  /** M8-3 (B3b): limit episodes that ENDED IN A PAUSE (successful switches never count); > 6 ⇒ needs_human. */
+  limitPauses?: number;
+  /** The episode already counted in `limitPauses` (an episode is counted once). */
+  limitPausedEpisode?: number;
+}
+
+export interface RunMove {
+  kind: 'account' | 'tool';
+  /** true when a running stage started again on the next account/tool (build limit, removed account). */
+  restarted: boolean;
+  note: string;
+  at: number;
+  /** N5: the real reason (`Skipped.kind`): 'limit' | 'auth' | 'missing' | 'removed' | … — F5 shows "Switched" only for a limit. */
+  reason?: string;
 }
 
 // ───────────────────────────── config ─────────────────────────────
@@ -333,6 +361,8 @@ export interface Config {
    * a discovered family (or, with `custom`, a listed id). Re-validated at use; never trusted as argv-safe just because it is stored.
    */
   toolModels: Partial<Record<ProviderId, { model: string; custom?: true }>>;
+  /** M8-3 (config v7): ordered accounts per tool; `default` = the user's own sign-in (today's env). Metadata only — never a secret or a path. */
+  accounts: Accounts;
   /** Roles → ordered provider chains (config v4). Replaces v3's `stages` + `pipeline.onClaudeLimit`, which are derived for the dashboard (see Settings). */
   roles: Roles;
   pipeline: {
@@ -358,6 +388,16 @@ export interface Config {
     policy: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
     /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
     verifyEachItem: boolean;
+    /** M8-3 (config v7, contract C1): what happens at a usage limit. Read ONLY through `effectiveLimitRule` (src/accounts/limit-rule.ts). */
+    limitRule: LimitRule;
+    /**
+     * M8-4 (contract C3): one global overlay. `complete-auto` makes the EFFECTIVE approval policy `full-auto` (first-plan and risk holds
+     * off) and the effective limit rule `switch`; forced holds never change and stored settings are never written. Read only through
+     * `isCompleteAuto` (exact equality: anything else is Per settings). Additive, no config version of its own.
+     */
+    runMode: 'per-settings' | 'complete-auto';
+    /** M8-4 N11: when the run mode last changed (epoch ms); written only by `PUT /api/run-mode`. */
+    runModeChangedAt?: number;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
   };
   /** Per-project settings keyed by board project key (config v5). */
@@ -389,11 +429,20 @@ export interface Settings {
   noGates: Config['pipeline']['noGates'];
   /** Derived from `roles`: the first claude|cursor provider of the planning / review / verification chains. */
   stages: { plan: 'claude' | 'cursor'; review: 'claude' | 'cursor'; verify: 'claude' | 'cursor' };
+  /** M8-3 (C1): the stored limit rule, and the rule in effect (`effectiveLimitRule`). PUT accepts `limitRule` only. */
+  limitRule: LimitRule;
+  limitRuleEffective: LimitRule;
+  /** M8-4 (C4): the stored run mode. Changed ONLY through `PUT /api/run-mode`; `PUT /api/settings` refuses it. */
+  runMode: Config['pipeline']['runMode'];
+  /** M8-4 (C4): the settings the run mode currently overrides: empty under Per settings, all three under Complete auto. */
+  overriddenByRunMode: Array<'planApproval' | 'policy' | 'limitRule'>;
 }
 
 // ───────────────────────────── agents ─────────────────────────────
 export interface LimitInfo {
   provider: ProviderId;
+  /** M8-3: the account the CALLER ran (never taken from provider output). Missing on a limit pause is a programming error. */
+  account?: string;
   resetsAt: number | null; // epoch ms; null = unknown (use backoff)
   kind?: string; // 'seven_day' | 'five_hour' | 'unknown'
   message: string;
@@ -553,6 +602,13 @@ export interface ApiRunSummary {
   canFinish: boolean; // mark it done
   /** Progress of the task graph, when the run has one. */
   taskProgress?: ApiGraphProgress;
+  /** M8-3: the account of the current/last stage, and the last automatic move. */
+  account?: { provider: ProviderId; id: string; name: string } | null;
+  moved?: RunMove | null;
+  /** M8-4 (C4/N3c): while `awaiting_approval`, the hold is forced (absent on the run counts as forced); `false` otherwise. */
+  forcedHold: boolean;
+  /** M8-4 (N3c): while `awaiting_approval`, the plan has risk-rule hits that need the per-card confirmation; `false` otherwise. */
+  risky: boolean;
 }
 export interface ApiSession extends SessionRec {
   resumeCommand: string; // e.g. `cd '/path' && claude --resume <id>`
@@ -606,6 +662,9 @@ export interface ApiQuota {
   claude?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean };
 }
 export interface ApiEngine {
+  /** M8-4 (C4): the global run mode, live over SSE so a second tab's board header follows; and when it last changed (N11). */
+  runMode: Config['pipeline']['runMode'];
+  runModeChangedAt: number | null;
   /** Cards Conductor deliberately does not run (e.g. in a Conductor-owned lane without a run), with the reason. */
   ignored?: { key: string; reason: string }[];
   /** Set when the board cannot be written (disk full, journal refused): effects stop retrying every tick until it recovers. */
@@ -655,8 +714,29 @@ export interface ApiState {
   repos: ApiRepo[];
   runs: ApiRunSummary[];
   cards: ApiCard[];
+  /** M8-3: every account of every tool, in order (the field M8-U feature-detects). */
+  accounts?: AccountView[];
   /** M8-6 C1 (additive): Home composer features — "Design the work" and the research brief — and the counters it shows. */
   home?: { design: true; researchBrief: boolean; limits: { designPerHour: number; designUsed: number; researchPerDay: number; researchUsed: number } };
+}
+/** M8-3 §2.7 — an allow-listed view (S12): no path, no email, no secret. */
+export interface AccountView {
+  provider: ProviderId;
+  id: string;
+  name: string;
+  order: number;
+  isDefault: boolean;
+  status: 'ready' | 'in-use' | 'at-limit' | 'not-signed-in' | 'not-installed' | 'checking' | 'unknown' | 'unavailable';
+  until?: number;
+  untilKind?: 'reset' | 'retry';
+  plan?: string;
+  usage?: { utilization7d?: number; utilization5h?: number; resetsAt?: number };
+  checkedAt?: number;
+  inUse: number;
+  buildReady?: boolean;
+  signInCommand: string;
+  /** A short static reason (e.g. why it is unavailable). */
+  note?: string;
 }
 export interface ApiError {
   error: { code: string; message: string };

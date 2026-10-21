@@ -43,9 +43,9 @@ test('v5→v6 moves models to toolModels (custom), invalid to legacy.v5', () => 
   for (const t of ['claude', 'cursor', 'codex']) assert.equal(Object.hasOwn(out.agents[t], 'model'), false, t);
   assert.equal(out.agents.claude.bin, 'claude', 'everything else is kept');
   assert.deepEqual(migrateConfigV5ToV6({ version: 5 }).toolModels, {}, 'nothing to move ⇒ an empty toolModels');
-  assert.equal(CONFIG_SPEC.current, 6);
+  assert.equal(CONFIG_SPEC.current, 7); // M8-3 took v7
   assert.equal(CONFIG_SPEC.migrations?.[5], migrateConfigV5ToV6);
-  assert.equal(defaultConfig().version, 6);
+  assert.equal(defaultConfig().version, 7);
   assert.deepEqual(defaultConfig().toolModels, {});
 });
 
@@ -82,7 +82,7 @@ test('Codex x[1m] refused at load/save with a human message, never in argv (W6)'
   assert.ok(!buildCodexArgs({ outFile: '/o', model: s.modelArg, effort: s.effortArg }).some((x) => x.includes('x[1m]') || x.startsWith('--model')));
   saveConfig(cfg);
   const disk = JSON.parse(readFileSync(paths.config(), 'utf8'));
-  assert.equal(disk.version, 6);
+  assert.equal(disk.version, 7);
   assert.deepEqual(disk.legacy.v5.agentsModel, { codex: 'x[1m]' });
   assert.equal(disk.agents.codex.model, undefined);
   // a hand edit putting it straight into toolModels is refused at load too
@@ -159,7 +159,7 @@ test('load+save round trip keeps a pre-upgrade backup (AC6)', () => {
   assert.deepEqual(cfg.toolModels, { claude: { model: 'opus', custom: true } });
   saveConfig(cfg);
   const disk = JSON.parse(readFileSync(paths.config(), 'utf8'));
-  assert.equal(disk.version, 6);
+  assert.equal(disk.version, 7);
   assert.deepEqual(disk.toolModels, { claude: { model: 'opus', custom: true } });
   assert.equal(disk.agents.claude.model, undefined);
   if (prev === undefined) delete process.env.CONDUCTOR_BACKUP_DIR;
@@ -202,7 +202,7 @@ test('migrate.ts imports a v5 home as v6', async () => {
   const r = await migrate({ from, to, apply: true, backupRoot: mkdtempSync(join(tmpdir(), 'cond-v6-bk-')) });
   assert.equal(r.published, true);
   const cfg = JSON.parse(readFileSync(join(to, 'config.json'), 'utf8'));
-  assert.equal(cfg.version, 6);
+  assert.equal(cfg.version, 7);
   assert.deepEqual(cfg.toolModels.claude, { model: 'opus', custom: true });
   assert.equal(cfg.toolModels.cursor, undefined);
   assert.deepEqual(cfg.legacy.v5.agentsModel, { cursor: 'id[effort=high]' });

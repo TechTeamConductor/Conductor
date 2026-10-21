@@ -13,6 +13,8 @@ import * as W from '../git/worktree.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
 import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
 import { errMsg, truncate } from '../util.ts';
+import type { AccountRef } from '../accounts/types.ts';
+import { AccountIsolationError, accountBuildEnv, isolationMessage } from '../accounts/env.ts';
 
 /** Keys NO provider may ever set through `prepare`, even if its allow-list says so (the envelope's own env also always wins). */
 const FORBIDDEN_PREP_ENV = /^(GIT_[A-Z0-9_]*|HOME|PATH|USERPROFILE|CODEX_[A-Z0-9_]*|XDG_[A-Z0-9_]*|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|NODE_OPTIONS)$/i;
@@ -77,6 +79,8 @@ export interface BuildInput {
   onResult: (res: AgentResult) => void;
   /** M8-2: the builder's model/effort selection. DATA ONLY: forwarded to the provider untouched; no safety step reads it. */
   sel?: ResolvedSel;
+  /** M8-3: the builder's account (absent ⇒ the tool's main sign-in, today's env). */
+  account?: AccountRef;
 }
 
 const HELD_NO_GUARD = (label: string, why: string) => `${label}'s guard could not be established (${why}). Nothing was started. Review the setup before continuing.`;
@@ -115,11 +119,21 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
     return { kind: 'held', reason: `Conductor could not read the repository's git settings (${truncate(errMsg(e), 120)}), so it did not start the builder. Check the repository, then move the card to To do.` };
   }
 
+  // 3b — M8-3 (B5): a named account's env fragment is resolved HERE from fixed code (never by `prepare`; FORBIDDEN_PREP_ENV is unchanged).
+  //      Builds on named accounts are gated off by the router until CURSOR_ACCOUNT_HOME_BUILD_VERIFIED flips (D-G, S17); the binding check on
+  //      the final env runs inside the adapter right before the spawn (R2-1).
+  let acctEnv: Record<string, string> | undefined;
+  try {
+    acctEnv = i.account && i.account.provider !== provider.id ? (() => { throw new AccountIsolationError('an account of another tool'); })() : accountBuildEnv(i.account);
+  } catch (e) {
+    return { kind: 'held', reason: isolationMessage(`added ${label}`, e instanceof AccountIsolationError ? e.cls : 'an account folder that could not be checked') };
+  }
+
   // 4 — run, with the git-meta restore guaranteed (also when the provider throws, times out or is aborted)
   let res: AgentResult | undefined;
   let thrown: { e: unknown } | undefined;
   try {
-    res = await b.run({ cwd: i.worktree, prompt: i.prompt, name: i.name, env, onEvent: i.onEvent, signal: i.signal, secrets: i.secrets, ...(i.sel ? { sel: i.sel } : {}) }, prep);
+    res = await b.run({ cwd: i.worktree, prompt: i.prompt, name: i.name, env, onEvent: i.onEvent, signal: i.signal, secrets: i.secrets, ...(i.sel ? { sel: i.sel } : {}), ...(i.account ? { account: i.account } : {}), ...(acctEnv ? { accountEnv: acctEnv } : {}) }, prep);
   } catch (e) {
     thrown = { e };
   }

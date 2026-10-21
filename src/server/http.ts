@@ -1,13 +1,37 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomToken } from '../util.ts';
 import type { RunStore } from '../store.ts';
 import type { Engine } from '../pipeline/engine.ts';
 import { logger } from '../log.ts';
 import { errMsg } from '../util.ts';
-import { Api, ApiFail } from './api.ts';
+import { Api, ApiFail, accountRoute } from './api.ts';
+import { AccountError } from '../accounts/service.ts';
+
+/** M8-3 S11: control-socket account routes — an exact method + path allow-list, ≤ 16 KB JSON bodies, no login route. */
+export const CONTROL_BODY_MAX = 16 * 1024;
+const CONTROL_ID = '[a-z0-9][a-z0-9-]{0,31}';
+export const CONTROL_ROUTES: readonly { method: string; re: RegExp }[] = Object.freeze([
+  { method: 'GET', re: /^\/accounts$/ },
+  { method: 'POST', re: /^\/accounts$/ },
+  { method: 'PUT', re: /^\/accounts\/order$/ },
+  { method: 'PUT', re: new RegExp(`^/accounts/${CONTROL_ID}$`) },
+  { method: 'POST', re: new RegExp(`^/accounts/${CONTROL_ID}/check$`) },
+  { method: 'DELETE', re: new RegExp(`^/accounts/${CONTROL_ID}$`) },
+]);
+/** S11: `<home>/run` must be a real directory owned by the user with mode 0700, or no socket is opened. */
+export function controlDirOk(dir: string): boolean {
+  try {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
+    return (st.mode & 0o777) === 0o700;
+  } catch {
+    return false;
+  }
+}
 import { Auth, COOKIE_NAME, clearCookie, parseCookies, sessionCookie } from './auth.ts';
 
 const log = logger('http');
@@ -104,6 +128,13 @@ export class DashboardServer {
 
   /** Unix-socket control channel (0600): `conductor open` asks for a one-time sign-in link. */
   async listenControl(sockPath: string): Promise<void> {
+    const dir = dirname(sockPath);
+    try {
+      if (existsSync(dir) && !lstatSync(dir).isSymbolicLink() && (lstatSync(dir).mode & 0o777) !== 0o700) chmodSync(dir, 0o700);
+    } catch {
+      /* verified below */
+    }
+    if (!controlDirOk(dir)) throw new Error('the run folder is not a private directory owned by you (mode 0700); the control socket was not opened');
     if (existsSync(sockPath)) {
       try {
         unlinkSync(sockPath);
@@ -118,6 +149,8 @@ export class DashboardServer {
         res.end(JSON.stringify({ url: this.loginUrl(), file: this.loginFile(this.sockPath ? dirname(this.sockPath) : '') }));
       } else if (req.method === 'GET' && req.url === '/status') {
         res.end(JSON.stringify({ pid: process.pid, port: this.port }));
+      } else if (CONTROL_ROUTES.some((r) => r.method === req.method && r.re.test(req.url ?? ''))) {
+        void this.controlAccounts(req, res);
       } else {
         res.statusCode = 404;
         res.end('{}');
@@ -131,6 +164,45 @@ export class DashboardServer {
       chmodSync(sockPath, 0o600);
     } catch {
       /* best effort */
+    }
+  }
+
+  /** The same strict handlers as `/api/accounts…` (shared `accountRoute`), on the same-user 0600 socket. */
+  private async controlAccounts(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const send = (status: number, body: unknown) => {
+      res.statusCode = status;
+      res.end(JSON.stringify(body));
+    };
+    try {
+      let body: unknown = {};
+      if (req.method !== 'GET') {
+        const type = String(req.headers['content-type'] ?? '');
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const c of req) {
+          size += (c as Buffer).length;
+          if (size > CONTROL_BODY_MAX) return send(413, { error: { code: 'too_large', message: 'Request too large.' } });
+          chunks.push(c as Buffer);
+        }
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (raw.length) {
+          if (!/^application\/json\b/i.test(type)) return send(415, { error: { code: 'bad_request', message: 'Send application/json.' } });
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            return send(400, { error: { code: 'bad_request', message: 'Malformed JSON.' } });
+          }
+        }
+      }
+      const svc = this.d.api.accountsService();
+      if (!svc) return send(501, { error: { code: 'not_available', message: 'Accounts are not available in this mode.' } });
+      const out = await accountRoute(svc, req.method ?? 'GET', req.url ?? '', body, { cli: true });
+      if (!out) return send(404, {});
+      return send(out.status ?? 200, out.json ?? {});
+    } catch (e) {
+      if (e instanceof AccountError || e instanceof ApiFail) return send(e.status, { error: { code: e.code, message: e.message } });
+      log.warn(`control: accounts route failed: ${errMsg(e).slice(0, 120)}`);
+      return send(500, { error: { code: 'internal', message: 'Internal error.' } });
     }
   }
 

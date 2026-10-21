@@ -99,7 +99,7 @@ test('ui/style.css: no @import and no external url()', () => {
 
 test('no code for controls whose backend is not built yet (M8-U §2.0; each slice removes its own entry)', () => {
   const app = code(read('app.js'));
-  for (const id of ['runMode', '/api/run-mode', '/api/models', '/api/accounts']) {
+  for (const id of ['runMode', '/api/run-mode', '/api/models']) { // M8-3 removed '/api/accounts' (its backend landed)
     assert.ok(!app.includes(id), `ui/app.js mentions ${id}`);
   }
 });
@@ -111,6 +111,13 @@ function rawPathJoins(src: string): string[] {
   for (const m of src.matchAll(/`\/api\/(asks|items)\/\$\{([^}]*)\}/g)) if (!/^enc\(/.test(m[2]!)) hits.push(m[0]);
   return hits;
 }
+test('M8-3: every /api/accounts/<id> path in ui/app.js encodes its id; account labels go through text nodes (no innerHTML)', () => {
+  const app = code(read('app.js'));
+  const joins = [...app.matchAll(/`\/api\/accounts\/\$\{([^}]*)\}/g)].map((m) => m[1]!);
+  assert.ok(joins.length >= 2);
+  for (const j of joins) assert.match(j, /^enc\(/, j);
+  assert.ok(!/innerHTML/.test(app));
+});
 test('every /api/asks/ and /api/items/ path in ui/app.js encodes its id (M8-U2)', () => {
   assert.deepEqual(rawPathJoins(code(read('app.js'))), []);
   assert.ok(code(read('app.js')).includes("'/api/asks/' + enc(id) + '/dismiss'"), 'the dismiss call is present and encoded');

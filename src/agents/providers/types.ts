@@ -5,6 +5,7 @@ import type { Clock } from '../../util.ts';
 import type { Schema } from '../json.ts';
 import type { StageName } from '../../types.ts';
 import type { ResolvedSel } from '../../models/select.ts';
+import type { AccountRef } from '../../accounts/types.ts';
 
 /** Registry-driven: add a provider by adding a registry entry; nothing else names providers in a ternary. */
 export type ProviderId = 'claude' | 'cursor' | 'codex';
@@ -33,6 +34,8 @@ export interface ReadOnlyRunReq {
   maxTurnsFactor?: number;
   /** M8-2: the resolved model/effort for this tool (data only). Absent ⇒ the tool-default resolution. */
   sel?: ResolvedSel;
+  /** M8-3: the account this run uses (absent/'default' ⇒ today's env, byte-identical). Never a path, never a secret. */
+  account?: AccountRef;
 }
 
 /** Deep Research: Claude with web tools only, in an empty scratch directory. */
@@ -48,6 +51,8 @@ export interface ResearchRunReq {
   sel?: ResolvedSel;
   /** M8-6: Standard (default — today's exact argv) or Deep. Only `--max-turns` and the wall clock differ (RESEARCH_DEPTH). */
   depth?: 'standard' | 'deep';
+  /** M8-3 (B2): the Claude account research runs on. */
+  account?: AccountRef;
 }
 
 export interface BuildRunReq {
@@ -61,6 +66,9 @@ export interface BuildRunReq {
   secrets?: string[];
   /** M8-2: the builder's resolved selection, forwarded untouched by the envelope. */
   sel?: ResolvedSel;
+  /** M8-3: the builder's account, and (named Cursor only, B5) the account env fragment the ENVELOPE resolved — never `prepare`. */
+  account?: AccountRef;
+  accountEnv?: Record<string, string>;
 }
 
 /** What a provider's own guard looks like after `prepare` (recorded on the run as guardSha / guardEnvOnly). */

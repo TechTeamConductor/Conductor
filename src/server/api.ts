@@ -31,10 +31,14 @@ import { BRIEF_ID_RE, type ResearchCardView } from '../briefs/types.ts';
 import { used as budgetUsed } from '../limits/budget.ts';
 import { detectGates } from '../git/gates.ts';
 import { inspectRepo } from '../git/worktree.ts';
-import { errMsg, truncate } from '../util.ts';
+import { deepClone, errMsg, truncate } from '../util.ts';
+import { logger } from '../log.ts';
+import { TAINTED_ACTORS } from '../board/types.ts';
+import type { Run } from '../types.ts';
 import { OpenError, openRun, type ExecFn } from './open.ts';
 import type { Auth } from './auth.ts';
 import type { CatalogView } from '../models/types.ts';
+import { AccountError, AccountService } from '../accounts/service.ts';
 
 export class ApiFail extends Error {
   status: number;
@@ -61,6 +65,8 @@ export interface ApiResult {
 }
 
 export interface ApiDeps {
+  /** M8-3 accounts per tool. Absent ⇒ the /api/accounts endpoints answer 501. */
+  accounts?: AccountService;
   /** Quick Ask (M5). Absent ⇒ the ask endpoints answer 501. */
   asks?: AskService;
   /** "Design the work" + research briefs (M8-6). Absent ⇒ the brief endpoints answer 501. */
@@ -88,6 +94,10 @@ export interface ApiDeps {
 /** N5: GET /api/roles without a model service (e.g. a test or demo wiring) — every tool shows "Tool default" only. */
 const NO_MODELS_REASON = 'Model lists are not available in this mode.';
 const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
+const log = logger('api');
+/** M8-4 §2.3/N8: the static confirmation text for turning Complete auto on (names every forced hold). */
+const COMPLETE_AUTO_CONFIRM =
+  'Complete auto approves and builds plans without asking you and moves work to the next account or tool at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
 // L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -154,7 +164,29 @@ export class Api {
       .map((i) => ({ key: i.key, title: i.title, lane: i.lane, kind: i.kind, createdAt: i.createdAt, updatedAt: i.updatedAt, note: why.get(i.key) }));
   }
 
-  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota']; cards: ApiState['cards'] } {
+  /**
+   * M8-4 §2.6: why a run may NOT be approved from the waiting list (null = it may). Fail closed, in order: not waiting; a forced hold (an
+   * ABSENT `forcedHold` — a run held before M8-4 — counts as forced); an untrusted source (belt and braces); a card created by a tainted actor
+   * (S9b: "Design the work", research, imports, Ask conversions); risk-rule hits (they keep the per-card "I understand" confirmation).
+   */
+  private notBulkApprovable(run: Run): 'forced' | 'risky' | 'not_waiting' | null {
+    if (run.status !== 'awaiting_approval') return 'not_waiting';
+    if (run.forcedHold !== false) return 'forced';
+    if (run.untrusted === true) return 'forced';
+    const createdBy = this.d.board.item(run.key)?.createdBy;
+    if (createdBy === undefined || TAINTED_ACTORS.includes(createdBy)) return 'forced';
+    if (run.risks?.length) return 'risky';
+    return null;
+  }
+
+  /** M8-4: plans waiting right now, and which of them "Approve waiting plans" would accept (titles redacted like all card text). */
+  private waiting(): { total: number; bulkApprovable: number; eligible: { key: string; rev: number; title: string }[] } {
+    const waiting = this.d.store.list().filter((r) => r.status === 'awaiting_approval');
+    const eligible = waiting.filter((r) => this.notBulkApprovable(r) === null).map((r) => ({ key: r.key, rev: r.rev, title: truncate(redact(r.title, []), 200) }));
+    return { total: waiting.length, bulkApprovable: eligible.length, eligible };
+  }
+
+  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota']; cards: ApiState['cards']; accounts?: ApiState['accounts'] } {
     const cfg = this.d.getConfig();
     const now = Date.now();
     const st = this.d.engine.status();
@@ -181,9 +213,12 @@ export class Api {
         pollSeconds: st.pollSeconds,
         ignored: st.ignored,
         storageProblem: st.storageProblem,
+        runMode: cfg.pipeline.runMode,
+        runModeChangedAt: cfg.pipeline.runModeChangedAt ?? null,
       },
       quota: st.quota,
       cards: this.cards(st.ignored),
+      ...(this.d.accounts ? { accounts: this.d.accounts.list() } : {}),
     };
   }
 
@@ -218,6 +253,7 @@ export class Api {
       repos: cfg.repos.map((r) => this.repoView(r, persist)),
       runs: live.runs,
       cards: live.cards,
+      ...(live.accounts ? { accounts: live.accounts } : {}),
       ...(this.d.briefs ? { home: this.homeState(cfg) } : {}),
     };
   }
@@ -354,6 +390,14 @@ export class Api {
     return body;
   }
 
+  /** The control socket's handle on the same service (S11). */
+  accountsService(): AccountService | null {
+    return this.d.accounts ?? null;
+  }
+  private accountsSvc(): AccountService {
+    if (!this.d.accounts) throw new ApiFail(501, 'not_available', 'Accounts are not available in this mode.');
+    return this.d.accounts;
+  }
   private asksSvc(): AskService {
     if (!this.d.asks) throw new ApiFail(501, 'not_available', 'Quick Ask is not available here.');
     return this.d.asks;
@@ -410,7 +454,9 @@ export class Api {
       if (e instanceof ApiFail) throw e;
       if (e instanceof EngineError) throw new ApiFail(e.code === 'missing' ? 404 : e.code === 'bad_lane' || e.code === 'bad_repo' ? 400 : 409, e.code, e.message);
       if (e instanceof BoardError) throw new ApiFail(boardStatus(e.code), e.code, e.message);
-      if (e instanceof AskError) throw new ApiFail(e.status, e.code, e.message);
+      // M8-3: `extra` is allow-listed to `retryAt` only
+      if (e instanceof AskError) throw new ApiFail(e.status, e.code, e.message, undefined, e.extra ? { retryAt: e.extra.retryAt } : undefined);
+      if (e instanceof AccountError) throw new ApiFail(e.status, e.code, e.message);
       if (e instanceof BriefError) throw new ApiFail(e.status, e.code, e.message, undefined, e.extra);
       if (e instanceof OpenError) throw new ApiFail(e.code === 'bad_target' ? 400 : 409, e.code, e.message);
       throw e;
@@ -419,6 +465,11 @@ export class Api {
 
   private async route(method: string, path: string, q: URLSearchParams, body: any): Promise<ApiResult> {
     let m: RegExpExecArray | null;
+    // ───────── M8-3 accounts (strict, CSRF, loopback — the same handlers as the control socket, S11) ─────────
+    if (path === '/api/accounts' || path.startsWith('/api/accounts/')) {
+      const r = await accountRoute(this.accountsSvc(), method, path.slice('/api'.length), method === 'GET' ? undefined : body);
+      if (r) return r;
+    }
     if (method === 'GET') {
       if (path === '/api/state') return { json: await this.state() };
       if ((m = /^\/api\/runs\/([^/]+)$/.exec(path))) return { json: this.runDetail(safeDecode(m[1]!)) };
@@ -468,10 +519,10 @@ export class Api {
       for (const k of Object.keys(body)) if (!['policy', 'confirmFullAuto'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
       if (!['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'].includes(body.policy)) throw new ApiFail(400, 'bad_request', '"policy" must be full-auto, approve-plan, approve-risky or manual-stages.');
       if (body.policy === 'full-auto' && body.confirmFullAuto !== true) throw new ApiFail(400, 'confirm_required', 'Full automation needs "confirmFullAuto": true — plans will run without asking (large changes, protected files and unverified sources still wait for you).');
+      // M8-4 N1: build a NEW config, persist it, then swap — a refused save leaves memory and disk unchanged
       const cfg = this.d.getConfig();
       const prev = cfg.projects?.[key] ?? {};
-      cfg.projects = { ...(cfg.projects ?? {}), [key]: { ...prev, policy: body.policy } };
-      this.d.saveConfig(cfg);
+      this.d.saveConfig({ ...cfg, projects: { ...(cfg.projects ?? {}), [key]: { ...prev, policy: body.policy } } });
       return { json: { ok: true, policy: body.policy } };
     }
     if ((m = /^\/api\/projects\/([^/]+)\/context\/settings$/.exec(path)) && method === 'PUT') {
@@ -482,9 +533,10 @@ export class Api {
       const cfg = this.d.getConfig();
       const cur = cfg.projects?.[key]?.context ?? { summaries: false, staleDays: 14, packBytes: 8192 };
       const next = normalizeProjects({ [key]: { context: { ...cur, ...body } } });
-      cfg.projects = { ...(cfg.projects ?? {}), [key]: { ...(cfg.projects?.[key] ?? {}), context: next[key]!.context } }; // keep everything else of the project (its policy!)
-      this.d.saveConfig(cfg);
-      return { json: { ok: true, context: cfg.projects[key]!.context, notice: cfg.projects[key]!.context!.summaries ? 'Directory summaries spend model quota (a small number of calls per day, see pipeline.contextRunsPerDay).' : undefined } };
+      // M8-4 N1: a NEW config (keep everything else of the project — its policy!), persisted before the swap
+      const projects = { ...(cfg.projects ?? {}), [key]: { ...(cfg.projects?.[key] ?? {}), context: next[key]!.context } };
+      this.d.saveConfig({ ...cfg, projects });
+      return { json: { ok: true, context: projects[key]!.context, notice: projects[key]!.context!.summaries ? 'Directory summaries spend model quota (a small number of calls per day, see pipeline.contextRunsPerDay).' : undefined } };
     }
     if (method === 'POST' && path === '/api/ask') {
       const allowed = new Set(['question', 'repo', 'allowChange', 'mode']);
@@ -564,6 +616,46 @@ export class Api {
       const repo = str(body.repo, 'repo', 64, false);
       const r = await this.d.engine.createTask({ title, description, repo: repo || undefined });
       return { status: 201, json: { ok: true, key: r.key, url: r.url } };
+    }
+
+    // ───────── M8-4 commit 3: "Approve waiting plans" — a bulk HUMAN approval of exactly the runs the client listed (never "all") ─────────
+    if (method === 'POST' && path === '/api/runs/approve-waiting') {
+      if (!isPlain(body) || Object.getPrototypeOf(body) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
+      for (const k of Object.getOwnPropertyNames(body)) if (k !== 'runs' && k !== 'confirm') throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      const list = body.runs;
+      if (!Array.isArray(list) || list.length < 1 || list.length > 50) throw new ApiFail(400, 'bad_request', '"runs" must list 1 to 50 plans.');
+      const wanted: { key: string; rev: number }[] = [];
+      const seen = new Set<string>();
+      for (const e of list) {
+        if (!isPlain(e) || Object.getPrototypeOf(e) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'Each entry must be { key, rev }.');
+        for (const k of Object.getOwnPropertyNames(e)) if (k !== 'key' && k !== 'rev') throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+        if (typeof e.key !== 'string' || !KEY_RE.test(e.key)) throw new ApiFail(400, 'bad_request', 'Each "key" must be a card key.');
+        if (typeof e.rev !== 'number' || !Number.isInteger(e.rev) || e.rev < 1) throw new ApiFail(400, 'bad_request', 'Each "rev" must be a positive integer.');
+        if (seen.has(e.key)) throw new ApiFail(400, 'bad_request', 'Each card can be listed once.');
+        seen.add(e.key);
+        wanted.push({ key: e.key, rev: e.rev });
+      }
+      if (Object.hasOwn(body, 'confirm') && typeof body.confirm !== 'boolean') throw new ApiFail(400, 'bad_request', '"confirm" must be true or false.');
+      if (body.confirm !== true) throw new ApiFail(400, 'confirm_required', 'This approves every listed plan and starts building it. Send "confirm": true.');
+      const approved: string[] = [];
+      const skipped: { key: string; reason: 'stale' | 'forced' | 'risky' | 'not_waiting' | 'missing' }[] = [];
+      for (const w of wanted) {
+        // N3a: the checks and the approval run synchronously, with no await in between
+        const run = this.d.store.get(w.key);
+        const why = !run ? 'missing' : w.rev !== run.rev && run.status === 'awaiting_approval' ? 'stale' : this.notBulkApprovable(run);
+        if (why) { skipped.push({ key: w.key, reason: why }); continue; }
+        try {
+          this.d.engine.approve(w.key, 'human', w.rev, false);
+        } catch (e) {
+          if (e instanceof EngineError) { skipped.push({ key: w.key, reason: e.code === 'stale' ? 'stale' : e.code === 'confirm_required' ? 'risky' : 'not_waiting' }); continue; }
+          throw e;
+        }
+        this.d.store.update(w.key, (r) => void r.history.push({ ts: Date.now(), text: 'Plan approved (you, from the waiting list)' })); // N3b
+        approved.push(w.key);
+      }
+      log.info(`approve waiting: ${approved.length} approved, ${skipped.length} skipped`); // counts only
+      if (approved.length) this.d.engine.invalidate();
+      return { json: { approved, skipped } };
     }
 
     if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open)$/.exec(path)) && method === 'POST') {
@@ -671,7 +763,37 @@ export class Api {
       }
     }
 
+    // ───────── M8-4 run mode: ONE writer of pipeline.runMode (strict, CSRF via http.ts, confirm to turn on, persist-then-swap) ─────────
+    if (method === 'PUT' && path === '/api/run-mode') {
+      if (!isPlain(body) || Object.getPrototypeOf(body) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
+      for (const k of Object.getOwnPropertyNames(body)) if (k !== 'runMode' && k !== 'confirm') throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      const runMode = body.runMode;
+      if (runMode !== 'per-settings' && runMode !== 'complete-auto') throw new ApiFail(400, 'bad_request', '"runMode" must be "per-settings" or "complete-auto".');
+      if (Object.hasOwn(body, 'confirm') && typeof body.confirm !== 'boolean') throw new ApiFail(400, 'bad_request', '"confirm" must be true or false.');
+      const cfg = this.d.getConfig();
+      const from = cfg.pipeline.runMode;
+      if (from === runMode) return { json: { ok: true, runMode, changed: false, waiting: this.waiting() } };
+      if (runMode === 'complete-auto' && body.confirm !== true) throw new ApiFail(400, 'confirm_required', COMPLETE_AUTO_CONFIRM);
+      // B1: build a NEW config (the live one is never mutated); saveConfig persists first and only then swaps memory — a refused save changes nothing
+      const next = deepClone(cfg);
+      next.pipeline.runMode = runMode;
+      next.pipeline.runModeChangedAt = Date.now();
+      try {
+        this.d.saveConfig(next);
+      } catch (e) {
+        log.error(`run mode change not saved: ${errMsg(e)}`);
+        throw new ApiFail(500, 'save_failed', 'The run mode could not be saved, so nothing changed. Details are in the log.');
+      }
+      const waiting = this.waiting();
+      log.info(`run mode: ${from} → ${runMode} (waiting: ${waiting.total})`); // counts only: no titles, no keys
+      this.d.engine.invalidate(); // SSE state carries engine.runMode
+      return { json: { ok: true, runMode, changed: true, waiting, settings: toSettings(this.d.getConfig()) } };
+    }
+
     if (method === 'PUT' && path === '/api/settings') {
+      if (isPlain(body) && (Object.hasOwn(body, 'runMode') || Object.hasOwn(body, 'runModeChangedAt'))) throw new ApiFail(400, 'bad_request', 'Change the run mode with PUT /api/run-mode.');
+      if (isPlain(body) && Object.hasOwn(body, 'limitRule')) AccountService.checkLimitRule(body.limitRule); // M8-3: strict ⇒ 400
+      if (isPlain(body) && Object.hasOwn(body, 'limitRuleEffective')) throw new ApiFail(400, 'bad_request', 'limitRuleEffective is read-only.');
       const next = applySettings(this.d.getConfig(), body as Partial<Settings>);
       this.d.saveConfig(next);
       this.d.engine.invalidate();
@@ -750,4 +872,31 @@ export class Api {
 
     throw new ApiFail(404, 'not_found', 'No such endpoint.');
   }
+}
+
+/**
+ * M8-3 S11: the EXACT method + path allow-list shared by HTTP (`/api` prefix stripped) and the 0600 control socket. No login route; no route
+ * takes or returns a credential, a path or an email. Returns null for a path this table does not own.
+ */
+export async function accountRoute(svc: AccountService, method: string, path: string, body: unknown, opts: { cli?: boolean } = {}): Promise<ApiResult | null> {
+  const ID = '([a-z0-9][a-z0-9-]{0,31})';
+  let m: RegExpExecArray | null;
+  if (path === '/accounts' && method === 'GET') return { json: svc.listing() };
+  if (path === '/accounts' && method === 'POST') return { status: 201, json: svc.add(body) };
+  if (path === '/accounts/order' && method === 'PUT') return { json: { accounts: svc.reorder(body) } };
+  if ((m = new RegExp(`^/accounts/${ID}/check$`).exec(path)) && method === 'POST') {
+    const view = await svc.check(m[1], { waitMs: 10_000 });
+    return { status: 202, json: { account: view } };
+  }
+  if ((m = new RegExp(`^/accounts/${ID}$`).exec(path))) {
+    if (method === 'PUT') return { json: { account: svc.rename(m[1], body, (body as { provider?: unknown } | null)?.provider) } };
+    if (method === 'DELETE') {
+      // `--keep-signin` is CLI-only (the control socket); over HTTP removal always signs out (B4)
+      const o = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+      if (Object.keys(o).some((k) => !(opts.cli && k === 'keepSignin'))) throw new ApiFail(400, 'bad_request', 'Unexpected fields.');
+      return { json: await svc.remove(m[1], { keepSignin: opts.cli === true && o.keepSignin === true }) };
+    }
+  }
+  if (path === '/accounts' || path.startsWith('/accounts/')) throw new ApiFail(404, 'not_found', 'Unknown accounts route.');
+  return null;
 }

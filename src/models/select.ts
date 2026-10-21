@@ -298,6 +298,12 @@ export function selectionForTool(role: Role, tool: ProviderId, cfg: Pick<Config,
   return resolveSelection(tool, s, catalog, 'tool-default');
 }
 
+/** M8-3 §2.2: the selection a candidate of `tool` runs for `role` — the role's choice only when made for this tool (B2), else the tool default. */
+export function candidateSel(cfg: Pick<Config, 'roles' | 'toolModels'>, role: Role, tool: ProviderId): RoleModelSel {
+  const rs = roleSel(cfg, role);
+  return rs.tool && rs.tool === tool ? rs : toolDefaultSelection(cfg, tool);
+}
+
 /** B4 / §2.9 table: may this tool (with this catalog) run this choice? null = the list is unknown (counts as offering for ordering). */
 export function modelOffered(tool: ProviderId, catalog: CatalogView | null, sel: RoleModelSel): true | false | null {
   if (!sel.model) return true;

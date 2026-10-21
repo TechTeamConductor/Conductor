@@ -48,6 +48,12 @@ export interface AskRecord {
   briefId?: string;
   /** M8-6 Q3: the research card was dismissed from the board's "Report ready" lane. */
   dismissedAt?: number;
+  /** M8-3: `limited` = every account it may use reached its limit mid-call (the counter was refunded); `retryAt` = the earliest reset. */
+  errorKind?: 'limited';
+  retryAt?: number;
+  /** The counter window this ask took (so a refund credits THAT window, N12) and whether it was refunded (at most once). */
+  takenKey?: string;
+  refunded?: boolean;
 }
 export const askDir = (): string => join(paths.home(), 'asks');
 export const newAskId = (): string => `ask-${randomBytes(8).toString('hex')}`;
@@ -113,6 +119,10 @@ export function validateAsk(raw: unknown, id: string): AskRecord | null {
     ...(mode === 'research' && own(raw, 'brief') ? (() => { const b = shapeResearchBrief(own(raw, 'brief')); return b ? { brief: b } : {}; })() : {}),
     ...(mode === 'research' && (own(raw, 'depth') === 'standard' || own(raw, 'depth') === 'deep') ? { depth: own(raw, 'depth') as 'standard' | 'deep' } : {}),
     ...(typeof own(raw, 'briefId') === 'string' && /^brf-[0-9a-f]{16}$/.test(own(raw, 'briefId') as string) ? { briefId: own(raw, 'briefId') as string } : {}),
+    ...(own(raw, 'errorKind') === 'limited' ? { errorKind: 'limited' as const } : {}),
+    ...(typeof own(raw, 'retryAt') === 'number' && Number.isFinite(own(raw, 'retryAt')) && (own(raw, 'retryAt') as number) > 0 ? { retryAt: own(raw, 'retryAt') as number } : {}),
+    ...(typeof own(raw, 'takenKey') === 'string' && /^\d{4}-\d{2}-\d{2}(T\d{2})?$/.test(own(raw, 'takenKey') as string) ? { takenKey: own(raw, 'takenKey') as string } : {}),
+    ...(own(raw, 'refunded') === true ? { refunded: true } : {}),
     ...(typeof own(raw, 'dismissedAt') === 'number' && Number.isFinite(own(raw, 'dismissedAt')) && (own(raw, 'dismissedAt') as number) > 0 ? { dismissedAt: own(raw, 'dismissedAt') as number } : {}),
   };
 }

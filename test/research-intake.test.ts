@@ -50,7 +50,7 @@ test('S2a selRole changes nothing but --model/--effort; S2b a fake init with Web
   const h = await makeHarness();
   try {
     h.scenario({ claude: { '*': { ask: [{}] } } });
-    const base = { stage: 'plan' as const, cwd: h.root, prompt: '# Stage: ASK\nq', schema: { type: 'object' }, name: 'conductor same', onEvent: () => undefined, states: h.engine.routeStates() };
+    const base = { stage: 'plan' as const, cwd: h.root, prompt: '# Stage: ASK\nq', schema: { type: 'object' }, name: 'conductor same', onEvent: () => undefined, states: h.engine.routeStates(), rule: 'switch' as const };
     await h.agents.readOnly({ ...base, role: 'context' });
     await h.agents.readOnly({ ...base, role: 'context', selRole: 'research' });
     const [a, b] = h.calls().filter((c) => c.stage === 'ask').map((c) => c.argv as string[]);
@@ -87,7 +87,7 @@ test("S3 Claude only: chain ['cursor','claude'] with Claude healthy runs Claude;
     h.cfg.roles.context = { providers: ['cursor', 'claude'] };
     const notes: string[] = [];
     h.scenario({ claude: { '*': { ask: [{}] } } });
-    await h.agents.readOnly({ role: 'context', onlyProviders: ['claude'], stage: 'plan', cwd: h.root, prompt: '# Stage: ASK\nq', schema: { type: 'object' }, name: 'n', states: h.engine.routeStates(), onEvent: (e) => { if (e.kind === 'note' && e.text) notes.push(e.text); } });
+    await h.agents.readOnly({ role: 'context', onlyProviders: ['claude'], stage: 'plan', cwd: h.root, prompt: '# Stage: ASK\nq', schema: { type: 'object' }, name: 'n', states: h.engine.routeStates(), rule: 'switch', onEvent: (e) => { if (e.kind === 'note' && e.text) notes.push(e.text); } });
     assert.deepEqual(notes, ['This step runs on Claude only — Claude is doing this read-only step.']);
   } finally { await h.cleanup(); }
 });

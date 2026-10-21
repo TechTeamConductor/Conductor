@@ -45,6 +45,8 @@ export interface ModelServiceDeps {
   envFor?: (provider: Discoverable, account: string) => Record<string, string> | Promise<Record<string, string>>;
   /** M8-3 seam: the accounts to discover for. Default ['default']. */
   accountIds?: (provider: ProviderId) => string[];
+  /** M8-3 seam (S9/N3): called once the discovery child of (provider, account) was reaped — releases the account's lease taken in `envFor`. */
+  afterDiscovery?: (provider: Discoverable, account: string) => void;
 }
 
 export interface HealthLike {
@@ -332,6 +334,11 @@ export class ModelService {
       return provider === 'claude' ? await discoverClaude(ctx) : await discoverCursor({ ...ctx, cliVersion: this.seenVersion.get('cursor') ?? null });
     } finally {
       setLeftover(cleanDiscoveryDir()); // after the child was reaped (runProcess resolved)
+      try {
+        this.d.afterDiscovery?.(provider, account);
+      } catch {
+        /* never fails a refresh */
+      }
     }
   }
 }

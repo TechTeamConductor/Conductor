@@ -30,9 +30,15 @@ import { PROVIDER_IDS, capabilitiesOf, providerLabel } from '../agents/providers
 import { effectiveReadOnlyTier, readOnlyTier } from '../agents/providers/verification.ts';
 import { currentCodexBinding } from '../agents/providers/codex.ts';
 import { CANARY_VERSION } from '../agents/providers/canary.ts';
-import { route, type ProviderState, type States } from '../agents/routing.ts';
+import { route, type AccountState, type ProviderState, type States } from '../agents/routing.ts';
 import { resolveBin } from '../config.ts';
 import type { Role } from '../agents/roles.ts';
+import { DEFAULT_ACCOUNT, accountKey, type AccountRef } from '../accounts/types.ts';
+import { effectiveLimitRule } from '../accounts/limit-rule.ts';
+import { accountBuildOk } from '../agents/providers/verification.ts';
+import { isRemoving } from '../accounts/profile.ts';
+import { candidateSel, modelOffered } from '../models/select.ts';
+import type { AgentResult, LimitInfo } from '../types.ts';
 
 const log = logger('engine');
 const TERMINAL = new Set(['finished', 'aborted']);
@@ -84,7 +90,12 @@ export class Engine {
   private stages: Stages;
   readonly effects: Effects;
   private jobs = new Map<string, Job>();
-  private pauses = new Map<ProviderId, { until: number; reason: string }>();
+  /** M8-3: usage-limit pauses per ACCOUNT (`provider:id`), in memory (D-E), capped at 24 h. */
+  private pauses = new Map<string, { until: number; reason: string }>();
+  /** M8-3: which account each running job's current attempt uses (removal ⇒ restart). */
+  private jobAccount = new Map<string, string>();
+  /** M8-3: a named account whose pre-flight failed at its last check is `unavailable` (never routed) until a check passes. */
+  private accountUnavailable = new Set<string>();
   private globalPaused = false;
   private pauseReason: string | undefined;
   private lastPollAt: number | null = null;
@@ -94,7 +105,7 @@ export class Engine {
   private tickAgain = false;
   private stopped = true;
   private failCounts = new Map<string, number>();
-  private quotaMap = new Map<ProviderId, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
+  private quotaMap = new Map<string, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
@@ -133,22 +144,17 @@ export class Engine {
       signal: (key) => this.jobs.get(key)?.ac.signal ?? new AbortController().signal,
       emit: (key, ev) => this.emit(key, ev),
       hist: (key, text) => this.d.store.update(key, (r) => void r.history.push({ ts: this.clock.now(), text })),
-      routeStates: () => this.routeStates(),
+      routeStates: (role) => this.routeStates(role),
       freshHealth: () => this.freshHealth(),
-      providerPause: (agent, until, reason) => {
-        // a pause derived from a CLI limit message is capped at 24 h (a hostile or buggy message cannot park a provider for months); a human can resume any time
-        this.pauses.set(agent, { until: Math.min(until, this.clock.now() + PAUSE_CEILING_MS), reason });
-        this.changed();
-      },
-      pausedUntil: (agent) => this.activePause(agent),
+      providerPause: (ref, until, reason) => this.accountPause(ref, until, reason),
+      pausedUntil: (ref) => this.activePause(accountKey(ref)),
+      limitRule: () => effectiveLimitRule(this.d.getConfig()),
+      noteCandidate: (key, ref) => this.noteCandidate(key, ref),
       tickSoon: () => this.tickSoon(),
       analysisSlot: (signal) => this.analysisSem.acquire(signal),
       context: this.context,
       networkState: () => this.probe.check(),
-      recordQuota: (agent, q) => {
-        this.quotaMap.set(agent, { utilization7d: q.utilization7d, utilization5h: q.utilization5h, resetsAt: q.resetsAt, rejected: q.status === 'rejected' });
-        this.changed();
-      },
+      recordQuota: (ref, q) => this.recordQuota(ref, q),
     };
   }
 
@@ -177,34 +183,155 @@ export class Engine {
     }
   }
 
-  /** The router's view of every provider: capabilities derived from code, tier, CLI-reported health/auth, CLI-reported pauses. */
-  routeStates(): States {
+  /**
+   * The router's view of every provider: capabilities derived from code, tier, CLI-reported health/auth, CLI-reported pauses — and (M8-3)
+   * every account of the tool in config order. `role` given ⇒ `offersModel` per account (the selection THAT candidate would run); else null.
+   */
+  routeStates(role?: Role): States {
     const cfg = this.d.getConfig();
     const health = this.healthSource?.() ?? {};
+    const now = this.clock.now();
     const out = {} as Record<ProviderId, ProviderState>;
     for (const id of PROVIDER_IDS) {
       const bin = (cfg.agents as Record<string, { bin: string } | undefined>)[id]?.bin;
       const h = Object.hasOwn(health, id) ? health[id] : undefined;
+      const toolAuth: ProviderState['auth'] = h?.loggedIn === false ? 'not-logged-in' : h?.loggedIn === true ? 'ok' : 'unknown';
+      const sel = role ? candidateSel(cfg, role, id) : null;
+      const metas = cfg.accounts?.[id] ?? [{ id: DEFAULT_ACCOUNT, name: '' }];
+      const accounts: AccountState[] = metas.map((m) => {
+        const isDefault = m.id === DEFAULT_ACCOUNT;
+        const ref = { provider: id, id: m.id };
+        const enabled = isDefault || (id !== 'codex' && !isRemoving(ref) && !this.accountUnavailable.has(accountKey(ref))); // S24: named Codex is dormant
+        let offersModel: boolean | null = null;
+        if (sel) {
+          try {
+            offersModel = modelOffered(id, this.d.agents.catalogOf(id, m.id), sel);
+          } catch {
+            offersModel = null;
+          }
+        }
+        return { id: m.id, name: m.name, isDefault, enabled, auth: isDefault ? toolAuth : this.namedAuth(ref), pausedUntil: this.activePause(accountKey(ref))?.until ?? null, offersModel, buildOk: accountBuildOk(id, isDefault) };
+      });
+      // provider-level pause (compat + the dashboard): paused only while EVERY enabled account is
+      const en = accounts.filter((a) => a.enabled);
+      const allPaused = en.length > 0 && en.every((a) => a.pausedUntil !== null && a.pausedUntil > now);
       out[id] = {
         caps: capabilitiesOf(this.d.agents.provider(id)),
         // code constant, adjusted by the add-only canary records (a pass counts only while the install still matches what was tested)
         tier: id === 'codex' ? effectiveReadOnlyTier('codex', currentCodexBinding(cfg.agents.codex.bin, h?.version, CANARY_VERSION)) : readOnlyTier(id),
         installed: (bin ? resolveBin(bin) !== null : true) && h?.found !== false,
-        auth: h?.loggedIn === false ? 'not-logged-in' : h?.loggedIn === true ? 'ok' : 'unknown',
-        pausedUntil: this.activePause(id)?.until ?? null,
+        auth: toolAuth,
+        pausedUntil: allPaused ? Math.min(...en.map((a) => a.pausedUntil as number)) : null,
+        // M8-3 (B2): set from CODE, never from config — only Claude in safe-mode isolates its web profile (F11 locks unchanged)
+        ...(id === 'claude' && cfg.agents.claude.isolation === 'safe-mode' ? { webResearchIsolated: true } : {}),
+        accounts,
       };
     }
     return out;
   }
 
-  private activePause(agent: ProviderId): { until: number; reason: string } | null {
-    const p = this.pauses.get(agent);
+  /** A named account's sign-in state from its last check (M8-1 per-account discovery): signed in ⇒ 'ok'; never checked ⇒ 'unknown' (NOT usable). */
+  private namedAuth(ref: AccountRef): AccountState['auth'] {
+    const v = this.d.agents.catalogOf(ref.provider, ref.id);
+    return v?.signedIn === true ? 'ok' : v?.signedIn === false ? 'not-logged-in' : 'unknown';
+  }
+  /** AccountService: a failed/passed pre-flight at the last check (S2: a check ⇒ the account is `unavailable`). */
+  setAccountUnavailable(ref: AccountRef, on: boolean): void {
+    const k = accountKey(ref);
+    if (on ? !this.accountUnavailable.has(k) : this.accountUnavailable.has(k)) {
+      if (on) this.accountUnavailable.add(k);
+      else this.accountUnavailable.delete(k);
+      this.changed();
+    }
+  }
+  isAccountUnavailable(ref: AccountRef): boolean {
+    return this.accountUnavailable.has(accountKey(ref));
+  }
+
+  private activePause(key: string): { until: number; reason: string } | null {
+    const p = this.pauses.get(key);
     if (!p) return null;
     if (p.until <= this.clock.now()) {
-      this.pauses.delete(agent);
+      this.pauses.delete(key);
       return null;
     }
     return p;
+  }
+  /** A pause derived from a CLI limit message is capped at 24 h (a hostile or buggy message cannot park an account for months); a human can resume any time. */
+  private accountPause(ref: AccountRef, until: number, reason: string): void {
+    this.pauses.set(accountKey(ref), { until: Math.min(until, this.clock.now() + PAUSE_CEILING_MS), reason });
+    this.changed();
+  }
+  /** Home calls (research hops, asks) record the pause of the account they left (24 h cap). */
+  recordAccountPause(ref: AccountRef, until: number, reason: string): void {
+    this.accountPause(ref, until, reason);
+  }
+  /** The account's active pause (views). */
+  pauseOf(ref: AccountRef): { until: number; reason: string } | null {
+    return this.activePause(accountKey(ref));
+  }
+  private recordQuota(ref: AccountRef, q: NonNullable<AgentResult['quota']>): void {
+    this.quotaMap.set(accountKey(ref), { utilization7d: q.utilization7d, utilization5h: q.utilization5h, resetsAt: q.resetsAt, rejected: q.status === 'rejected' });
+    this.changed();
+  }
+  quotaOf(ref: AccountRef): { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean } | undefined {
+    return this.quotaMap.get(accountKey(ref));
+  }
+  /** How many running jobs use this account right now (the view's `inUse`). */
+  jobsOn(ref: AccountRef): number {
+    const k = accountKey(ref);
+    let n = 0;
+    for (const [run, a] of this.jobAccount) if (a === k && this.jobs.has(run)) n++;
+    return n;
+  }
+  private noteCandidate(key: string, ref: AccountRef): void {
+    this.jobAccount.set(key, accountKey(ref));
+    const name = this.d.agents.accountLabel(ref.provider, ref.id);
+    const meta = this.d.getConfig().accounts?.[ref.provider]?.find((a) => a.id === ref.id);
+    this.d.store.update(key, (r) => void (r.account = { provider: ref.provider, id: ref.id, name: meta?.name ?? name }));
+  }
+
+  /**
+   * Home requests never queue (§2.3, M8-6): the pure route over the current states. `paused` ⇒ 409 `limited` with `retryAt`; `ineligible` is
+   * reported too (callers keep today's behaviour for it). Quick Ask, Research and briefs call this BEFORE taking a counter.
+   */
+  accountsGate(role: Role): { ok: true } | { ok: false; kind: 'paused' | 'ineligible'; retryAt: number | null; reason: string } {
+    const r = route({ role, roles: this.d.getConfig().roles, states: this.routeStates(role), now: this.clock.now(), label: providerLabel, rule: effectiveLimitRule(this.d.getConfig()) });
+    if (r.ok) return { ok: true };
+    return r.kind === 'paused' ? { ok: false, kind: 'paused', retryAt: r.pauseUntil, reason: r.reason } : { ok: false, kind: 'ineligible', retryAt: null, reason: r.reason };
+  }
+
+  /**
+   * S8 step 2 for stage jobs: every job running on the removed account is stopped (the envelope's git-meta restore runs), its attempt refunded,
+   * and it goes back to the queue with the same `next` and a visible move note. Not a human restart. Partial uncommitted builder edits stay in
+   * the worktree — the next attempt starts on top of them, exactly as after a timeout retry (documented).
+   */
+  async accountRemoved(ref: AccountRef, label: string): Promise<number> {
+    const k = accountKey(ref);
+    const hit = [...this.jobAccount.entries()].filter(([run, a]) => a === k && this.jobs.has(run)).map(([run]) => run);
+    for (const key of hit) {
+      await this.stopJob(key);
+      this.jobAccount.delete(key);
+      const run = this.d.store.get(key);
+      // code review N6: re-queue only a run that is still in flight — a concurrent needs_human / awaiting_approval / pause is never overwritten
+      if (!run || (run.status !== 'running' && run.status !== 'queued')) continue;
+      const role = this.roleFor(run);
+      const r = role ? route({ role, complexity: run.complexity, roles: this.d.getConfig().roles, states: this.routeStates(role), now: this.clock.now(), label: providerLabel, rule: effectiveLimitRule(this.d.getConfig()) }) : null;
+      const nextWho = r?.ok ? this.d.agents.accountLabel(r.candidates[0]!.id, r.candidates[0]!.account) : 'the next available account';
+      const note = `${label} was removed, so this stage started again on ${nextWho}.`;
+      this.d.store.update(key, (x) => {
+        x.agentRuns = Math.max(0, x.agentRuns - 1);
+        x.status = 'queued';
+        x.moved = { kind: r?.ok && r.candidates[0]!.id === ref.provider ? 'account' : 'tool', restarted: true, note, at: this.clock.now(), reason: 'removed' };
+        x.history.push({ ts: this.clock.now(), text: note });
+      });
+    }
+    for (const key of [...this.pauses.keys()]) if (key === k) this.pauses.delete(key);
+    this.quotaMap.delete(k);
+    this.accountUnavailable.delete(k);
+    this.changed();
+    this.tickSoon();
+    return hit.length;
   }
 
   secretsFor(run: Run): string[] {
@@ -269,6 +396,13 @@ export class Engine {
 
   /** Crash recovery: runs that were mid-flight when the process died go back to the queue. */
   recover(): void {
+    const now = this.clock.now();
+    for (const r of this.d.store.list()) {
+      // D-E: pauses live in memory — a limit-paused run re-seeds the pause of the account it hit, so a restart does not re-spawn into a known limit
+      if (r.status === 'paused' && r.pauseKind === 'limit' && r.account && (r.pausedUntil ?? 0) > now && !this.pauses.has(accountKey(r.account))) {
+        this.pauses.set(accountKey(r.account), { until: Math.min(r.pausedUntil!, now + PAUSE_CEILING_MS), reason: r.pauseReason ?? 'usage limit' });
+      }
+    }
     for (const r of this.d.store.list()) {
       if (r.status === 'running') {
         this.d.store.update(r.key, (x) => {
@@ -370,7 +504,7 @@ export class Engine {
     const dir = mkdtempSync(join(tmpdir(), 'conductor-ctx-'));
     try {
       await this.freshHealth();
-      const res = await this.d.agents.readOnly({ role: 'context', complexity: undefined, states: this.routeStates(), onLimit: () => undefined, stage: 'plan', cwd: dir, prompt, schema: SUMMARY_SCHEMA as any, name: 'conductor context summary', onEvent: () => undefined, secrets: this.d.secrets?.() ?? [], toolDefaultOnly: true } as any); // M8-2 N4: the summary runs on the tool default, never the Quick Ask choice
+      const res = await this.d.agents.readOnly({ role: 'context', complexity: undefined, states: this.routeStates('context'), rule: effectiveLimitRule(this.d.getConfig()), onLimit: (l: LimitInfo) => { if (l.account) this.accountPause({ provider: l.provider, id: l.account }, l.resetsAt && l.resetsAt > this.clock.now() ? l.resetsAt : this.clock.now() + 15 * 60_000, l.message); }, stage: 'plan', cwd: dir, prompt, schema: SUMMARY_SCHEMA as any, name: 'conductor context summary', onEvent: () => undefined, secrets: this.d.secrets?.() ?? [], toolDefaultOnly: true } as any); // M8-2 N4: the summary runs on the tool default, never the Quick Ask choice
       return res.ok ? res.json ?? null : null;
     } catch {
       return null;
@@ -562,6 +696,10 @@ export class Engine {
       r.buildFails = 0;
       r.limitStreak = 0;
       r.limitEpisode = 0;
+      r.limitPauses = 0; // B3b: a human restart resets the paused-episode cap, as it resets limitEpisode
+      r.limitPausedEpisode = undefined;
+      r.pauseKind = undefined;
+      r.moved = undefined;
       if (item) {
         r.title = item.title;
         r.description = item.description ?? '';
@@ -645,18 +783,39 @@ export class Engine {
     }
   }
 
-  /** The run waits only when EVERY provider that may take its next step is at a usage limit (v1 semantics, now chain-aware). */
-  private blockedByPause(run: Run): { until: number } | null {
+  /** The run waits only when EVERY account that may take its next step is at a usage limit (v1 semantics, chain- and account-aware). */
+  private blockedByPause(run: Run, statesFor: (role: Role) => States = (role) => this.routeStates(role)): { until: number } | null {
     const role = this.roleFor(run);
     if (!role) return null;
-    const r = route({ role, complexity: run.complexity, roles: this.d.getConfig().roles, states: this.routeStates(), now: this.clock.now(), label: providerLabel });
+    const r = route({ role, complexity: run.complexity, roles: this.d.getConfig().roles, states: statesFor(role), now: this.clock.now(), label: providerLabel, rule: effectiveLimitRule(this.d.getConfig()) });
     return !r.ok && r.kind === 'paused' ? { until: r.pauseUntil } : null;
+  }
+  /** Who would take the run's next step right now (for the "continues on …" line). */
+  private nextLabel(run: Run, statesFor: (role: Role) => States): string | null {
+    const role = this.roleFor(run);
+    if (!role) return null;
+    const r = route({ role, complexity: run.complexity, roles: this.d.getConfig().roles, states: statesFor(role), now: this.clock.now(), label: providerLabel, rule: effectiveLimitRule(this.d.getConfig()) });
+    return r.ok ? this.d.agents.accountLabel(r.candidates[0]!.id, r.candidates[0]!.account) : null;
+  }
+  /** B3c: a limit pause (also records written before M8-3 without a kind, unless they are offline pauses). */
+  private static limitPaused(r: Run): boolean {
+    return r.status === 'paused' && (r.pauseKind === 'limit' || (r.pauseKind === undefined && r.pauseReason !== 'offline'));
   }
 
   schedule(): void {
     if (this.globalPaused) return;
     const cfg = this.d.getConfig();
     const now = this.clock.now();
+    // N4: the router's states (incl. modelOffered per account) are computed ONCE per tick per role, never per run
+    const byRole = new Map<Role, States>();
+    const statesFor = (role: Role): States => {
+      let st = byRole.get(role);
+      if (!st) {
+        st = this.routeStates(role);
+        byRole.set(role, st);
+      }
+      return st;
+    };
     const runs = this.d.store.list().sort((a, b) => a.createdAt - b.createdAt);
     for (const r of runs) {
       if (r.status === 'failed') {
@@ -669,20 +828,30 @@ export class Engine {
     for (const r of this.d.store.list().sort((a, b) => a.createdAt - b.createdAt)) {
       if (this.jobs.size >= cfg.pipeline.maxParallel) break;
       if (this.jobs.has(r.key)) continue;
-      const waitingPause = r.status === 'paused' && (r.pausedUntil ?? 0) > now;
-      if (r.status !== 'queued' && !(r.status === 'paused' && !waitingPause)) continue;
-      const blocked = this.blockedByPause(r);
+      const limitPaused = Engine.limitPaused(r);
+      // offline pauses keep their own timer; a LIMIT pause is re-routed on every tick regardless of pausedUntil (a reset, an added or signed-in
+      // account, a reorder or a rule change resumes it at once — §2.3 auto-resume)
+      const waitingPause = r.status === 'paused' && !limitPaused && (r.pausedUntil ?? 0) > now;
+      if (r.status !== 'queued' && r.status !== 'paused') continue;
+      const blocked = this.blockedByPause(r, statesFor);
       if (blocked) {
         if (r.status !== 'paused') {
           this.d.store.update(r.key, (x) => {
             x.status = 'paused';
             x.pausedUntil = blocked.until;
             x.pauseReason = 'Waiting for the usage limit to reset';
+            x.pauseKind = 'limit';
           });
+        } else if (limitPaused && r.pausedUntil !== blocked.until) {
+          this.d.store.update(r.key, (x) => void (x.pausedUntil = blocked.until));
         }
         continue;
       }
       if (waitingPause) continue;
+      if (limitPaused) {
+        const who = this.nextLabel(r, statesFor);
+        if (who) this.d.store.update(r.key, (x) => void x.history.push({ ts: now, text: `${r.key} continues on ${who}` }));
+      }
       this.startJob(r.key);
     }
   }
@@ -693,12 +862,14 @@ export class Engine {
       r.status = 'running';
       r.pausedUntil = undefined;
       r.pauseReason = undefined;
+      r.pauseKind = undefined;
       r.stageStartedAt = this.clock.now();
     });
     const promise = this.runJob(key, ac)
       .catch((e) => this.failRun(key, e))
       .finally(() => {
         this.jobs.delete(key);
+        this.jobAccount.delete(key);
         this.changed();
         this.tickSoon();
       });
@@ -854,7 +1025,11 @@ export class Engine {
     const run = this.d.store.get(key);
     if (!run) throw new EngineError('missing', 'Unknown run.');
     if (run.status === 'paused') {
-      this.pauses.clear();
+      // M8-3: clear ONLY the pauses of the accounts this run's role may use (chain tools + its complexity pick), never everyone's
+      const role = this.roleFor(run);
+      const cfg = this.d.getConfig();
+      const tools = new Set<ProviderId>(role ? [...cfg.roles[role].providers, ...Object.values(cfg.roles[role].autoByComplexity ?? {})] : PROVIDER_IDS);
+      for (const k of [...this.pauses.keys()]) if (tools.has(k.slice(0, k.indexOf(':')) as ProviderId)) this.pauses.delete(k);
       this.d.store.update(key, (r) => {
         r.status = 'queued';
         r.pausedUntil = undefined;
@@ -926,11 +1101,15 @@ export class Engine {
   // ───────────────────────── introspection ─────────────────────────
   status() {
     const now = this.clock.now();
+    // compat: a provider counts as paused only while ALL its enabled accounts are, until the earliest of them
     const pp: Partial<Record<ProviderId, { until: number; reason: string }>> = {};
+    const cfg = this.d.getConfig();
     for (const a of PROVIDER_IDS) {
-      const p = this.activePause(a);
-      if (p) pp[a] = p;
+      const ids = (cfg.accounts?.[a] ?? [{ id: DEFAULT_ACCOUNT }]).map((m) => m.id).filter((id) => id === DEFAULT_ACCOUNT || (a !== 'codex' && !this.accountUnavailable.has(`${a}:${id}`)));
+      const ps = ids.map((id) => this.activePause(`${a}:${id}`));
+      if (ps.length && ps.every((p) => p !== null)) pp[a] = (ps as { until: number; reason: string }[]).reduce((x, y) => (y.until < x.until ? y : x));
     }
+    const claudeHead = cfg.accounts?.claude?.[0]?.id ?? DEFAULT_ACCOUNT;
     const storageProblem = this.effects.storageProblem();
     return {
       paused: this.globalPaused,
@@ -945,7 +1124,7 @@ export class Engine {
       pollSeconds: TICK_MS / 1000,
       ignored: [...this.ignored],
       now,
-      quota: { claude: this.quotaMap.get('claude') },
+      quota: { claude: this.quotaMap.get(`claude:${claudeHead}`) },
     };
   }
   isRunning(key: string): boolean {

@@ -152,13 +152,13 @@ async function runEveryPath(h: Harness): Promise<void> {
 
   // 2. Agents.readOnly — plan_review on Claude, ask on Cursor, exec on Codex
   const schema = { type: 'object', properties: { ok: { type: 'boolean' } } } as any;
-  const rev = await h.agents.readOnly({ role: 'planning', stage: 'plan_review', cwd: h.repoDir, prompt: '# Stage: PLAN_REVIEW\nIssue key: GLD-1\nTitle: golden', schema, name: 'conductor golden review', onEvent: noop, states: h.engine.routeStates() });
+  const rev = await h.agents.readOnly({ role: 'planning', stage: 'plan_review', cwd: h.repoDir, prompt: '# Stage: PLAN_REVIEW\nIssue key: GLD-1\nTitle: golden', schema, name: 'conductor golden review', onEvent: noop, states: h.engine.routeStates(), rule: 'switch' });
   assert.equal(rev.agent, 'claude');
-  const ask = await h.agents.readOnly({ role: 'requirements', stage: 'plan', cwd: h.repoDir, prompt: '# Stage: PLAN\nIssue key: GLD-2\nTitle: golden', schema, name: 'conductor golden ask', onEvent: noop, states: h.engine.routeStates() });
+  const ask = await h.agents.readOnly({ role: 'requirements', stage: 'plan', cwd: h.repoDir, prompt: '# Stage: PLAN\nIssue key: GLD-2\nTitle: golden', schema, name: 'conductor golden ask', onEvent: noop, states: h.engine.routeStates(), rule: 'switch' });
   assert.equal(ask.agent, 'cursor');
   prepareCodexHome();
   writeFileSync(join(codexHomePath(), 'auth.json'), '{}', { mode: 0o600 });
-  const cx = await h.agents.readOnly({ role: 'architecture', stage: 'verify', cwd: h.repoDir, prompt: '# Stage: VERIFY\nIssue key: GLD-3\nTitle: golden', schema, name: 'conductor golden codex', onEvent: noop, states: h.engine.routeStates() });
+  const cx = await h.agents.readOnly({ role: 'architecture', stage: 'verify', cwd: h.repoDir, prompt: '# Stage: VERIFY\nIssue key: GLD-3\nTitle: golden', schema, name: 'conductor golden codex', onEvent: noop, states: h.engine.routeStates(), rule: 'switch' });
   assert.equal(cx.agent, 'codex');
 
   // 3. Deep Research through the asks service

@@ -12,6 +12,7 @@
 import type { EmitEvent } from '../agents/claude.ts';
 import type { Role } from '../agents/roles.ts';
 import { route } from '../agents/routing.ts';
+import { DEFAULT_ACCOUNT } from '../accounts/types.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { AgentResult, GateComparison, GateDef, GateRun, ItemRun, LimitInfo, NextStep, Plan, RepoConfig, Run, StageName } from '../types.ts';
 import * as W from '../git/worktree.ts';
@@ -48,7 +49,8 @@ export interface GraphHost {
   patch(key: string, fn: (r: Run) => void): Run;
   note(key: string, stage: StageName | 'engine', text: string): void;
   toNeedsHuman(key: string, reason: string, origin: NextStep, comment?: string): Promise<void>;
-  pauseForLimit(key: string, limit: LimitInfo): Promise<void>;
+  /** M8-3 `onLimitHit`: the account's pause, then a re-route under the limit rule (restart on the next account, or pause). */
+  pauseForLimit(key: string, limit: LimitInfo, role?: Role): Promise<void>;
   finishSession(key: string, res: AgentResult): void;
   refundIfLimit(key: string, res: AgentResult): void;
   emitter(key: string, stage: StageName, loop: number, rev: number): (ev: EmitEvent) => void;
@@ -328,12 +330,14 @@ export class GraphBuilder {
     // 1) who builds it (nothing is recorded before this succeeds, so a refusal leaves the item pending)
     await h.c.freshHealth();
     const role: Role = it.loop > 1 ? 'debugging' : (it.role as Role);
-    const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: h.c.routeStates(), now: h.c.clock.now(), label: providerLabel });
+    const rt = route({ role, complexity: run.complexity, roles: cfg.roles, states: h.c.routeStates(role), now: h.c.clock.now(), label: providerLabel, rule: h.c.limitRule() });
     if (!rt.ok) {
-      if (rt.kind === 'paused') return h.pauseForLimit(key, { provider: rt.provider, resetsAt: rt.pauseUntil, message: rt.reason });
+      if (rt.kind === 'paused') return h.pauseForLimit(key, { provider: rt.provider, account: rt.account, resetsAt: rt.pauseUntil, message: rt.reason }, role);
       return h.toNeedsHuman(key, rt.reason, 'build');
     }
-    const builder = h.c.agents.provider(rt.candidates[0]!.id);
+    const cand = rt.candidates[0]!;
+    const builder = h.c.agents.provider(cand.id);
+    const account = { provider: cand.id, id: cand.account };
 
     // 2) a clean tree to start from (a repo-hook rejection of the previous attempt leaves its files in place ON PURPOSE — fixed in place)
     if ((await h.hasUncommitted(run.worktree)) && !run.commitNote) {
@@ -385,10 +389,12 @@ export class GraphBuilder {
     const secrets = h.c.secretsFor(run);
     const subject = `${run.key}: ${truncate(sanitizeLine(run.title, 60), 60)} — ${cur.id}: ${sanitizeLine(cur.title, 80)}${cur.loop > 1 ? ` (fix, loop ${cur.loop})` : ''}`;
     // M8-2: the item role's model/effort for the tool that actually builds (B2 binding)
-    const sel = h.c.agents.selectionFor(role, builder.id);
+    const sel = h.c.agents.selectionFor(role, builder.id, { account: cand.account });
+    h.c.noteCandidate(key, account);
     for (const n of sel.notes) h.note(key, 'build', redact(n, secrets));
     const out = await runBuild({
       provider: builder,
+      ...(cand.account !== DEFAULT_ACCOUNT ? { account } : {}),
       sel,
       repoPath: repo.path,
       worktree: run.worktree,
@@ -410,7 +416,7 @@ export class GraphBuilder {
         if (prep.note) h.note(key, 'build', prep.note);
       },
       onResult: (res) => {
-        h.c.agents.noteRunResult(builder.id, sel, res);
+        h.c.agents.noteRunResult(builder.id, sel, res, cand.account);
         h.finishSession(key, res);
         h.refundIfLimit(key, res);
         if (res.ok) h.patch(key, (r) => void (r.buildFails = 0));
@@ -435,7 +441,7 @@ export class GraphBuilder {
           x.startHead = undefined;
           x.nonce = undefined;
         });
-        if (res.errorKind === 'limit') return h.pauseForLimit(key, res.limit ?? { provider: out.provider, resetsAt: null, message: res.error ?? 'limit' });
+        if (res.errorKind === 'limit') return h.pauseForLimit(key, { ...(res.limit ?? { resetsAt: null, message: res.error ?? 'limit' }), provider: out.provider, account: cand.account }, role);
         if (res.errorKind === 'network') return h.applyHold(key, { type: 'offline', message: res.error ?? 'network unreachable' });
         if (res.errorKind === 'spawn') return h.toNeedsHuman(key, res.error ?? 'agent could not start', 'build');
         if (await h.looksOffline(res)) {

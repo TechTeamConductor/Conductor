@@ -20,7 +20,7 @@ test('v3 → v4: stages + onClaudeLimit become role chains, the old keys are kep
   const wait = migrateConfigV3ToV4({ version: 3, stages: { plan: 'claude' }, pipeline: { onClaudeLimit: 'wait' } });
   assert.deepEqual(wait.roles.planning.providers, ['claude']);
   const cfg = normalizeConfig(m);
-  assert.equal(cfg.version, 6); // M8-2: config v6
+  assert.equal(cfg.version, 7); // M8-3: config v7 (M8-2 took v6)
   assert.deepEqual(cfg.roles.implementation.providers, ['cursor'], 'roles the old config never had get the v1 defaults');
   assert.deepEqual(cfg.roles.research.providers, ['claude']);
   assert.equal(cfg.ui.port, 5000);

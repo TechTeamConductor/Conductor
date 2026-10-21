@@ -203,9 +203,50 @@ Their CSS is already in `style.css`.
 - **Limits:** `designPerHour` (default 10, ceiling 30, refunded once to the window it was taken in when a call ends on a usage limit), ≤ 2 briefs at once, ≤ 8 parts and cards per send, `researchPerDay` checked before a research brief and taken at Send (Deep = 2). Scratch folders (`conductor-brief-…`) are removed on every outcome; a start-up sweep removes owned `conductor-{ask,research,brief}-` folders untouched for more than 3 hours (the temp folder is shared with other Conductor homes, and a Deep research with its re-run can last 70 minutes).
 - **Fetch-target filter residual:** a research brief may not introduce URLs, IP literals (including short/hex/private-decimal IPv4 and IPv6 forms), local or cloud-metadata host names or wildcard-DNS names you did not type; plain public host names in prose are not caught (they collide with ordinary wording). The brief is written from your question only and you review it before Send.
 
+## Run mode: Per settings | Complete auto (M8-4)
+
+- **An overlay, read at decision time; it writes nothing else.** `pipeline.runMode` (`per-settings` default; exact equality — any other value is Per settings). Under `complete-auto`, `effectivePolicy` returns `full-auto` for every project, `effectiveFirstPlanHold` is off, and `effectiveLimitRule` returns `switch` (the next account, then the next tool in the job's list — never a tool outside it). `storedPolicy`, `planApproval`, `limitRule` and per-project policies are never written by the switch, and the settings view reports stored and effective values separately (`overriddenByRunMode`).
+- **What Complete auto never does.** It never removes a forced hold: `decideApproval` is unchanged and its forced inputs (large change, protected files, more than 8 tasks, an untrusted source — imports, Ask conversions, research, `design` cards) are computed in `stages.ts`, which never reads the mode (static test). It never approves a plan that is already waiting; a hold records `run.forcedHold` (absent = forced), so the separate "Approve waiting plans" action (a human approval) can skip forced, risky, stale and tainted-author cards.
+- **One writer, persist then swap.** Only `PUT /api/run-mode` changes the mode (CSRF + `confirm` to turn it on). Every config writer goes through the runtime's `save`, which writes `config.json` first and switches memory only after the write succeeded. A v1 import always arrives as Per settings.
+
+## Accounts per tool and the limit rule (M8-3)
+
+- **Accounts.** Each tool has an ordered list of sign-ins (`config.accounts`, config v7). `default` is your own sign-in, with today's environment, the real HOME and the Keychain, byte for byte. Added accounts are named `<tool>-<label>-<4 hex>`, with a fresh suffix at every add, so a re-added name never reuses an old folder. Each gets a private 0700 folder `<home>/accounts/<tool>/<id>/`:
+  - Claude: its own `CLAUDE_CONFIG_DIR`;
+  - Cursor: its own HOME plus `AGENT_CLI_CREDENTIAL_STORE=file`.
+- **No secrets in Conductor.** Each tool keeps the login in its own store. Conductor never opens `.credentials.json` or `auth.json` (static test) and stores no key or token. Views show labels and Ready / Not signed in only: never a path, an email or an organisation.
+- **Signing in extra accounts is not enabled yet.** `conductor accounts login <id>` answers "awaiting a live check" until the user-run checks L2 (Claude) and L4b (Cursor) pass. Added accounts can be listed, checked (zero quota), reordered and removed.
+- **The limit rule** (`pipeline.limitRule`, read ONLY through `effectiveLimitRule`):
+  - `switch` (default): the next account of the same tool, then the next tool **in that job's list**. Conductor never moves work to a tool that is not in the job's list, so a Claude-only job never moves to Cursor.
+  - `same`: only the first tool's accounts; a limit never changes the tool.
+  - `wait`: only the first account.
+  - Under every rule, non-limit fallbacks (a tool that is not installed, signed out, or does not start) follow the chain as before.
+  - With one sign-in per tool and `switch`, every route, argv and env is byte-identical to the previous build (property test against a verbatim copy of the old router).
+- **Engine behaviour.**
+  - Pauses are kept per account, in memory, for at most 24 hours. After a restart, only the account a limit-paused run last hit is paused again (from the run record). Other accounts that were paused are tried once more, and a rejected attempt is refunded.
+  - A read-only stage and Deep Research move to the next allowed account inside the same call.
+  - A build that hits a limit starts again at once on the next allowed account. When nothing is usable, the run pauses until the earliest reset. A limit-paused run is re-routed on every tick: it resumes as soon as an account is free, added and signed in, reordered, or the rule changes.
+  - A reset never interrupts a running stage.
+  - Each limit episode gets one board comment and one notification. Only episodes that end in a pause count toward the cap of 6.
+  - Removing the account a stage runs on stops that stage and restarts it on the next account. A removed builder's uncommitted edits stay in the worktree, as after a timeout retry.
+  - Home calls (Quick Ask, Research, briefs) never queue. When every account is at its limit they answer `409 limited` with `retryAt`, before any counter is taken. When the limit hits mid-call they end `failed`/`limited` and the counter is refunded.
+- **Safety checks before every spawn of an added account.**
+  - The folder and its parents must be real 0700 directories owned by you.
+  - Claude's folder may hold only the entries measured live (L1, signed out): `.claude.json`, `.claude.json.lock`, `backups`, `sessions`, `projects`. `settings.json`, `CLAUDE.md`, `.mcp.json`, `hooks`, `plugins`, `skills`, unknown entries, links and hard links are refused, and so is a `.claude.json` with MCP servers, an API key, `env` or `apiKeyHelper`. L3 showed that `--safe-mode` does not stop a planted `settings.json` `apiKeyHelper` or `env`; this check is what stands in front of those.
+  - The Cursor `.cursor` allow-list is empty until L4c, so an added Cursor account becomes `unavailable` after its first check. Stray top-level HOME entries are removed while the account is idle.
+  - Every child env is asserted right before the spawn. A failure is an `isolation` error with nothing started, and it never falls back.
+- **Builds on added Cursor accounts are off** (`CURSOR_ACCOUNT_HOME_BUILD_VERIFIED = false`) until the no-push suite passes under an account HOME (L5). They do read-only work only.
+- **Please read (residual risks):**
+  - (a) Signing in another account stores that tool's login in a private folder under the Conductor home. For Cursor this is a plaintext file (`auth.json`, 0600), not the Keychain. Code that the Cursor builder or repository checks run can read it as your own user, just as it can read your other files. Add only accounts you accept that exposure for, and revoke sessions if a build looked hostile. Builds on added Cursor accounts (once enabled) share your npm, Go-module and Rust caches and toolchains with your own shell, as builds on your main account already do.
+  - (b) Under "Next account, then another tool", work from **any** project may run on **any** listed account, including a personal one. If a project must stay on one organisation's account, use same/wait or do not add the account.
+  - (c) Folders of removed accounts are deleted. Sign-out is attempted, but Claude may keep a Keychain item for a folder that no longer exists. Orphan folders found at start-up are deleted without a sign-out.
+  - Added Claude accounts bypass an `ANTHROPIC_BASE_URL` proxy set in your shell, which is the safe direction.
+  - You may exclude `<home>/accounts` from Time Machine (`tmutil addexclusion`); Conductor does not do it for you.
+- **Isolation scope.** Per-account folders protect against accidental crossing of sign-ins. They are not a boundary against a hostile process running as you. The CLI talks to a running server over the 0600 control socket in a 0700 `run/` folder, which exposes an exact route list and no login route.
+
 ## Files on disk (`~/.conductor-v2`)
 
-`home.json` · `config.json` (0600) · `state.json` · `board/{snapshot.json, journal.ndjson, board.lock}` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock, sessions.json, discovery/}` · `briefs/brf-<hex16>.json` (M8-6 briefs, 0600, ≤ 200 kept; created on first use) · `models/<provider>/<account>.json` (model lists; a cache — an empty `models/` counts as skeleton, a cache file makes the home "hold data" for `migrate`, like `run/`).
+`home.json` · `config.json` (0600) · `state.json` · `board/{snapshot.json, journal.ndjson, board.lock}` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock, sessions.json, discovery/}` · `briefs/brf-<hex16>.json` (M8-6 briefs, 0600, ≤ 200 kept; created on first use) · `accounts/<tool>/<id>/` (M8-3 added sign-ins, 0700; never for `default`) · `models/<provider>/<account>.json` (model lists; a cache — an empty `models/` counts as skeleton, a cache file makes the home "hold data" for `migrate`, like `run/`).
 
 ## Known limits (v2 so far)
 - The board view does not draw the M8-6 research projection or the "Part n/N" chip yet: `GET /api/board` serves both (`research[]`, `items[].design`), the Home thread shows briefs, parts, research briefs and reports.

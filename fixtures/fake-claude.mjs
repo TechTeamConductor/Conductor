@@ -3,9 +3,19 @@
 // Behaviour comes from $FAKE_DIR/scenario.json (see test/helpers/fakes.ts). Event shapes mirror the real CLI 2.1.296.
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 const argv = process.argv.slice(2);
+// M8-3: a named account is the basename of its CLAUDE_CONFIG_DIR (tests only); scenario `accounts.<id>` overrides the top level for it
+const acct = process.env.CLAUDE_CONFIG_DIR && /\/accounts\/claude\/[^/]+$/.test(process.env.CLAUDE_CONFIG_DIR) ? basename(process.env.CLAUDE_CONFIG_DIR) : 'default';
+const acctEnv = () => ({ CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? null, HOME: process.env.HOME ?? null, AGENT_CLI_CREDENTIAL_STORE: process.env.AGENT_CLI_CREDENTIAL_STORE ?? null });
+const scAll = () => { try { return JSON.parse(readFileSync(join(process.env.FAKE_DIR || '', 'scenario.json'), 'utf8')); } catch { return {}; } };
+const scFor = () => { const s = scAll(); return acct !== 'default' && s.accounts?.[acct] ? { ...s, ...s.accounts[acct] } : s; };
+if (argv[0] === 'auth' && (argv[1] === 'logout' || argv[1] === 'login')) {
+  const d = process.env.FAKE_DIR || '';
+  if (d) { mkdirSync(d, { recursive: true }); appendFileSync(join(d, 'calls.jsonl'), JSON.stringify({ who: 'claude', mode: argv[1], argv, acct, acctEnv: acctEnv(), at: Date.now() }) + '\n'); }
+  process.exit(scFor().logout === 'fail' ? 1 : 0);
+}
 if (argv.includes('--version')) {
   console.log('2.1.296 (Claude Code)');
   process.exit(0);
@@ -13,10 +23,7 @@ if (argv.includes('--version')) {
 const dir = process.env.FAKE_DIR || '';
 if (argv[0] === 'auth' && argv[1] === 'status') {
   // sign-in state: scenario `login: 'out'` ⇒ signed out (shape of the real `claude auth status` JSON)
-  let login = 'ok';
-  try {
-    login = JSON.parse(readFileSync(join(dir, 'scenario.json'), 'utf8')).login ?? 'ok';
-  } catch {}
+  const login = scFor().login ?? 'ok';
   if (login === 'out') {
     console.log(JSON.stringify({ loggedIn: false }));
     process.exit(1);
@@ -38,10 +45,7 @@ if (argv.includes('--input-format') && prompt.startsWith('{"type":"control_reque
 async function discovery() {
   const flush = () => new Promise((r) => process.stdout.write('', () => process.stderr.write('', r)));
   const here = new URL('.', import.meta.url).pathname;
-  let sc = {};
-  try {
-    sc = JSON.parse(readFileSync(join(dir, 'scenario.json'), 'utf8'));
-  } catch {}
+  const sc = scFor();
   const mode = sc.models ?? 'in';
   const stdinLines = prompt.split('\n').filter(Boolean);
   let reqId = 'r1';
@@ -61,7 +65,7 @@ async function discovery() {
     try {
       cwdEntries = (await import('node:fs')).readdirSync(process.cwd());
     } catch {}
-    appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'claude', mode: 'models', scenario: mode, argv, cwd: process.cwd(), cwdEntries, envKeys: Object.keys(process.env), stdinLines: stdinLines.length, prompts, at: Date.now() }) + '\n');
+    appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'claude', mode: 'models', scenario: mode, argv, cwd: process.cwd(), cwdEntries, envKeys: Object.keys(process.env), acct, acctEnv: acctEnv(), stdinLines: stdinLines.length, prompts, at: Date.now() }) + '\n');
   }
   const fixture = (f) => JSON.parse(readFileSync(join(here, 'real', f), 'utf8'));
   const reply = (inner, subtype = 'success', id = reqId) => out({ type: 'control_response', response: { subtype, request_id: id, response: inner, pending_permission_requests: [], pending_user_dialog_requests: [] } });
@@ -149,7 +153,7 @@ function nextIndex() {
   // an atomic claim (mkdir fails with EEXIST for everyone but one), so concurrent invocations never share an index
   for (let i = 0; ; i++) {
     try {
-      mkdirSync(join(dir, `counter-${key}-${stage}-${i}`));
+      mkdirSync(join(dir, acct === 'default' ? `counter-${key}-${stage}-${i}` : `counter-${acct}-${key}-${stage}-${i}`));
       return i;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -157,13 +161,13 @@ function nextIndex() {
   }
 }
 const idx = nextIndex();
-const sc = scenario();
+const sc = acct !== 'default' && scenario().accounts?.[acct] ? { ...scenario(), ...scenario().accounts[acct] } : scenario();
 const mine = sc.claude?.[key] ?? sc.claude?.['*'] ?? {};
 const list = mine[stage];
 const step = Array.isArray(list) ? (list[Math.min(idx, list.length - 1)] ?? {}) : {};
 
 if (dir) {
-  appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'claude', argv, stage, key, idx, cwd: process.cwd(), envKeys: Object.keys(process.env), promptBytes: prompt.length }) + '\n');
+  appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'claude', argv, stage, key, idx, cwd: process.cwd(), envKeys: Object.keys(process.env), acct, acctEnv: acctEnv(), promptBytes: prompt.length }) + '\n');
   if (step.savePrompt) writeFileSync(join(dir, `prompt-claude-${key}-${stage}-${idx}.txt`), prompt);
 }
 

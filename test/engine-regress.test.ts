@@ -314,7 +314,7 @@ test('m6: a builder that commits by itself is accepted (not reported as "no chan
 // ───────────── config migration ─────────────
 test('config: an old v1 config gets the hands-off defaults once; explicit v2 choices are kept', () => {
   const old = normalizeConfig({ version: 1, pipeline: { planApproval: 'first', onClaudeLimit: 'wait', timeoutsMin: { idle: 10 } } });
-  assert.equal(old.version, 6); // M8-2: config v6
+  assert.equal(old.version, 7); // M8-3: config v7 (M8-2 took v6)
   assert.equal(old.pipeline.planApproval, 'auto');
   assert.deepEqual(old.roles.planning.providers, ['claude', 'cursor'], 'v1 `wait` was upgraded to Cursor taking over read-only stages');
   assert.equal(toSettings(old).onClaudeLimit, 'cursor');
@@ -323,5 +323,5 @@ test('config: an old v1 config gets the hands-off defaults once; explicit v2 cho
   assert.equal(chosen.pipeline.planApproval, 'first', 'a v2 choice is respected');
   assert.deepEqual(chosen.roles.planning.providers, ['claude'], 'a v2 `wait` is respected');
   assert.equal(toSettings(chosen).onClaudeLimit, 'wait');
-  assert.equal(normalizeConfig(defaultConfig()).version, 6); // M8-2: config v6
+  assert.equal(normalizeConfig(defaultConfig()).version, 7); // M8-3: config v7 (M8-2 took v6)
 });

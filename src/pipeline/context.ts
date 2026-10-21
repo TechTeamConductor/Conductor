@@ -8,6 +8,9 @@ import type { Clock } from '../util.ts';
 import type { States } from '../agents/routing.ts';
 import type { Effects } from './effects.ts';
 import type { ContextLike } from '../context/service.ts';
+import type { AccountRef } from '../accounts/types.ts';
+import type { LimitRule } from '../accounts/limit-rule.ts';
+import type { Role } from '../agents/roles.ts';
 
 /** Everything stage logic needs from the engine. Keeps `stages.ts` testable and free of polling concerns. */
 export interface PipelineCtx {
@@ -25,11 +28,16 @@ export interface PipelineCtx {
   signal(key: string): AbortSignal;
   emit(key: string, ev: EmitEvent): void;
   hist(key: string, text: string): void;
-  providerPause(agent: ProviderId, until: number, reason: string): void;
-  /** Active pause for a provider, if any. */
-  pausedUntil(agent: ProviderId): { until: number; reason: string } | null;
-  /** Provider capabilities + CLI-reported health + pauses, as the router wants them. */
-  routeStates(): States;
+  /** M8-3: a usage-limit pause on ONE account (capped at 24 h by the engine). */
+  providerPause(ref: AccountRef, until: number, reason: string): void;
+  /** Active pause for an account, if any. */
+  pausedUntil(ref: AccountRef): { until: number; reason: string } | null;
+  /** Provider capabilities + CLI-reported health + pauses + accounts, as the router wants them (`role` ⇒ offersModel per account). */
+  routeStates(role?: Role): States;
+  /** M8-3 (C1): the ONLY source of the limit rule for stages — `effectiveLimitRule(cfg)`. */
+  limitRule(): LimitRule;
+  /** M8-3: an attempt of run `key` starts on this account (records `run.account`; removal ⇒ restart). */
+  noteCandidate(key: string, ref: AccountRef): void;
   /** Refresh the zero-quota provider health first if the last reading is missing/stale (so routing never relies on a dashboard having looked). */
   freshHealth(): Promise<void>;
   /**
@@ -44,5 +52,5 @@ export interface PipelineCtx {
   /** Ask the engine to run another poll/schedule pass soon. */
   tickSoon(): void;
   /** Latest provider quota/utilisation reported by an agent run (for the dashboard meter). */
-  recordQuota(agent: ProviderId, q: NonNullable<AgentResult['quota']>): void;
+  recordQuota(ref: AccountRef, q: NonNullable<AgentResult['quota']>): void;
 }
