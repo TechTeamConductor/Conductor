@@ -124,6 +124,65 @@ Nothing in your working tree or branches. It does add: a git **worktree** per ta
   - CLI: `conductor models [--refresh] [--json]`. It does not refresh while a server holds the lock, and holds the lock during its own refresh.
 - **Known footprint:** each Claude discovery writes the user's Claude config dir (`.claude.json` and a backup), the same as every read-only stage does. Measured live on 2026-10-21 over two refreshes: the `~/.claude.json` project-key count and the `~/.claude/projects` entry count did not change, and no entry for the discovery folder was added. Cursor runs with the real HOME, which sign-in needs.
 
+## Dashboard UI (M8-U)
+
+Vanilla JS with no build step and no dependencies. It ships as exact static files: `/` → `ui/index.html`, `/modes.js`, `/app.js`, `/style.css`, `/favicon.svg`. `modes.js` loads first, and both scripts are `defer`. The design source is `.techteam/design/v16/` (Version 16).
+
+**Files**
+- **`ui/modes.js`**: pure helpers with no DOM or network access, exposed as one deeply frozen `ConductorModes`. The same bytes run in `test/ui-modes.test.ts` through `vm`. It holds:
+  - `detectMode` (verbatim from the design);
+  - repo matching and resolution;
+  - the Build title rule (`taskFromText`);
+  - the seven "Who does what" rows (`ROLE_ROWS`) and their follower roles;
+  - the role-chain edit (`setLead`, `roleEdit`, `rolesPatch`), the acknowledgement set (`acksNeeded`, `withAck`), and wording derived from roles;
+  - `safeAttr` / `safeHttp`, which guard every attribute the DOM helper writes.
+
+  If it is missing, `app.js` shows an alert and stops.
+- **`ui/app.js`**: the views.
+  - It renders only through `h()`, which creates text nodes and passes attributes through `safeAttr`, or through the DOM-only markdown renderer.
+  - `test/ui-safety.test.ts` enforces that there are no HTML sinks and that every URL attribute is on a reviewed allow-list.
+
+**Routing**
+
+| Hash | Shows |
+| --- | --- |
+| `#/` | Home (the default once setup is complete) |
+| `#/board` | Board |
+| `#/setup` | the setup wizard |
+| `#/run/:key[/tab]` | the run drawer, over the last Home/Board view; Board for a direct link |
+
+Closing the drawer goes back in history if it was opened in the app. Otherwise it replaces the hash with the base view.
+
+**Home**
+- One composer with the modes Auto / Ask / Build / Research. Auto uses `detectMode` and shows the result ("Auto · Ask").
+- Requests:
+  - Ask and Research go to `POST /api/ask` and are polled through `GET /api/asks/:id`, every 1.5 s, until they finish.
+  - Build goes to `POST /api/tasks`: the title is the first line, at most 200 characters, and the full text becomes the description.
+- The repo chip always shows where a request goes. The order is:
+  1. an explicit choice;
+  2. a unique whole-word match of a repo name in the text;
+  3. the last repo used (a session value, only a registered name);
+  4. the only repo.
+- The conversation is held in memory only. It survives Home ↔ Board navigation; it is never stored, and it is dropped on sign-out or session expiry.
+- Steps come only from the record's real fields. A running turn turns Send into Stop.
+
+**Who does what** (Settings rows and the Home "Handled by" popover)
+- A change replaces the lead of the role's chain and keeps every other entry and field.
+- Followers are mirrored: Build → `debugging` and `documentation`; Design the work → `architecture`.
+- The change is computed from a fresh `GET /api/roles`.
+- Unverified providers are confirmed one by one. Only the confirmed ids go into `acknowledge`, and the server's `notices` are shown.
+- In the popover, a pick is a draft until "Use X for every … job".
+- Settings saves `PUT /api/settings` first (it no longer sends `stages`), then the roles.
+
+**Not built here.** These controls have no backend yet; each owning slice adds its own UI step:
+- model, effort and flags per job: M8-2;
+- model refresh: M8-1 / M8-2;
+- accounts: M8-3;
+- run mode: M8-4;
+- work and research briefs, research and part chips: M8-6.
+
+Their CSS is already in `style.css`.
+
 ## Files on disk (`~/.conductor-v2`)
 
 `home.json` · `config.json` (0600) · `state.json` · `board/{snapshot.json, journal.ndjson, board.lock}` · `runs/<KEY>/{run.json, events.ndjson, plan-N.json|md, review-N.json, verdict-N.json, baseline.json, gates-N.json, prompt-*.md}` · `logs/` · `run/{lock.json, control.sock, sessions.json, discovery/}` · `models/<provider>/<account>.json` (model lists; a cache — an empty `models/` counts as skeleton, a cache file makes the home "hold data" for `migrate`, like `run/`).

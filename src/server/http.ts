@@ -27,6 +27,7 @@ const SECURITY_HEADERS: Record<string, string> = {
 const STATIC: Record<string, { file: string; type: string; public: boolean }> = {
   '/': { file: 'index.html', type: 'text/html; charset=utf-8', public: false },
   '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8', public: false },
+  '/modes.js': { file: 'modes.js', type: 'text/javascript; charset=utf-8', public: false },
   '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8', public: true },
   '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml', public: true },
 };

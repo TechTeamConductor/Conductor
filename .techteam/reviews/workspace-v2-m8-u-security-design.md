@@ -165,3 +165,16 @@ No new HTML sink, inline script, style attribute or inline handler was found. `i
 **Release gate:** satisfied for the Security part. U1–U9 are met, with no Critical, High or Medium finding. L1 and L2 are tracked as follow-ups.
 
 Verdict: Approved
+
+---
+
+## M8-U follow-up check of L1–L3 (2026-10-21)
+
+The Frontend agent (ae49c55b92c8dd875) applied all three. I read each change and re-ran `test/ui-*.test.ts`: 25/25 pass.
+
+- **L1 (closed).** The AC6 sink and eval scan now reads the raw source. A test proves that `'a // b'` cannot hide `innerHTML`, and that a sink word inside a comment also counts. The header comment in `app.js` is reworded, so it no longer contains a sink word.
+- **L2 (closed).** `safeAttr`'s `URL_ATTR` now also covers `ping`, `background`, `cite`, `longdesc`, `manifest`, `codebase`, `data`, `icon`, `lowsrc`, `dynsrc`, `archive`, `classid`, `usemap`, `profile` and `itemtype`. `srcset`, `imagesrcset` and `is` are now dropped. The unit tests were extended.
+- **L3 (closed).** A remaining 409 now shows a plain-language line, "The tool settings changed while you were editing. Reload Settings and try again.", with the server text below it as text only. It is not resent.
+- **Other changes, no security impact.** The header Ask button is removed (the user's D-U1 decision). `confirmDialog` closes an open confirm before showing the next. The popover gets `tabindex=-1`. The CSS uses `white-space: pre-line` for the 409 detail.
+
+Verdict: Approved

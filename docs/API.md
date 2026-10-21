@@ -7,7 +7,7 @@ The v2 contract (board-native; no Linear). Types live in [`src/types.ts`](../src
 - **Auth.** The browser arrives already signed in: `conductor open` mints a one-time URL that sets an `HttpOnly; SameSite=Strict` session cookie. The UI never sees or handles tokens. Any `401` ⇒ show a full-page "Session expired — run `conductor open` in a terminal" message.
 - **Mutations** (`POST`/`PUT`/`DELETE`) must send `Content-Type: application/json` **and** header `X-Conductor-CSRF: <state.csrf>` (value from the latest `GET /api/state`). Missing/incorrect ⇒ `403`.
 - **CSP** is `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'`. Therefore: **no inline `<script>`, no inline `style="…"` attributes, no external fonts/CDNs**. Use classes; set dynamic values via `element.style.setProperty('--x', …)` (CSSOM is allowed).
-- **Static files** are an exact whitelist: `/` → `ui/index.html`, `/app.js`, `/style.css`, `/favicon.svg`. Nothing else is served.
+- **Static files** are an exact whitelist: `/` → `ui/index.html`, `/modes.js`, `/app.js`, `/style.css`, `/favicon.svg`. Nothing else is served. `/`, `/modes.js` and `/app.js` need a session; without one, the browser is redirected to `/login`.
 - **Errors**: HTTP status + body `{"error":{"code":"…","message":"…"}}` (`ApiError`). Messages are human-readable and safe to show verbatim.
 - All timestamps are **epoch milliseconds** unless noted. Bodies ≤ 1 MB.
 
@@ -87,8 +87,18 @@ Storage failures answer `503`; validation failures `400`; unknown keys `404`; re
 
 ## UI behaviour requirements (for the implementer)
 
-1. **First load**: `GET /api/state`; if `!setup.complete` render the **Setup wizard** (2 steps: Agents → Repository) with per-step status from `setup.steps`; otherwise the **Dashboard**.
-2. **Dashboard**: header (engine pill with pause/resume, Claude quota meter from `quota.claude.utilization7d` + reset time, "New task" button, settings), **board** with columns **Backlog** and **To do** (run-less `cards`, with Start / Park / Cancel) followed by the run columns from `ApiRunSummary.column` (`queued, planning, plan_ready, building, verifying, needs_human, paused, ready`; `closed` runs live in a collapsible "History"). Cards show key, title, repo, activity sentence, loop `n/max`, open-bug count, an `unverified` badge, who is working (Claude/Cursor chip).
+1. **First load**: `GET /api/state`. If `!setup.complete`, render the **Setup wizard** (2 steps: Agents → Repository) with per-step status from `setup.steps`. Otherwise render **Home** (`#/`), the default view.
+   - **Home** has one composer (Auto / Ask / Build / Research), a repo chip and a "Handled by" chip, with the conversation below it. Requests go to:
+     - Ask → `POST /api/ask`, then poll `GET /api/asks/:id`;
+     - Research → `POST /api/ask {mode:'research'}`, then poll the same way;
+     - Build → `POST /api/tasks`.
+   - Asks fail fast. The server's message is shown verbatim and nothing retries automatically.
+   - `GET /api/roles` provides the "who" wording. Choosing a tool changes a **global** setting, through `PUT /api/roles`, which works as follows:
+     - the role's whole entry from a fresh GET is sent back, with only `providers` changed;
+     - an `unverified` provider needs one explicit confirmation, and `acknowledge` lists exactly the confirmed ids;
+     - `notices` are shown.
+   - Settings no longer sends `stages`.
+2. **Dashboard**: header (Home / Board tabs, engine pill with pause/resume, Claude quota meter from `quota.claude.utilization7d` + reset time, "New task" button on the Board, settings), **board** (`#/board`) with columns **Backlog** and **To do** (run-less `cards`, with Start / Park / Cancel) followed by the run columns from `ApiRunSummary.column` (`queued, planning, plan_ready, building, verifying, needs_human, paused, ready`; `closed` runs live in a collapsible "History"). Cards show key, title, repo, activity sentence, loop `n/max`, open-bug count, an `unverified` badge, who is working (Claude/Cursor chip).
 3. **Run detail** (drawer on desktop, full page on phone): tabs **Overview** (activity, next action, needs-human reason, action buttons honouring `canApprove/canRetry/canAbort/canCleanup/canPark/canFinish`), a **Notes** panel (the card's conversation + an input for your notes), **Live log** (SSE; filters by agent; auto-scroll with a "pinned" toggle; collapse noisy tool events), **Plan** (rendered `planMarkdown` + AC), **Verification** (verdict per loop, gate table with baseline vs now, bugs with severity), **Sessions** (resume commands with copy buttons + "Open in Claude app / Cursor / Terminal" buttons), **Timeline**.
 4. **Honest empty/limit states**: when `engine.providerPause.claude` is set show a banner "Claude usage limit — resuming automatically at <time>"; when health warns about leaked instruction files, show them; `setup.complete:false` never shows an empty board.
 5. **Accessibility/responsive**: keyboard reachable, focus-visible, ARIA live region for toasts, `prefers-color-scheme` light/dark (and respects `prefers-reduced-motion`), works at 390 px width without horizontal page scroll.

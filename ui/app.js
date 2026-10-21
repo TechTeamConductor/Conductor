@@ -1,9 +1,24 @@
 /* Conductor dashboard (vanilla JS, no build step, no dependencies).
- * Contract: docs/API.md + src/types.ts. CSP-safe: no inline script/style, no innerHTML with data,
+ * Contract: docs/API.md + src/types.ts. CSP-safe: no inline script/style, no HTML-string sinks,
  * server strings are only ever written with textContent / text nodes.
  */
 (() => {
 'use strict';
+
+/* Pure helpers (ui/modes.js, loaded first). Without them the dashboard would half-work, so say so instead. */
+const M = window.ConductorModes;
+if (!M) {
+  const v = document.getElementById('view');
+  if (v) {
+    const p = document.createElement('p');
+    p.className = 'boot';
+    p.setAttribute('role', 'alert');
+    p.textContent = 'The dashboard did not load completely (modes.js is missing). Reload the page; if it persists, restart Conductor.';
+    v.setAttribute('aria-busy', 'false');
+    v.replaceChildren(p);
+  }
+  return;
+}
 
 /* ───────────────────────── constants ───────────────────────── */
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -53,7 +68,8 @@ const OPEN_LABEL = {
 /* ───────────────────────── app state ───────────────────────── */
 const S = {
   state: null, offset: 0, csrf: '',
-  route: { view: 'board', key: null, tab: 'overview' },
+  route: { view: 'home', key: null, tab: 'overview' },
+  baseView: null, // 'home' | 'board': the view under the run drawer (a direct run link shows the board)
   detail: null, detailKey: null, detailSig: '', detailError: null,
   verLoop: null,
   sse: { es: null, ok: false, everOpen: false, dropped: false, lastMsg: 0, attempts: 0, timer: 0, downSince: 0 },
@@ -61,8 +77,9 @@ const S = {
   busy: new Set(),
   dismissed: new Set(),
   isMobile: false,
-  view: null, // 'board' | 'wizard' | 'error'
+  view: null, // 'home' | 'board' | 'wizard' | 'error'
   loadFailed: false,
+  roles: null, rolesErr: null, // GET /api/roles (who does each job); null until loaded
 };
 let uidN = 0;
 const uid = (p) => `${p || 'id'}-${++uidN}`;
@@ -92,7 +109,7 @@ function h(tag, attrs, ...kids) {
       else if (k === 'data') { for (const d of Object.keys(v)) if (v[d] !== null && v[d] !== undefined) el.dataset[d] = String(v[d]); }
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
       else if (k === 'value' || k === 'checked' || k === 'disabled' || k === 'selected' || k === 'hidden' || k === 'open') el[k] = v;
-      else el.setAttribute(k, v === true ? '' : String(v));
+      else { const sv = M.safeAttr(k, v); if (sv !== null) el.setAttribute(k, sv); } // no handler strings, no style, URLs only in-app or http(s)
     }
   }
   return appendKids(el, kids);
@@ -166,9 +183,7 @@ function pctOf(v) {
   const p = v <= 1 ? v * 100 : v;
   return Math.max(0, Math.min(100, Math.round(p)));
 }
-function safeHttp(u) {
-  try { const x = new URL(String(u)); return x.protocol === 'https:' || x.protocol === 'http:' ? x.href : null; } catch { return null; }
-}
+const safeHttp = M.safeHttp;
 function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
 const ELAPSED_TAIL = /\s*[·•|–—-]\s*(?=\d)(?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?\s*$/;
 /** The server's activity sentence, minus the live timer, and minus any copy of the needs-human reason (shown separately). */
@@ -266,25 +281,34 @@ function showExpired() {
   closeSSE();
   for (const d of document.querySelectorAll('dialog[open]')) { try { d.close(); } catch { /* noop */ } }
   for (const id of ['topbar', 'banners', 'main']) { const el = document.getElementById(id); if (el) el.inert = true; }
+  dropHome();
+  closeHomeMenus(false);
+  $('#view').replaceChildren();
+  S.view = null;
   $('#expired').hidden = false;
   const retry = $('#expired-retry');
   if (retry) retry.focus();
 }
 
 /* ───────────────────────── routing ───────────────────────── */
+/** #/ Home · #/board Board · #/setup wizard · #/run/:key[/tab] the drawer over the base view (Board for a direct link). */
 function parseHash() {
-  const m = /^#\/run\/([^/?]+)(?:\/([a-z]+))?/.exec(location.hash);
+  const hsh = location.hash;
+  const m = /^#\/run\/([^/?]+)(?:\/([a-z]+))?/.exec(hsh);
   if (m) {
     let key = m[1];
     try { key = decodeURIComponent(key); } catch { /* keep raw */ }
     const tab = TABS.some((t) => t[0] === m[2]) ? m[2] : 'overview';
-    return { view: 'board', key, tab };
+    return { view: S.baseView || 'board', key, tab };
   }
-  if (/^#\/setup/.test(location.hash)) return { view: 'setup', key: null, tab: 'overview' };
-  return { view: 'board', key: null, tab: 'overview' };
+  if (/^#\/setup/.test(hsh)) return { view: 'setup', key: null, tab: 'overview' };
+  if (/^#\/board(?:$|[/?])/.test(hsh)) return { view: 'board', key: null, tab: 'overview' };
+  return { view: 'home', key: null, tab: 'overview' };
 }
+const baseHash = () => (S.baseView === 'home' ? '#/' : '#/board');
 function applyRoute() {
   S.route = parseHash();
+  if (S.route.view === 'home' || S.route.view === 'board') S.baseView = S.route.view;
   if (!S.route.key) S.pushedRun = false;
   if (S.state) renderAll();
 }
@@ -298,7 +322,7 @@ function openRun(key, tab) {
 }
 function closeRoute() {
   if (S.pushedRun) { S.pushedRun = false; history.back(); return; }
-  history.replaceState(null, '', '#/');
+  history.replaceState(null, '', baseHash());
   applyRoute();
 }
 
@@ -345,7 +369,9 @@ function normalizeDetail(d) {
 }
 function applyState(data, quiet) {
   normalizeState(data);
+  const provChanged = S.state && providersSig(S.state.providers) !== providersSig(data.providers);
   S.state = data;
+  if (provChanged || (!S.roles && !rolesLoading && !S.rolesErr)) loadRoles();
   S.offset = (data.now || Date.now()) - Date.now();
   S.csrf = data.csrf || S.csrf;
   S.loadFailed = false;
@@ -362,11 +388,16 @@ function renderAll() {
   updateHeader(wizard);
   renderBanners(wizard);
   if (wizard) {
-    if (S.view !== 'wizard') { closeDrawerSilently(); S.view = 'wizard'; $('#view').replaceChildren(); W.sig = ''; }
+    if (S.view !== 'wizard') { closeDrawerSilently(); if (S.view === 'home') leaveHome(); S.view = 'wizard'; $('#view').replaceChildren(); W.sig = ''; }
     renderWizard();
   } else {
-    if (S.view !== 'board') { S.view = 'board'; buildBoardView(); }
-    updateBoard();
+    const v = S.route.view === 'board' ? 'board' : 'home';
+    if (S.view !== v) {
+      if (S.view === 'home') leaveHome();
+      S.view = v;
+      if (v === 'board') buildBoardView(); else buildHomeView();
+    }
+    if (v === 'board') updateBoard(); else updateHome();
     syncDrawer();
   }
   updateTitle();
@@ -379,11 +410,13 @@ function renderLive() {
   updateHeader(wizard);
   renderBanners(wizard);
   if (!wizard && S.view === 'board') { updateBoard(); updateDrawerLive(); }
+  else if (!wizard && S.view === 'home') { updateHome(); updateDrawerLive(); }
   updateTitle();
   tick();
 }
+const needYouCount = () => (S.state ? S.state.runs.filter((r) => r.column === 'needs_human' || r.column === 'plan_ready').length : 0);
 function updateTitle() {
-  const n = S.state ? S.state.runs.filter((r) => r.column === 'needs_human' || r.column === 'plan_ready').length : 0;
+  const n = needYouCount();
   const t = (n ? `(${n}) ` : '') + 'Conductor';
   if (document.title !== t) document.title = t;
 }
@@ -467,8 +500,12 @@ const HDR = {};
 function buildHeader() {
   const top = $('#topbar');
   HDR.version = h('small');
-  const brand = h('a', { class: 'brand', href: '#/', 'aria-label': 'Conductor, back to board' },
+  const brand = h('a', { class: 'brand', href: '#/', 'aria-label': 'Conductor, home' },
     h('span', { class: 'brand-mark' }, icon('baton')), h('span', { class: 'brand-name' }, 'Conductor'), HDR.version);
+  HDR.badge = h('span', { class: 'nav-badge', hidden: true });
+  HDR.navHome = h('a', { class: 'nav-tab', href: '#/' }, 'Home');
+  HDR.navBoard = h('a', { class: 'nav-tab', href: '#/board' }, 'Board', HDR.badge);
+  HDR.nav = h('nav', { class: 'nav', 'aria-label': 'Main' }, HDR.navHome, HDR.navBoard);
   HDR.pill = h('span', { class: 'st st-ready' });
   HDR.pillSig = '';
   HDR.pauseBtn = h('button', { type: 'button', class: 'btn', onclick: toggleEngine });
@@ -482,9 +519,8 @@ function buildHeader() {
   HDR.connLbl = h('span', { class: 'conn-label' });
   HDR.conn = h('span', { class: 'conn', hidden: true }, HDR.connIcon, HDR.connLbl);
   HDR.newBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-label': 'New task', onclick: () => openNewTask() }, icon('plus'), h('span', { class: 'btn-label-hide' }, 'New task'));
-  HDR.askBtn = h('button', { type: 'button', class: 'btn', 'aria-label': 'Ask a question', title: 'Ask a question about a project', onclick: () => openAsk() }, icon('help'), h('span', { class: 'btn-label-hide' }, 'Ask'));
   HDR.setBtn = h('button', { type: 'button', class: 'btn btn-icon', 'aria-label': 'Settings', title: 'Settings', onclick: () => openSettings() }, icon('sliders'));
-  top.append(brand, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.askBtn, HDR.newBtn, HDR.setBtn);
+  top.append(brand, HDR.nav, HDR.engine, HDR.quota, h('span', { class: 'tb-spacer' }), HDR.conn, HDR.newBtn, HDR.setBtn);
 }
 function engineView(eng) {
   const pp = eng.providerPause || {};
@@ -505,8 +541,19 @@ function updateHeader(wizard) {
   toggleHidden(HDR.version, !st.version);
   setText(HDR.version, st.version ? 'v' + st.version : '');
   toggleHidden(HDR.engine, wizard);
-  toggleHidden(HDR.newBtn, wizard);
+  toggleHidden(HDR.nav, !st.setup.complete);
+  const onHome = !wizard && S.route.view === 'home';
+  const onBoard = !wizard && S.route.view === 'board';
+  toggleHidden(HDR.newBtn, !onBoard);
   toggleHidden(HDR.setBtn, wizard);
+  for (const [el, on] of [[HDR.navHome, onHome], [HDR.navBoard, onBoard]]) {
+    el.classList.toggle('is-on', on);
+    if (on) el.setAttribute('aria-current', 'page'); else el.removeAttribute('aria-current');
+  }
+  const need = needYouCount();
+  toggleHidden(HDR.badge, !need);
+  setText(HDR.badge, need || '');
+  HDR.badge.setAttribute('aria-label', need === 1 ? '1 needs you' : need + ' need you');
 
   const ev = engineView(st.engine);
   const sig = ev.cls + '|' + ev.label + '|' + (ev.pulse ? 1 : 0);
@@ -692,6 +739,638 @@ function setBusy(el, busy) {
   if (el.disabled !== busy) el.disabled = busy;
 }
 
+/* ───────────────────────── roles (GET /api/roles): who does each job ───────────────────────── */
+/** Display name of a provider id (labels come from the server's provider list). */
+const provLabel = (id) => (id ? AGENT_LABEL[id] || String(id) : '');
+const roleLead = (role) => (S.roles ? M.leadOf(S.roles.roles, role) : null);
+let rolesLoading = null;
+/** Fetched on load, after any role change, when Settings opens, and when the provider list changes (N5). Failure keeps the static wording. */
+function loadRoles() {
+  if (rolesLoading) return rolesLoading;
+  rolesLoading = (async () => {
+    try { S.roles = await api('GET', '/api/roles'); S.rolesErr = null; }
+    catch (e) { if (!(e instanceof ApiFail && e.status === 401)) S.rolesErr = e; }
+    finally { rolesLoading = null; }
+    if (S.state && !S.expired) renderLive();
+    return S.roles;
+  })();
+  return rolesLoading;
+}
+const providersSig = (ps) => JSON.stringify((ps || []).map((p) => [p.id, p.state, p.tier, p.inUse]));
+
+/**
+ * Change who leads one or more jobs (Settings rows or the Home "Handled by" popover). Always from a FRESH GET /api/roles:
+ * roleEdit keeps every other field of each role; unverified providers are acknowledged one by one in a modal, and only the
+ * confirmed ids are sent (Security U1). A 409 that still comes back is shown and the flow stops. Returns
+ * { ok, notices, error, canceled, nothing }.
+ */
+async function applyRoleChanges(changes) {
+  let fresh;
+  try { fresh = await api('GET', '/api/roles'); S.roles = fresh; } catch (e) { return { ok: false, error: e.message }; }
+  const patch = M.rolesPatch(fresh.roles, changes);
+  if (!Object.keys(patch.roles).length) return { ok: true, nothing: true, notices: [] };
+  const confirmed = [];
+  for (const a of M.acksNeeded(fresh.roles, fresh.choices, patch)) {
+    const name = provLabel(a.provider);
+    const extra = a.roles.filter((r) => !M.ROLE_ROWS.some((x) => x.role === r));
+    const ok = await confirmDialog({
+      title: `Use ${name} for: ${a.rows.join(', ')}?`,
+      body: `${name}'s isolation has not been verified on this machine.${extra.length ? ` It would also be used for ${extra.join(', ')}.` : ''} This is a global setting: it changes who does this job for every request and every card.`,
+      confirmLabel: 'Use it anyway', danger: true,
+    });
+    if (!ok) return { ok: false, canceled: true };
+    confirmed.push(a.provider);
+  }
+  try {
+    const r = await api('PUT', '/api/roles', M.withAck(patch, confirmed));
+    const notices = Array.isArray(r && r.notices) ? r.notices.filter((x) => typeof x === 'string') : [];
+    for (const n of notices) toast('warn', n);
+    await loadRoles();
+    return { ok: true, notices };
+  } catch (e) {
+    if (e instanceof ApiFail && e.status === 401) return { ok: false, error: e.message };
+    loadRoles();
+    // a 409 here means the choices changed after the fresh GET: say so plainly, keep the server's text as the detail; never resend
+    if (e instanceof ApiFail && e.status === 409) return { ok: false, error: 'The tool settings changed while you were editing. Reload Settings and try again.\n' + e.message };
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ───────────────────────── small widgets: pill radiogroups and menus ───────────────────────── */
+/**
+ * A radiogroup of pills (design .pills/.pill), updated in place so focus survives. items: [{ id, label, icon?, title?, locked? }].
+ * Arrow keys / Home / End move and pick; a locked item takes focus and calls onLocked instead of being picked.
+ */
+function pillGroup(o) {
+  const el = h('div', { class: 'pills' + (o.cls ? ' ' + o.cls : ''), role: 'radiogroup', 'aria-label': o.label });
+  const btns = o.items.map((it) => {
+    const lbl = h('span', null, it.label);
+    const b = h('button', { type: 'button', role: 'radio', class: 'pill', title: it.title || null, 'aria-disabled': it.locked ? 'true' : null, data: { id: it.id } },
+      it.icon ? icon(it.icon, 'icon-sm') : null, lbl);
+    b._lbl = lbl;
+    b.addEventListener('click', () => (it.locked ? (o.onLocked && o.onLocked(it)) : o.onPick(it.id)));
+    return b;
+  });
+  el.append(...btns);
+  el.addEventListener('keydown', (e) => {
+    const i = btns.indexOf(document.activeElement);
+    if (i < 0) return;
+    let n = -1;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') n = (i + 1) % btns.length;
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') n = (i - 1 + btns.length) % btns.length;
+    else if (e.key === 'Home') n = 0;
+    else if (e.key === 'End') n = btns.length - 1;
+    else return;
+    e.preventDefault();
+    btns[n].focus();
+    btns[n].click();
+  });
+  const set = (value, labels) => {
+    let any = false;
+    btns.forEach((b, k) => {
+      const on = b.dataset.id === value;
+      any = any || on;
+      b.classList.toggle('is-on', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+      b.tabIndex = on ? 0 : -1;
+      if (labels && labels[k] !== undefined) setText(b._lbl, labels[k]);
+    });
+    if (!any && btns[0]) btns[0].tabIndex = 0;
+  };
+  set(o.value);
+  return { el, set, btns };
+}
+/** Arrow / Home / End / Escape / Tab handling for a role="menu" (Escape and Tab close and return focus to the trigger). */
+function menuKeys(menu, close) {
+  menu.addEventListener('keydown', (e) => {
+    const items = Array.from(menu.querySelectorAll('[role^="menuitem"]'));
+    const i = items.indexOf(document.activeElement);
+    let n = -1;
+    if (e.key === 'ArrowDown') n = i < 0 ? 0 : (i + 1) % items.length;
+    else if (e.key === 'ArrowUp') n = i < 0 ? items.length - 1 : (i - 1 + items.length) % items.length;
+    else if (e.key === 'Home') n = 0;
+    else if (e.key === 'End') n = items.length - 1;
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(true); return; }
+    else if (e.key === 'Tab') { close(false); return; }
+    else return;
+    e.preventDefault();
+    if (items[n]) items[n].focus();
+  });
+}
+
+/* ───────────────────────── Home (design vmLanding / turnVM) ───────────────────────── */
+const PLACEHOLDER = {
+  auto: 'Ask a question, describe a feature, or name something to research…',
+  ask: 'Ask about the code, for example “Where are rate limits enforced?”',
+  work: 'Describe the feature or fix in one line…',
+  research: 'What should be researched?',
+};
+const SUGGEST = {
+  ask: ['How does cursor pagination work in the audit log?', 'Where are rate limits enforced?'],
+  work: ['Add filters by user and date to the audit log', 'Add a dark mode toggle to the settings page'],
+  research: ['Compare job-queue options for webhook retries', 'What is the safest way to roll out feature flags?'],
+};
+const MODE_PILLS = [
+  { id: 'auto', label: 'Auto', icon: 'sparkle', title: 'Let Conductor decide from what you type' },
+  { id: 'ask', label: 'Ask', icon: 'help', title: 'Quick Ask: answered here, no task' },
+  { id: 'work', label: 'Build', icon: 'code', title: 'Engineering work: sent to the board as a task' },
+  { id: 'research', label: 'Research', icon: 'shield', title: 'Deep Research: a web report with sources' },
+];
+const MODE_CARDS = [
+  { id: 'ask', title: 'Quick Ask', desc: 'A question or an explanation. Answered right here from your code. No task, no plan.' },
+  { id: 'work', title: 'Engineering Work', desc: 'Features, refactors, bug fixes. Sent to the board as a task: Conductor plans it, splits it into tasks if needed, builds and verifies it.' },
+  { id: 'research', title: 'Deep Research', desc: 'Compare options and check evidence on the web. A report with sources, shown as opened, listed or unverified.' },
+];
+const DISCLOSE = {
+  ask: 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.',
+  research: 'Searches and reads sources on the web (it cannot see your code) and writes a report with citations. Needs the internet; uses your Claude plan.',
+  work: 'Creates a card in To do. Conductor plans it, builds it and verifies it without further input.',
+};
+const MAX_TURNS = 20;
+const ASK_POLL_MS = 1500;
+S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null };
+const HM = { root: null };
+
+const homeRepoNames = () => ((S.state && S.state.repos) || []).map((r) => r.name);
+function lastRepo() { const v = storeGet('home:lastRepo'); return v && homeRepoNames().includes(v) ? v : ''; }
+const effMode = () => (S.home.mode === 'auto' ? M.detectMode(S.home.text) : S.home.mode);
+const homeRepo = () => M.resolveRepo({ text: S.home.text, chosen: S.home.repo, lastUsed: lastRepo(), names: homeRepoNames(), allowNone: noneAllowed(effMode()) });
+const homeBusy = () => S.home.turns.some((t) => t.phase === 'sending' || t.phase === 'running');
+/** "No repository" is a real choice for Research, and for Ask unless exactly one repo is registered (the server then picks it). */
+const noneAllowed = (mode) => M.noneAllowed(mode, homeRepoNames().length);
+const modeRow = (mode) => M.ROLE_ROWS.find((r) => r.id === M.MODE_META[mode].row);
+
+function buildHomeView() {
+  HM.hero = h('section', { class: 'home-hero', 'aria-labelledby': 'hero-h' },
+    h('div', { class: 'home-hero-mark' }, icon('baton')),
+    h('h1', { id: 'hero-h' }, 'What do you want to do?'),
+    h('p', null, 'Write one line. Conductor answers it, researches it, or sends it to the board as work.'));
+  HM.clear = h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: clearThread }, 'Clear');
+  HM.turnList = h('div', { class: 'thread-list' });
+  HM.turnEls = new Map();
+  HM.thread = h('div', { class: 'thread', role: 'log', 'aria-live': 'polite', 'aria-label': 'Conversation', hidden: true },
+    h('div', { class: 'thread-head' }, HM.clear), HM.turnList);
+  HM.input = h('textarea', { id: 'cmp-text', class: 'cmp-input', rows: '1', maxlength: '4000', 'aria-label': 'Your request', placeholder: PLACEHOLDER.auto });
+  HM.input.value = S.home.text;
+  HM.input.addEventListener('input', () => { S.home.text = HM.input.value; fitComposer(); updateHome(); });
+  HM.input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); homeSubmit(); }
+    else if (e.key === 'Escape' && S.home.menu) { e.preventDefault(); closeHomeMenus(false); }
+  });
+  HM.modes = pillGroup({ label: 'Type of request', items: MODE_PILLS, value: S.home.mode, onPick: (id) => { S.home.mode = id; S.home.menu = null; S.home.err = ''; updateHome(); } });
+  HM.repoLbl = h('span');
+  HM.repoBtn = h('button', { type: 'button', class: 'chip-btn', 'aria-haspopup': 'menu', 'aria-expanded': 'false', onclick: () => toggleHomeMenu('repo') },
+    icon('folder'), HM.repoLbl, icon('chevron', 'icon-sm'));
+  HM.repoWrap = h('div', { class: 'menu-wrap' }, HM.repoBtn);
+  HM.whoIcon = h('span', { class: 'who-ic' });
+  HM.whoLbl = h('span');
+  HM.whoBtn = h('button', { type: 'button', class: 'chip-btn', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', onclick: () => toggleHomeMenu('who') },
+    HM.whoIcon, HM.whoLbl, icon('chevron', 'icon-sm'));
+  HM.whoWrap = h('div', { class: 'menu-wrap' }, HM.whoBtn);
+  HM.sendIcon = h('span', { class: 'send-ic' });
+  HM.send = h('button', { type: 'button', class: 'send', onclick: () => (S.home.turns.some((t) => t.phase === 'running' && t.askId) ? stopRunningTurn() : homeSubmit()) }, HM.sendIcon);
+  HM.note = h('p', { class: 'cmp-note' });
+  HM.allowBox = h('input', { type: 'checkbox', onchange: () => { S.home.allowChange = HM.allowBox.checked; } });
+  HM.allowLbl = h('span');
+  HM.opt = h('div', { class: 'cmp-opt', hidden: true },
+    h('label', { class: 'check' }, HM.allowBox, h('span', null, HM.allowLbl,
+      h('span', { class: 'hint' }, 'Only if the question asks for a change. This starts a task and spends your plan quota; its approval rules still apply.'))));
+  HM.err = h('p', { class: 'err cmp-err', role: 'alert', hidden: true });
+  HM.suggest = h('div', { class: 'suggest', 'aria-label': 'Examples' });
+  HM.suggestSig = '';
+  const dock = h('div', { class: 'dock' },
+    h('div', { class: 'composer' }, HM.input,
+      h('div', { class: 'cmp-bar' }, HM.modes.el, h('span', { class: 'cmp-spacer' }), HM.repoWrap, HM.whoWrap, HM.send)),
+    HM.note, HM.opt, HM.err, HM.suggest);
+  HM.cardWho = {};
+  HM.cards = h('div', { class: 'cards3' }, MODE_CARDS.map((c) => {
+    HM.cardWho[c.id] = h('span', { class: 'mcard-who' });
+    return h('button', { type: 'button', class: 'mcard', data: { mode: c.id }, onclick: () => { S.home.mode = c.id; S.home.err = ''; updateHome(); HM.input.focus(); } },
+      h('span', { class: 'mcard-ic' }, icon(M.MODE_META[c.id].icon)), h('span', { class: 'mcard-t' }, c.title), h('span', { class: 'mcard-d' }, c.desc), HM.cardWho[c.id]);
+  }));
+  HM.tools = h('div', { class: 'tools-row' });
+  HM.toolNotes = h('div', { class: 'tools-notes' });
+  HM.recentList = h('ul');
+  HM.recent = h('section', { class: 'recent', 'aria-labelledby': 'recent-h', hidden: true }, h('h3', { id: 'recent-h' }, 'Recent on the board'), HM.recentList);
+  HM.idle = h('div', { class: 'home-idle' }, HM.cards, HM.tools, HM.toolNotes, HM.recent);
+  HM.idleSig = '';
+  HM.inner = h('div', { class: 'landing-inner' }, HM.hero, HM.thread, dock, HM.idle);
+  HM.root = h('div', { class: 'screen landing is-idle' }, HM.inner);
+  $('#view').replaceChildren(HM.root);
+  fitComposer();
+  if (!S.roles && !S.rolesErr) loadRoles();
+}
+function leaveHome() { S.home.menu = null; HM.root = null; HM.turnEls = null; }
+function fitComposer() {
+  if (!HM.input) return;
+  HM.input.style.setProperty('--cmp-h', 'auto');
+  HM.input.style.setProperty('--cmp-h', Math.min(HM.input.scrollHeight, 220) + 'px');
+}
+
+function updateHome() {
+  if (!HM.root || !S.state) return;
+  const hm = S.home;
+  const mode = effMode();
+  const busy = homeBusy();
+  const idle = hm.turns.length === 0;
+  HM.root.className = 'screen landing ' + (idle ? 'is-idle' : 'has-thread');
+  toggleHidden(HM.hero, !idle);
+  toggleHidden(HM.thread, idle);
+  toggleHidden(HM.idle, !idle);
+  toggleHidden(HM.suggest, !idle);
+  // pills, placeholder
+  const detected = hm.mode === 'auto' && hm.text.trim() ? M.detectMode(hm.text) : '';
+  HM.modes.set(hm.mode, [detected ? 'Auto · ' + M.MODE_META[detected].short : 'Auto']);
+  HM.input.placeholder = PLACEHOLDER[hm.mode] || PLACEHOLDER.auto;
+  // repo chip (the resolved repository is always visible before Send)
+  const names = homeRepoNames();
+  const res = homeRepo();
+  const repoText = res.how === 'none' ? 'No repository'
+    : res.how === 'chosen' ? res.name
+      : res.name ? 'Auto · ' + res.name
+        : mode === 'work' && names.length > 1 ? 'Choose repo' : 'No repository';
+  setText(HM.repoLbl, repoText);
+  HM.repoBtn.title = 'Repository: ' + repoText;
+  // handled-by chip
+  const row = modeRow(mode);
+  const lead = roleLead(row.role);
+  setText(HM.whoLbl, lead ? provLabel(lead) : 'Handled by');
+  if (HM.whoIcon._id !== lead) { HM.whoIcon._id = lead; HM.whoIcon.replaceChildren(icon(lead ? AGENT_ICON[lead] || 'diamond' : 'sliders')); }
+  HM.whoBtn.title = row.label + (lead ? ' · ' + provLabel(lead) : '') + ' (who does this job)';
+  HM.whoBtn.setAttribute('aria-label', 'Handled by: ' + row.label + (lead ? ', ' + provLabel(lead) : ''));
+  // send / stop: the name says what happens and where (Security U4)
+  const canStop = hm.turns.some((t) => t.phase === 'running' && t.askId);
+  const sendName = canStop ? 'Stop' : busy ? 'Sending…'
+    : mode === 'ask' ? (res.name ? 'Ask about ' + res.name : 'Ask (no repository)')
+      : mode === 'research' ? 'Research on the web'
+        : res.name ? 'Send to the board (' + res.name + ')' : 'Send to the board';
+  HM.send.setAttribute('aria-label', sendName);
+  HM.send.title = sendName;
+  HM.send.disabled = canStop ? false : busy || !hm.text.trim();
+  HM.send.classList.toggle('is-stop', canStop);
+  const sk = canStop ? 'stop' : 'up';
+  if (HM.sendIcon._k !== sk) { HM.sendIcon._k = sk; HM.sendIcon.replaceChildren(icon(canStop ? 'stop' : 'arrow-up', canStop ? 'is-fill' : '')); }
+  // disclosure, Ask-only fast-path option, inline error
+  const showNote = hm.mode !== 'auto' || !!hm.text.trim();
+  setText(HM.note, showNote ? DISCLOSE[mode] : '');
+  toggleHidden(HM.note, !showNote);
+  const allow = mode === 'ask' && !!res.name;
+  const allowKey = mode + '|' + (res.name || '');
+  if (HM.allowKey !== allowKey) { HM.allowKey = allowKey; hm.allowChange = false; }
+  toggleHidden(HM.opt, !allow);
+  if (allow) setText(HM.allowLbl, 'Let Conductor make the change in ' + res.name + ' if it is small');
+  HM.allowBox.checked = allow && hm.allowChange;
+  setText(HM.err, hm.err);
+  toggleHidden(HM.err, !hm.err);
+  // examples
+  const sugModes = hm.mode === 'auto' ? ['ask', 'work', 'research'] : [hm.mode];
+  const sug = hm.mode === 'auto' ? sugModes.map((m) => SUGGEST[m][0]) : SUGGEST[hm.mode];
+  if (sug.join('|') !== HM.suggestSig) {
+    HM.suggestSig = sug.join('|');
+    HM.suggest.replaceChildren(...sug.map((t) => h('button', { type: 'button', onclick: () => { S.home.text = t; HM.input.value = t; fitComposer(); updateHome(); HM.input.focus(); } }, t)));
+  }
+  HM.clear.disabled = busy;
+  HM.clear.title = busy ? 'Stop it first' : 'Clear the conversation';
+  renderThread();
+  if (idle) renderHomeIdle();
+  if (hm.menu === 'repo' && !HM.repoMenu) openRepoMenu();
+  if (hm.menu === 'who' && !HM.whoMenu) openWhoMenu();
+}
+
+function renderHomeIdle() {
+  const st = S.state;
+  const lw = (role) => provLabel(roleLead(role));
+  const who = {
+    ask: roleLead('context') ? 'Answered by ' + lw('context') : '',
+    work: roleLead('planning') && roleLead('implementation') ? 'Planned by ' + lw('planning') + ' · built by ' + lw('implementation') : '',
+    research: roleLead('research') ? 'Researched by ' + lw('research') : '',
+  };
+  const recent = st.runs.filter((r) => r.column !== 'closed').slice().sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
+  const sig = JSON.stringify([S.home.mode, who, providersSig(st.providers), (st.providers || []).map((p) => [p.version, p.hint, p.detail]), S.roles && S.roles.roles,
+    recent.map((r) => [r.key, r.title, r.column, r.status])]);
+  if (sig === HM.idleSig) return;
+  HM.idleSig = sig;
+  for (const c of MODE_CARDS) { setText(HM.cardWho[c.id], who[c.id]); toggleHidden(HM.cardWho[c.id], !who[c.id]); }
+  for (const b of HM.cards.children) b.classList.toggle('is-on', b.dataset.mode === S.home.mode);
+  const ps = st.providers || [];
+  HM.tools.replaceChildren(...(ps.length ? [h('span', null, 'Your tools')] : []), ...ps.map((p) => {
+    const tone = TOOL_STATE[p.state] || TOOL_STATE.unknown;
+    const jobs = S.roles ? M.toolJobs(S.roles.roles, p.id) : '';
+    const detail = [p.version ? 'v' + String(p.version).replace(/^v/, '') : '', p.state === 'ok' ? jobs : p.hint || p.detail || ''].filter(Boolean).join(' · ');
+    return h('span', { class: 'tool-chip', title: detail || null }, icon(AGENT_ICON[p.id] || 'diamond'), p.label || p.id, badge(tone[0], tone[1]));
+  }));
+  const bad = ps.filter((p) => p.state !== 'ok' && p.inUse && (p.hint || p.detail)); // an unused tool's hint stays in its tooltip
+  HM.toolNotes.replaceChildren(...bad.map((p) => h('p', null, h('b', null, (p.label || p.id) + ': '), p.hint || p.detail)));
+  toggleHidden(HM.toolNotes, !bad.length);
+  HM.recentList.replaceChildren(...recent.map((r) => h('li', null, h('button', { type: 'button', class: 'recent-row', data: { act: 'open', key: r.key } },
+    h('span', { class: 'card-key' }, r.key), h('span', { class: 't' }, r.title),
+    h('span', { class: 'st ' + statusClass(r) }, icon(statusIcon(r)), (COL_BY_ID[r.column] || { label: runLabel(r) }).label)))));
+  toggleHidden(HM.recent, !recent.length);
+}
+
+/* menus: repository, and the "Handled by" popover */
+function toggleHomeMenu(which) {
+  const open = S.home.menu === which;
+  closeHomeMenus(false);
+  if (!open) { S.home.menu = which; if (which === 'repo') openRepoMenu(); else openWhoMenu(); }
+}
+function closeHomeMenus(focusTrigger) {
+  const was = S.home.menu;
+  S.home.menu = null;
+  for (const k of ['repoMenu', 'whoMenu']) { if (HM[k]) { HM[k].remove(); HM[k] = null; } }
+  if (HM.repoBtn) HM.repoBtn.setAttribute('aria-expanded', 'false');
+  if (HM.whoBtn) HM.whoBtn.setAttribute('aria-expanded', 'false');
+  if (focusTrigger && was && HM.root) (was === 'repo' ? HM.repoBtn : HM.whoBtn).focus();
+}
+function openRepoMenu() {
+  const mode = effMode();
+  const names = homeRepoNames();
+  const opts = [{ v: '', label: 'Auto (best match)' }].concat(names.map((n) => ({ v: n, label: n })));
+  if (noneAllowed(mode)) opts.push({ v: M.NONE, label: 'No repository' });
+  const cur = (S.home.repo === M.NONE && noneAllowed(mode)) || names.includes(S.home.repo) ? S.home.repo : '';
+  const close = (f) => closeHomeMenus(f);
+  const menu = h('div', { class: 'menu', role: 'menu', 'aria-label': 'Repository' }, opts.map((o) => h('button', {
+    type: 'button', role: 'menuitemradio', class: 'menu-item' + (o.v === cur ? ' is-on' : ''), 'aria-checked': o.v === cur ? 'true' : 'false', tabindex: '-1',
+    onclick: () => { S.home.repo = o.v; S.home.err = ''; close(false); updateHome(); HM.input.focus(); },
+  }, icon('tick'), h('span', null, o.label))));
+  menuKeys(menu, close);
+  HM.repoMenu = h('div', null, h('div', { class: 'menu-scrim', onclick: () => close(false) }), menu);
+  HM.repoWrap.appendChild(HM.repoMenu);
+  HM.repoBtn.setAttribute('aria-expanded', 'true');
+  const on = menu.querySelector('[aria-checked="true"]') || menu.querySelector('[role="menuitemradio"]');
+  if (on) on.focus();
+}
+/** The popover edits a GLOBAL setting: the pill choice is only a draft until the explicit Apply button (Security U2). */
+function openWhoMenu() {
+  const row = modeRow(effMode());
+  const pop = h('div', { class: 'menu menu-who', role: 'dialog', tabindex: '-1', 'aria-label': 'Handled by ' + row.label });
+  pop.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeHomeMenus(true); } });
+  HM.whoMenu = h('div', null, h('div', { class: 'menu-scrim', onclick: () => closeHomeMenus(false) }), pop);
+  HM.whoWrap.appendChild(HM.whoMenu);
+  HM.whoBtn.setAttribute('aria-expanded', 'true');
+  fillWhoMenu(pop, row);
+}
+function fillWhoMenu(pop, row) {
+  const title = h('div', { class: 'menu-title' }, 'Handled by ', h('b', null, row.label));
+  const scope = h('p', { class: 'menu-text' }, h('b', null, 'This is a global setting.'), ' It changes who does this job for every request and every card, not just this one.');
+  const link = h('button', { type: 'button', class: 'menu-link', onclick: () => { closeHomeMenus(false); openSettings(); } }, 'All roles in Settings');
+  if (!S.roles) {
+    const msg = S.rolesErr ? "Couldn't load who does what: " + S.rolesErr.message : 'Loading…';
+    pop.replaceChildren(title, scope, h('p', { class: S.rolesErr ? 'err' : 'menu-text', role: 'status' }, msg),
+      S.rolesErr ? h('button', { type: 'button', class: 'btn btn-sm', onclick: async () => { S.rolesErr = null; await loadRoles(); if (HM.whoMenu) fillWhoMenu(pop, row); } }, 'Try again') : null, link);
+    if (!S.rolesErr) loadRoles().then(() => { if (HM.whoMenu && pop.isConnected) fillWhoMenu(pop, row); });
+    pop.focus();
+    return;
+  }
+  const lead = M.leadOf(S.roles.roles, row.role);
+  const choices = S.roles.choices[row.role] || {};
+  let draft = lead;
+  const status = h('p', { class: 'menu-text', role: 'status' });
+  const out = h('p', { class: 'warn-note', role: 'status', hidden: true });
+  const apply = h('button', { type: 'button', class: 'btn btn-primary btn-sm' });
+  const items = Object.keys(choices).map((id) => ({ id, label: provLabel(id), locked: !choices[id].ok, reason: choices[id].reason || '', title: choices[id].ok ? (choices[id].needsAck ? 'Isolation not verified on this machine' : null) : choices[id].reason || 'Not available for this job' }));
+  const sync = () => {
+    pills.set(draft);
+    setText(apply, draft && draft !== lead ? 'Use ' + provLabel(draft) + ' for every ' + row.label + ' job' : 'No change');
+    apply.disabled = !draft || draft === lead || apply.classList.contains('is-busy');
+  };
+  const pills = pillGroup({ label: 'Tool for ' + row.label, items, value: draft,
+    onPick: (id) => { draft = id; setText(status, ''); sync(); },
+    onLocked: (it) => setText(status, it.label + ': ' + it.reason) });
+  apply.addEventListener('click', async () => {
+    if (!draft || draft === lead) return;
+    apply.classList.add('is-busy'); apply.disabled = true;
+    for (const b of pills.btns) b.disabled = true;
+    const r = await applyRoleChanges({ [row.id]: draft });
+    if (!HM.whoMenu || !pop.isConnected) return;
+    if (r.ok) {
+      const notes = r.notices || [];
+      if (notes.length) { fillWhoMenu(pop, row); const o2 = pop.querySelector('.warn-note'); if (o2) { o2.replaceChildren(...notes.map((n) => h('span', null, n))); o2.hidden = false; } }
+      else { closeHomeMenus(true); toast('good', row.label + ' now runs on ' + provLabel(draft) + '.'); }
+      updateHome();
+      return;
+    }
+    apply.classList.remove('is-busy');
+    for (const b of pills.btns) b.disabled = false;
+    draft = M.leadOf(S.roles.roles, row.role);
+    if (r.error) { out.textContent = r.error; out.hidden = false; }
+    sync();
+  });
+  const notes = [];
+  if (row.id === 'research') notes.push("Deep Research always runs on Claude's web-only research profile today, so this job cannot be moved to another tool yet.");
+  const abc = S.roles.roles[row.role] && S.roles.roles[row.role].autoByComplexity;
+  if (abc && Object.keys(abc).length) notes.push('Some plan sizes use a different tool first (set in the config file).');
+  pop.replaceChildren(title, scope, pills.el, status, ...notes.map((n) => h('p', { class: 'menu-text muted' }, n)), out,
+    h('div', { class: 'turn-actions' }, apply, link));
+  sync();
+  const f = pills.btns.find((b) => b.getAttribute('aria-checked') === 'true') || pills.btns[0];
+  if (f) f.focus();
+}
+
+/* the thread */
+function pushTurn(t) {
+  S.home.turns.push(t);
+  while (S.home.turns.length > MAX_TURNS) {
+    const i = S.home.turns.findIndex((x) => x.phase !== 'sending' && x.phase !== 'running');
+    if (i < 0) break;
+    clearTimeout(S.home.turns[i].timer);
+    S.home.turns.splice(i, 1);
+  }
+}
+function clearThread() {
+  if (homeBusy()) return;
+  for (const t of S.home.turns) clearTimeout(t.timer);
+  S.home.turns = [];
+  updateHome();
+  if (HM.input) HM.input.focus();
+}
+/** Sign-out / expired session: nothing of the conversation stays on the page (Security U5). */
+function dropHome() {
+  for (const t of S.home.turns) { clearTimeout(t.timer); t.timer = 0; }
+  S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null };
+  HM.root = null; HM.turnEls = null;
+}
+const askPhase = (r) => (r.status === 'running' || r.status === 'paused' ? 'running' : r.status === 'done' ? 'done' : r.status === 'canceled' ? 'canceled' : 'failed');
+
+async function homeSubmit() {
+  const hm = S.home;
+  const text = HM.input ? HM.input.value.trim() : hm.text.trim();
+  if (!text || homeBusy()) { if (HM.input) HM.input.focus(); return; }
+  const mode = effMode();
+  const names = homeRepoNames();
+  const res = homeRepo();
+  hm.err = '';
+  if (mode === 'work') {
+    if (!names.length) { hm.err = 'Add a repository first (Settings, then Repositories and setup).'; updateHome(); return; }
+    if (!res.name) { hm.err = 'Choose which repository this task belongs to.'; updateHome(); toggleHomeMenu('repo'); return; }
+  }
+  const t = { id: uid('turn'), mode, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && !!res.name && hm.allowChange };
+  pushTurn(t);
+  hm.allowChange = false;
+  closeHomeMenus(false);
+  updateHome();
+  scrollToTurn(t);
+  try {
+    if (mode === 'work') {
+      const body = M.taskFromText(text);
+      if (t.repo) body.repo = t.repo;
+      const r = await api('POST', '/api/tasks', body);
+      t.phase = 'sent'; t.created = { key: r.key };
+      loadState().catch(() => {});
+    } else {
+      const body = { question: text };
+      if (mode === 'research') body.mode = 'research';
+      if (t.repo) body.repo = t.repo;
+      if (t.allowChange) body.allowChange = true;
+      const r = await api('POST', '/api/ask', body);
+      t.askId = r.id; t.rec = r; t.phase = askPhase(r);
+      if (t.phase === 'running') pollTurn(t);
+    }
+    if (t.repo) storeSet('home:lastRepo', t.repo);
+    hm.text = '';
+    if (HM.input) { HM.input.value = ''; fitComposer(); }
+  } catch (e) {
+    if (e instanceof ApiFail && e.status === 401) return;
+    t.phase = 'error'; t.error = e.message;
+  }
+  updateHome();
+}
+function pollTurn(t, delay) {
+  clearTimeout(t.timer);
+  t.timer = setTimeout(async () => {
+    t.timer = 0;
+    if (!S.home.turns.includes(t) || S.expired) return;
+    try {
+      const r = await api('GET', '/api/asks/' + enc(t.askId));
+      t.rec = r; t.phase = askPhase(r);
+      if (t.phase === 'running') pollTurn(t);
+    } catch (e) {
+      if (e instanceof ApiFail && e.status === 401) return;
+      if (e instanceof ApiFail && e.status === 404) { t.phase = 'error'; t.error = e.message; }
+      else pollTurn(t, 5000); // the server is unreachable for a moment: keep watching the same question (never re-asks)
+    }
+    updateHome();
+  }, delay || ASK_POLL_MS);
+}
+async function stopRunningTurn() {
+  const t = S.home.turns.find((x) => x.phase === 'running' && x.askId);
+  if (!t) return;
+  try {
+    const r = await api('POST', '/api/asks/' + enc(t.askId) + '/cancel');
+    t.rec = r; t.phase = askPhase(r);
+    if (t.phase === 'running') pollTurn(t); else clearTimeout(t.timer);
+  } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); }
+  updateHome();
+}
+async function convertTurn(t) {
+  if (t.busy || !t.askId) return;
+  t.busy = true; updateHome();
+  try {
+    const c = await api('POST', '/api/asks/' + enc(t.askId) + '/convert');
+    toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.');
+    loadState().catch(() => {});
+    t.rec = await api('GET', '/api/asks/' + enc(t.askId));
+  } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) { t.convertErr = e.message; } }
+  t.busy = false;
+  updateHome();
+}
+
+function scrollToTurn(t) {
+  const rec = HM.turnEls && HM.turnEls.get(t.id);
+  if (rec) rec.el.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'start' });
+}
+function renderThread() {
+  if (!HM.turnEls) return;
+  const els = S.home.turns.map((t) => {
+    const sig = JSON.stringify([t.phase, t.error, t.created, t.busy, t.convertErr, t.rec && [t.rec.status, t.rec.basis, t.rec.provider, t.rec.updatedAt, t.rec.convertedTo, t.rec.error], t.phase === 'running' ? null : roleLead(modeRow(t.mode).role)]);
+    let rec = HM.turnEls.get(t.id);
+    if (!rec) { rec = { el: h('article', { class: 'turn', data: { turn: t.id } }), sig: '' }; HM.turnEls.set(t.id, rec); }
+    if (rec.sig !== sig) {
+      rec.sig = sig;
+      const act = document.activeElement;
+      const fid = act && rec.el.contains(act) ? act.getAttribute('data-fid') : null;
+      rec.el.replaceChildren(...turnNodes(t));
+      if (fid) { const f = rec.el.querySelector('[data-fid="' + CSS.escape(fid) + '"]'); if (f) f.focus({ preventScroll: true }); }
+    }
+    return rec.el;
+  });
+  const live = new Set(S.home.turns.map((t) => t.id));
+  for (const id of Array.from(HM.turnEls.keys())) if (!live.has(id)) HM.turnEls.delete(id);
+  reconcile(HM.turnList, els);
+}
+function stepNodes(steps) {
+  return h('ol', { class: 'tsteps' }, steps.map((s) => h('li', { class: 'tstep is-' + s.state },
+    h('span', { class: 'tstep-ic' }, s.state === 'running' ? h('span', { class: 'spin' }) : s.state === 'done' ? icon('tick') : s.state === 'stopped' ? icon('x') : h('span', { class: 'tstep-dot' })),
+    h('span', { class: 'tstep-body' }, h('span', { class: 'tstep-t' }, s.label), s.detail ? h('span', { class: 'tstep-d' }, s.detail) : null))));
+}
+/** Steps come from the record's real fields only (status, basis, provider): nothing advances on a timer. */
+function turnSteps(t) {
+  const r = t.rec;
+  const ended = t.phase === 'failed' || t.phase === 'canceled' || t.phase === 'error';
+  if (t.mode === 'work') {
+    return [{ label: t.phase === 'sent' ? 'Sent to the board as ' + t.created.key : 'Creating the task', state: t.phase === 'sent' ? 'done' : ended ? 'stopped' : 'running' }];
+  }
+  if (t.phase === 'error') return [{ label: 'Not sent', state: 'stopped' }];
+  if (t.mode === 'research') {
+    const done = t.phase === 'done';
+    return [{ label: done ? 'Report written by ' + provLabel(r.provider || 'claude') : 'Researching on the web. This can take a few minutes.', state: done ? 'done' : ended ? 'stopped' : 'running' }];
+  }
+  const repo = (r && r.repo) || t.repo;
+  const read = !!(r && r.basis);
+  return [
+    { label: repo ? 'Reading a read-only copy of ' + repo : 'No repository: a general answer', detail: read ? r.basis : '', state: read ? 'done' : ended ? 'stopped' : 'running' },
+    { label: t.phase === 'done' ? 'Answered by ' + provLabel(r.provider) : 'Writing the answer', state: t.phase === 'done' ? 'done' : ended ? 'stopped' : read ? 'running' : 'pending' },
+  ];
+}
+function turnNodes(t) {
+  const meta = M.MODE_META[t.mode];
+  const row = modeRow(t.mode);
+  const r = t.rec;
+  const by = r && r.provider ? r.provider : roleLead(row.role);
+  const out = [];
+  if (t.phase === 'error') out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'Not sent'), h('div', { class: 'pre' }, t.error))));
+  if (t.phase === 'failed') out.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, t.mode === 'research' ? 'No report' : 'No answer'), h('div', { class: 'pre' }, (r && r.error) || 'Something went wrong.'))));
+  if (t.phase === 'canceled') out.push(h('p', { class: 'muted' }, 'Stopped.'));
+  if (t.phase === 'sent') {
+    out.push(h('div', { class: 'sent' }, icon('check'), h('span', { class: 'sent-t' }, 'Sent to the board'),
+      h('span', { class: 'keys' }, h('span', { class: 'chip' }, t.created.key)),
+      h('button', { type: 'button', class: 'btn btn-sm', data: { fid: 'view' }, onclick: () => navigate('#/board') }, 'View on board')));
+  }
+  if (t.phase === 'done' && r && r.result && t.mode === 'ask') {
+    const res = r.result;
+    const doc = h('div', { class: 'doc' });
+    if (res.answer) doc.appendChild(h('div', { class: 'doc-sec is-bare' }, renderMarkdown(res.answer)));
+    if (res.kind === 'change' && res.change) doc.appendChild(h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'This looks like a request for a change: ' + res.change.title + ' (size ' + res.change.complexity + '). Nothing was changed.')));
+    out.push(doc);
+    if ((res.citations || []).length) out.push(h('p', { class: 'cites' }, 'Sources: ', ...res.citations.flatMap((c, i) => [i ? ', ' : '', h('code', null, c.file + (c.lines ? ':' + c.lines : ''))])));
+    out.push(h('p', { class: 'cites' }, 'Based on ' + (r.basis || 'the repository') + '. The answer is model-written — check it before relying on it.' + (r.tierNote ? ' ' + r.tierNote : '')));
+    out.push(...convertNodes(t, 'Turn into a task', 'Started as task ', 'Nothing was added to the board. Turning it into a task always waits for your approval.', 'Choose a repository before asking if you want to turn this into a task.'));
+  }
+  if (t.phase === 'done' && r && r.report && t.mode === 'research') {
+    out.push(h('div', { class: 'doc' }, h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
+      h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.'))));
+    out.push(...convertNodes(t, 'Turn into an engineering plan', 'Turned into task ', '', 'Choose a repository before asking if you want to turn the findings into an engineering plan.', true));
+  }
+  return [
+    h('div', { class: 'msg-user' }, h('div', { class: 'bubble' }, t.text)),
+    h('div', { class: 'msg-ai' },
+      h('div', { class: 'ai-head' },
+        h('span', { class: 'ai-mark' }, icon('baton')), h('span', { class: 'ai-name' }, 'Conductor'),
+        h('span', { class: 'ai-tag' }, icon(meta.icon, 'icon-sm'), meta.label),
+        by ? h('span', { class: 'ai-who', title: row.label + ' · ' + provLabel(by) }, provLabel(by)) : null),
+      stepNodes(turnSteps(t)), out),
+  ];
+}
+function convertNodes(t, label, doneText, hint, noRepo, primary) {
+  const r = t.rec;
+  if (r.convertedTo) return [h('p', null, doneText, h('b', null, r.convertedTo), '. ', h('button', { type: 'button', class: 'link-btn', data: { fid: 'view' }, onclick: () => navigate('#/board') }, 'View on board'))];
+  if (!r.repo) return [h('p', { class: 'muted' }, noRepo)];
+  return [h('div', { class: 'turn-actions' },
+    h('button', { type: 'button', class: 'btn' + (primary ? ' btn-primary' : '') + (t.busy ? ' is-busy' : ''), disabled: !!t.busy, data: { fid: 'convert' }, onclick: () => convertTurn(t) }, icon('plus'), h('span', null, label)),
+    hint ? h('span', { class: 'muted' }, hint) : null),
+  t.convertErr ? h('p', { class: 'err', role: 'alert' }, t.convertErr) : null].filter(Boolean);
+}
+
 /* ───────────────────────── board view ───────────────────────── */
 const B = { idle: new Map(), summary: null, items: null, polled: null, board: null, cols: new Map(), cards: new Map(), history: null, histList: null, histCount: null, histSig: '', empty: null, pollEl: null, order: '', itemsSig: '' };
 
@@ -710,31 +1389,17 @@ function buildBoardView() {
     const el = h('section', { class: 'col is-empty', id: 'col-' + c.id, 'aria-labelledby': headId },
       h('div', { class: 'col-head st-' + c.id }, icon(c.icon), title, count),
       h('p', { class: 'col-sub' }, c.hint), list, empty);
-    B.cols.set(c.id, { el, list, count, empty, title });
+    B.cols.set(c.id, { el, list, count, empty, title, sub: el.querySelector('.col-sub') });
   }
-  B.tools = h('div', { class: 'tools' });
-  const modeCard = (icn, title, text, act) => h('button', { type: 'button', class: 'mode-card', data: { act } }, h('span', { class: 'mode-ic' }, icon(icn)), h('span', { class: 'mode-t' }, title), h('span', { class: 'mode-d' }, text));
-  B.modes = h('section', { class: 'modes', 'aria-labelledby': 'modes-h' },
-    h('h2', { id: 'modes-h', class: 'modes-title' }, 'What do you want to do?'),
-    h('div', { class: 'mode-grid' },
-      modeCard('help', 'Quick Ask', 'A question, an explanation, or a small fix. Answered from your code in seconds — no task, no plan.', 'open-ask'),
-      modeCard('code', 'Engineering Work', 'Features, refactors, bug fixes. Conductor plans it, splits it into tasks if needed, builds, and verifies.', 'new-task'),
-      modeCard('shield', 'Deep Research', 'Compare options and check evidence on the web. A report with sources, shown as opened, listed or unverified.', 'open-research')),
-    B.tools);
   B.pollEl = h('span', { class: 'num' }, '5');
   B.empty = h('section', { class: 'empty', 'aria-labelledby': 'empty-h' },
     h('h2', { id: 'empty-h', class: 'empty-title' }, 'Nothing in flight'),
     h('p', null, 'Create a task and Conductor plans it, builds it and verifies it. Your cards live right here on the board.'),
-    h('ol', { class: 'flow', 'aria-label': 'How a task moves' },
-      h('li', null, h('b', null, 'Plan'), h('span', null, 'Claude reads the card and writes a plan')),
-      h('li', null, h('b', null, 'Approve'), h('span', null, 'You confirm the first plan per repo')),
-      h('li', null, h('b', null, 'Build'), h('span', null, 'Cursor writes the code in a worktree')),
-      h('li', null, h('b', null, 'Verify'), h('span', null, 'Gates and Claude check every criterion')),
-      h('li', null, h('b', null, 'Review'), h('span', null, 'You merge. Conductor never pushes'))),
+    (B.flow = h('ol', { class: 'flow', 'aria-label': 'How a task moves' })),
     h('ol', { class: 'how' },
       h('li', null, 'Press ', h('b', null, 'New task'), ' and describe what you want.'),
       h('li', null, 'Conductor picks it up straight away: the card moves through the stages by itself.'),
-      h('li', null, 'You only step in when a card says ', h('b', null, 'Needs you'), ' or a plan needs approval.')),
+      h('li', null, 'You only step in when a card says ', h('b', null, 'Needs you'), (B.howTail = h('span')), '.')),
     h('div', { class: 'row' },
       h('button', { type: 'button', class: 'btn btn-primary', data: { act: 'new-task' } }, icon('plus'), h('span', null, 'New task')),
       h('button', { type: 'button', class: 'btn', data: { act: 'open-setup' } }, icon('sliders'), h('span', null, 'Repositories and setup'))));
@@ -743,7 +1408,22 @@ function buildBoardView() {
   B.history = h('details', { class: 'history' },
     h('summary', null, icon('archive'), h('span', null, 'History'), B.histCount, h('span', { class: 'card-spacer' }), icon('chevron', 'chev')),
     B.histList);
-  $('#view').replaceChildren(B.summary, B.modes, B.empty, B.board, B.history);
+  B.wordSig = '';
+  $('#view').replaceChildren(h('div', { class: 'screen' }, B.summary, B.empty, B.board, B.history));
+}
+
+/** Column hints and the empty-state steps name the tool assigned to each job (F5); without roles, today's static wording stays. */
+function updateBoardWording() {
+  const roles = S.roles ? S.roles.roles : null;
+  const pa = S.state.settings.planApproval;
+  const sig = JSON.stringify([roles, pa]);
+  if (sig === B.wordSig) return;
+  B.wordSig = sig;
+  const hints = roles ? M.colHints(roles, provLabel) : {};
+  for (const c of COLUMNS) { const col = B.cols.get(c.id); if (col && col.sub) setText(col.sub, hints[c.id] || c.hint); }
+  const f = M.flowText(roles || {}, pa, provLabel);
+  B.flow.replaceChildren(...f.steps.map((x) => h('li', null, h('b', null, x.t), h('span', null, x.d))));
+  setText(B.howTail, f.howTail);
 }
 
 function reconcile(parent, els) {
@@ -766,7 +1446,7 @@ function updateBoard() {
   const byCol = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
-  renderTools();
+  updateBoardWording();
   toggleHidden(B.empty, open.length > 0 || idle > 0);
   toggleHidden(B.board, open.length === 0 && idle === 0);
   setText(B.pollEl, st.engine.pollSeconds || 5);
@@ -909,9 +1589,13 @@ function createCard(key) {
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
   p.actions = h('div', { class: 'card-actions', hidden: true }, p.bApprove, p.bRetry, p.bResume);
-  const el = h('li', { class: 'card', data: { key } },
+  const el = h('li', { class: 'card is-entering', data: { key } },
     h('div', { class: 'card-top' }, p.key, h('span', { class: 'card-spacer' }), p.agent), p.main, p.act, p.reason, p.meta, p.actions);
   el._p = p;
+  el._entering = true;
+  const settle = () => { if (el._entering) { el._entering = false; el.classList.remove('is-entering'); } };
+  el.addEventListener('animationend', settle, { once: true });
+  setTimeout(settle, 800); // a hidden tab may never deliver animationend
   return el;
 }
 function setTimer(span, mode, ts) {
@@ -921,7 +1605,7 @@ function setTimer(span, mode, ts) {
 }
 function updateCard(el, r) {
   const p = el._p;
-  const cls = 'card ' + statusClass(r) + (S.route.key === r.key ? ' is-selected' : '');
+  const cls = 'card ' + statusClass(r) + (S.route.key === r.key ? ' is-selected' : '') + (el._entering ? ' is-entering' : '');
   if (el.className !== cls) el.className = cls;
   setText(p.repoT, r.repo || ''); toggleHidden(p.repo, !r.repo);
 
@@ -981,8 +1665,6 @@ function onViewClick(e) {
     case 'jump': jumpToColumn(t.dataset.col); break;
     case 'new-task': openNewTask(); break;
     case 'open-setup': navigate('#/setup'); break;
-    case 'open-ask': openAsk('quick'); break;
-    case 'open-research': openAsk('research'); break;
     default: break;
   }
 }
@@ -1912,6 +2594,7 @@ function bugTracker(d) {
 function confirmDialog(o) {
   return new Promise((resolve) => {
     const dlg = $('#dlg-confirm');
+    if (dlg.open) dlg.close(); // the previous confirm has already settled (from its submit); never stack two
     dlg.returnValue = '';
     const form = h('form', { method: 'dialog' },
       h('div', { class: 'dlg-head' }, h('h2', { id: 'dlg-confirm-title' }, o.title)),
@@ -1920,7 +2603,11 @@ function confirmDialog(o) {
         h('button', { type: 'submit', class: 'btn', value: 'cancel', formnovalidate: true, autofocus: true }, o.cancelLabel || 'Cancel'),
         h('button', { type: 'submit', class: 'btn ' + (o.danger ? 'btn-danger-solid' : 'btn-primary'), value: 'ok' }, o.confirmLabel || 'Confirm')));
     dlg.replaceChildren(form);
-    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
+    // settle from the submit itself (its submitter says which button) and, for Escape, from `close`; whichever comes first wins
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    form.addEventListener('submit', (e) => done(!!(e.submitter && e.submitter.value === 'ok')));
+    dlg.addEventListener('close', () => done(dlg.returnValue === 'ok'), { once: true });
     dlg.showModal();
   });
 }
@@ -1949,7 +2636,7 @@ function toolsNodes() {
     h('h3', { class: 'tools-title' }, 'Your tools', h('span', { class: 'muted' }, ' — found on this Mac automatically')),
     h('ul', { class: 'tool-list' }, ps.map((p) => {
       const st = TOOL_STATE[p.state] || TOOL_STATE.unknown;
-      const roles = p.id === 'claude' ? 'plans, reviews, verifies, answers, researches' : p.id === 'cursor' ? 'builds the code' : p.id === 'codex' ? 'optional read-only analysis' : '';
+      const roles = S.roles ? M.toolJobs(S.roles.roles, p.id) : '';
       return h('li', { class: 'tool' },
         h('span', { class: 'tool-name' }, icon(AGENT_ICON[p.id] || 'diamond'), p.label || p.id),
         badge(st[0], st[1]),
@@ -1957,11 +2644,8 @@ function toolsNodes() {
     })),
   ];
 }
-function renderTools() {
-  if (B.tools) B.tools.replaceChildren(...toolsNodes());
-}
 
-/* ───────────────────────── Quick Ask ───────────────────────── */
+/* ───────────────────────── research report (rendered in the Home thread) ───────────────────────── */
 function renderReport(rp) {
   const tone = { opened: ['good', 'Opened'], listed: ['warn', 'Listed, not opened'], unverified: ['bad', 'Unverified'] };
   const out = [h('h3', null, 'Summary'), h('p', null, rp.summary)];
@@ -1973,79 +2657,6 @@ function renderReport(rp) {
   out.push(h('h3', null, 'Limits of this report'), h('p', null, rp.limitations || 'None stated.'));
   if (rp.fetched.length || rp.searched.length) out.push(h('details', null, h('summary', null, 'Everything it searched and opened'), rp.searched.length ? h('p', { class: 'muted' }, 'Searches: ' + rp.searched.join(' · ')) : null, rp.fetched.length ? h('p', { class: 'muted' }, 'Opened: ' + rp.fetched.join(' · ')) : null));
   return out;
-}
-
-function openAsk(mode) {
-  const research = mode === 'research';
-  const repos = (S.state && S.state.repos) || [];
-  const idQ = uid('ask'); const idR = uid('ask'); const idC = uid('ask');
-  const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
-  const out = h('div', { class: 'stack', 'aria-live': 'polite' });
-  const q = h('textarea', { class: 'textarea', id: idQ, maxlength: '4000', placeholder: 'Ask about the code, how something works, or what a change would involve…' });
-  const repo = h('select', { class: 'select', id: idR }, repos.length !== 1 ? h('option', { value: '' }, research ? 'No repository (research only)' : 'No repository (general question)') : null, repos.map((r) => h('option', { value: r.name }, r.name)));
-  if (repos.length === 1) repo.value = repos[0].name;
-  const change = h('input', { type: 'checkbox', id: idC });
-  const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Ask');
-  let timer = 0;
-  const stop = () => { if (timer) { clearTimeout(timer); timer = 0; } };
-  const render = (r) => {
-    const kids = [];
-    if (r.status === 'running') kids.push(h('p', { class: 'muted' }, research ? 'Researching on the web — this can take a few minutes…' : 'Reading the code and answering…'));
-    if (r.status === 'done' && r.report) kids.push(...renderReport(r.report));
-    if (r.status === 'failed') kids.push(h('div', { class: 'callout c-bad' }, icon('warn'), h('div', { class: 'callout-body' }, h('b', null, 'No answer'), h('div', { class: 'pre' }, r.error || 'Something went wrong.'))));
-    if (r.status === 'canceled') kids.push(h('p', { class: 'muted' }, 'Canceled.'));
-    if (r.status === 'done' && r.report) {
-      kids.push(h('p', { class: 'muted' }, 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.'));
-      if (r.convertedTo) kids.push(h('p', null, 'Turned into task ', h('b', null, r.convertedTo), '.'));
-      else if (r.repo) kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn btn-primary', onclick: async () => {
-        try { const c = await api('POST', '/api/asks/' + enc(r.id) + '/convert'); toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.'); loadState().catch(() => {}); render(await api('GET', '/api/asks/' + enc(r.id))); } catch (ex) { toast('error', ex.message); }
-      } }, 'Turn into an engineering plan')));
-      else kids.push(h('p', { class: 'muted' }, 'Choose a repository before asking if you want to turn the findings into an engineering plan.'));
-    }
-    if (r.status === 'done' && r.result) {
-      if (r.result.answer) kids.push(renderMarkdown(r.result.answer));
-      if (r.result.kind === 'change' && r.result.change) kids.push(h('p', { class: 'muted' }, 'This looks like a request for a change: ' + r.result.change.title + ' (size ' + r.result.change.complexity + '). Nothing was changed.'));
-      if ((r.result.citations || []).length) kids.push(h('p', { class: 'muted' }, 'Sources: ', ...r.result.citations.flatMap((c, i) => [i ? ', ' : '', h('code', null, c.file + (c.lines ? ':' + c.lines : ''))])));
-      kids.push(h('p', { class: 'muted' }, 'Based on ' + (r.basis || 'the repository') + '. The answer is model-written — check it before relying on it.' + (r.tierNote ? ' ' + r.tierNote : '')));
-      if (r.convertedTo) kids.push(h('p', null, 'Started as task ', h('b', null, r.convertedTo), '.'));
-      else if (r.repo) kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn', onclick: async (ev) => {
-        try { const c = await api('POST', '/api/asks/' + enc(r.id) + '/convert'); toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.'); loadState().catch(() => {}); render(await api('GET', '/api/asks/' + enc(r.id))); } catch (ex) { toast('error', ex.message); }
-      } }, 'Turn into a task')));
-    }
-    out.replaceChildren(...kids);
-  };
-  const poll = async (id) => {
-    try {
-      const r = await api('GET', '/api/asks/' + enc(id));
-      render(r);
-      if (r.status === 'running') timer = setTimeout(() => poll(id), 1500);
-      else setBusy(submit, false);
-    } catch (ex) { setBusy(submit, false); err.hidden = false; setText(err, ex.message); }
-  };
-  const onSubmit = async (e) => {
-    e.preventDefault(); err.hidden = true; stop();
-    if (!q.value.trim()) { err.hidden = false; setText(err, 'Type a question first.'); q.focus(); return; }
-    setBusy(submit, true);
-    try {
-      const body = { question: q.value.trim() };
-      if (research) body.mode = 'research';
-      if (repo.value) body.repo = repo.value;
-      if (change.checked && !research) body.allowChange = true;
-      const r = await api('POST', '/api/ask', body);
-      render(r); poll(r.id);
-    } catch (ex) { setBusy(submit, false); err.hidden = false; setText(err, ex.message); }
-  };
-  const cancel = h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Close');
-  const dlg = dlgShell(research ? 'Deep Research' : 'Ask a question', [
-    h('p', { class: 'muted' }, research ? 'Searches and reads sources on the web (it cannot see your code) and writes a report with citations. Needs the internet; uses your Claude plan.' : 'Answered from a read-only copy of the repository\'s base branch. Nothing is changed and no task is created unless you choose to.'),
-    field(idQ, research ? 'What should be researched?' : 'Question', q),
-    repos.length ? field(idR, research ? 'Repository (only needed to turn findings into a plan)' : 'Repository', repo) : null,
-    research ? null : h('div', { class: 'field' }, h('label', { for: idC }, change, ' Let Conductor make the change if it is small'), h('p', { class: 'hint' }, 'Only if the question asks for a change. This starts a task and spends your plan quota; its approval rules still apply.')),
-    err, out,
-  ], [h('span', { class: 'spacer' }), cancel, submit], onSubmit, true);
-  dlg.addEventListener('close', stop, { once: true });
-  dlg.showModal();
-  q.focus();
 }
 
 function openNewTask() {
@@ -2100,18 +2711,57 @@ function openSettings() {
   const c = {
     planApproval: sel([['auto', 'Automatic'], ['first', 'Ask for the first plan in each repo'], ['manual', 'Ask for every plan']], s.planApproval),
     planReview: sel([['off', 'Off'], ['auto', 'Only for medium and large plans'], ['always', 'Always']], s.planReview),
-    stPlan: sel([['claude', 'Claude'], ['cursor', 'Cursor']], s.stages.plan),
-    stReview: sel([['claude', 'Claude'], ['cursor', 'Cursor']], s.stages.review),
-    stVerify: sel([['claude', 'Claude'], ['cursor', 'Cursor']], s.stages.verify),
     maxLoops: num(1, 10, s.maxLoops),
     maxParallel: num(1, 8, s.maxParallel),
     onClaudeLimit: sel([['wait', 'Wait until the limit resets'], ['cursor', 'Use Cursor for read-only stages']], s.onClaudeLimit),
     noGates: sel([['warn', 'Continue, marked Unverified'], ['block', 'Block the run']], s.noGates),
   };
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
+  const showErr = (m) => { setText(err, m); err.hidden = false; };
   const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save changes');
   const fld = (label, control, hint) => { const id = uid('st'); control.id = id; return field(id, label, control, hint); };
   const group = (legend, ...kids) => h('fieldset', { class: 'set-group' }, h('legend', { class: 'legend' }, legend), kids);
+
+  /* Who does what: seven rows, a draft until Save (the server's role chains are the truth; reasons are shown verbatim) */
+  const draft = {}; // row id → provider id the user picked
+  const whoList = h('div', { class: 'who-list' });
+  const limitNote = h('p', { class: 'warn-note', role: 'status', hidden: true });
+  const syncLimitNote = () => {
+    const ro = ['plan', 'review', 'verify'].filter((id) => draft[id] === 'cursor');
+    const show = c.onClaudeLimit.value === 'cursor' && ro.length > 0;
+    toggleHidden(limitNote, !show);
+    if (show) setText(limitNote, ro.map((id) => M.ROLE_ROWS.find((r) => r.id === id).label).join(', ') + ' now starts on Cursor, so it has no Claude limit to wait for.');
+  };
+  c.onClaudeLimit.addEventListener('change', syncLimitNote);
+  const fillWho = () => {
+    if (!S.roles) {
+      whoList.replaceChildren(S.rolesErr
+        ? h('div', { class: 'who-err' }, h('p', { class: 'err', role: 'alert' }, "Couldn't load who does what: " + S.rolesErr.message),
+          h('button', { type: 'button', class: 'btn btn-sm', onclick: async () => { S.rolesErr = null; whoList.replaceChildren(h('p', { class: 'muted' }, 'Loading…')); await loadRoles(); fillWho(); } }, icon('refresh'), h('span', null, 'Try again')))
+        : h('p', { class: 'muted' }, 'Loading…'));
+      return;
+    }
+    const { roles, choices } = S.roles;
+    whoList.replaceChildren(...M.ROLE_ROWS.map((row) => {
+      const lead = M.leadOf(roles, row.role);
+      const ch = choices[row.role] || {};
+      const note = h('p', { class: 'muted who-note', role: 'status' });
+      const items = Object.keys(ch).map((id) => ({ id, label: provLabel(id), locked: !ch[id].ok, reason: ch[id].reason || '', title: ch[id].ok ? (ch[id].needsAck ? 'Isolation not verified on this machine: Conductor asks you to confirm on Save' : null) : ch[id].reason || 'Not available for this job' }));
+      const pills = pillGroup({ label: 'Tool for ' + row.label, items, value: draft[row.id] || lead,
+        onPick: (id) => { if (id === lead) delete draft[row.id]; else draft[row.id] = id; pills.set(id); setText(note, ''); syncLimitNote(); },
+        onLocked: (it) => setText(note, it.label + ': ' + it.reason) });
+      const extra = [];
+      if (row.id === 'research') extra.push("Deep Research always runs on Claude's web-only research profile today, so this job cannot be moved to another tool yet.");
+      const abc = roles[row.role] && roles[row.role].autoByComplexity;
+      if (abc && Object.keys(abc).length) extra.push('Some plan sizes use a different tool first (set in the config file).');
+      return h('div', { class: 'who-row' },
+        h('div', { class: 'who-main' }, h('div', { class: 'who-title' }, row.label), h('div', { class: 'who-hint' }, row.hint),
+          ...extra.map((x) => h('div', { class: 'who-hint' }, x))),
+        h('div', { class: 'who-ctl' }, pills.el),
+        note);
+    }));
+  };
+
   const onSubmit = async (e) => {
     e.preventDefault();
     err.hidden = true;
@@ -2119,25 +2769,33 @@ function openSettings() {
       planApproval: c.planApproval.value, planReview: c.planReview.value,
       maxLoops: Number(c.maxLoops.value), maxParallel: Number(c.maxParallel.value),
       onClaudeLimit: c.onClaudeLimit.value, noGates: c.noGates.value,
-      stages: { plan: c.stPlan.value, review: c.stReview.value, verify: c.stVerify.value },
     };
+    const cur = S.state.settings;
     const patch = {};
-    for (const k of Object.keys(next)) {
-      if (k === 'stages') { if (JSON.stringify(next.stages) !== JSON.stringify(s.stages)) patch.stages = next.stages; }
-      else if (next[k] !== s[k]) patch[k] = next[k];
-    }
-    if (!Object.keys(patch).length) { $('#dlg').close(); return; }
-    if (!Number.isInteger(next.maxLoops) || next.maxLoops < 1 || next.maxLoops > 10) { setText(err, 'Fix loops must be a whole number from 1 to 10.'); err.hidden = false; c.maxLoops.focus(); return; }
-    if (!Number.isInteger(next.maxParallel) || next.maxParallel < 1 || next.maxParallel > 8) { setText(err, 'Parallel runs must be a whole number from 1 to 8.'); err.hidden = false; c.maxParallel.focus(); return; }
+    for (const k of Object.keys(next)) if (next[k] !== cur[k]) patch[k] = next[k];
+    const roleChanges = Object.assign({}, draft);
+    if (!Object.keys(patch).length && !Object.keys(roleChanges).length) { $('#dlg').close(); return; }
+    if (!Number.isInteger(next.maxLoops) || next.maxLoops < 1 || next.maxLoops > 10) { showErr('Fix loops must be a whole number from 1 to 10.'); c.maxLoops.focus(); return; }
+    if (!Number.isInteger(next.maxParallel) || next.maxParallel < 1 || next.maxParallel > 8) { showErr('Parallel runs must be a whole number from 1 to 8.'); c.maxParallel.focus(); return; }
     setBusy(submit, true);
-    try {
-      await api('PUT', '/api/settings', patch);
-      $('#dlg').close();
-      toast('good', 'Settings saved.');
-      loadState().catch(() => {});
-    } catch (ex) {
-      setText(err, ex.message); err.hidden = false; setBusy(submit, false);
+    // 1. settings (no `stages`: roles are edited directly below, so nothing here can overwrite them)
+    if (Object.keys(patch).length) {
+      try { await api('PUT', '/api/settings', patch); await loadState(); }
+      catch (ex) { showErr(ex.message); setBusy(submit, false); return; }
     }
+    // 2. roles, recomputed from a fresh GET (onClaudeLimit may just have changed the chains)
+    if (Object.keys(roleChanges).length) {
+      const r = await applyRoleChanges(roleChanges);
+      if (!r.ok) {
+        const why = r.canceled ? 'You did not confirm the tool change.' : r.error || 'Something went wrong.';
+        showErr(Object.keys(patch).length ? 'Your other settings were saved. Who does what was not changed: ' + why : 'Who does what was not changed: ' + why);
+        setBusy(submit, false);
+        return;
+      }
+    }
+    $('#dlg').close();
+    toast('good', 'Settings saved.');
+    loadState().catch(() => {});
   };
   const signOut = h('button', { type: 'button', class: 'btn btn-ghost', onclick: async () => {
     try { await api('POST', '/api/auth/logout'); } catch { /* cookie may already be gone */ }
@@ -2146,18 +2804,21 @@ function openSettings() {
   const dlg = dlgShell('Settings', [
     group('Planning',
       fld('Plan approval', c.planApproval, 'Automatic starts building as soon as the plan is written. Large plans always ask.'),
-      fld('Plan review', c.planReview, 'A second Claude pass checks the plan before anything is built.')),
+      fld('Plan review', c.planReview, 'A second pass checks the plan before anything is built.')),
     group('Who does what',
-      h('div', { class: 'row-2' }, fld('Write the plan', c.stPlan), fld('Review the plan', c.stReview)),
-      h('div', { class: 'row-2' }, fld('Verify the result', c.stVerify), h('div', { class: 'field' }, h('span', { class: 'label' }, 'Build the code'), h('p', { class: 'muted' }, 'Always Cursor.')))),
+      h('p', { class: 'who-intro' }, 'Pick the tool for each job. Some tools cannot take some jobs yet; the reason is shown when you pick one. These are global settings: they apply to every request and every card.'),
+      whoList),
+    group('Usage limits',
+      fld('When Claude hits its usage limit', c.onClaudeLimit), limitNote),
     group('Limits',
       h('div', { class: 'row-2' }, fld('Fix loops', c.maxLoops, 'Build and verify rounds before Conductor asks you.'), fld('Parallel runs', c.maxParallel, 'Runs working at the same time.')),
-      fld('When Claude hits its usage limit', c.onClaudeLimit),
       fld('When a repo has no tests or lint', c.noGates, 'Unverified runs are flagged on the board.')),
     err,
   ], [signOut, h('button', { type: 'button', class: 'btn', onclick: () => { $('#dlg').close(); navigate('#/setup'); } }, icon('folder'), h('span', null, 'Repositories and setup')),
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
+  fillWho();
   dlg.showModal();
+  loadRoles().then(() => { if (dlg.open && !Object.keys(draft).length) fillWho(); });
 }
 
 /* ───────────────────────── setup wizard ───────────────────────── */
@@ -2181,7 +2842,7 @@ const df = (id) => ({ focus: id });
 function renderWizard(force) {
   if (S.view !== 'wizard' || !S.state) return;
   const st = S.state;
-  const sig = JSON.stringify([st.setup, st.health, st.repos, st.providers, S.route.view]);
+  const sig = JSON.stringify([st.setup, st.health, st.repos, st.providers, S.route.view, S.roles && S.roles.roles]);
   if (!force && sig === W.sig) return;
   W.sig = sig;
   if (!W.inited) { W.inited = true; W.open = firstOpenStep(); }
@@ -2192,7 +2853,7 @@ function renderWizard(force) {
   const complete = st.setup.complete;
   const root = h('div', { class: 'wizard' },
     h('div', { class: 'wiz-head' },
-      complete ? h('p', null, h('a', { class: 'btn btn-sm', href: '#/' }, icon('chevron', 'icon-back'), 'Back to board')) : null,
+      complete ? h('p', null, h('a', { class: 'btn btn-sm', href: '#/board' }, icon('chevron', 'icon-back'), 'Back to board')) : null,
       h('h1', { id: 'wiz-h' }, complete ? 'Setup and repositories' : 'Set up Conductor'),
       h('p', null, complete
         ? 'Everything is connected. Add another repository or re-check a step.'
@@ -2206,7 +2867,7 @@ function renderWizard(force) {
     done === WIZ_STEPS.length ? h('section', { class: 'wiz-done', 'aria-labelledby': 'wiz-done-h' },
       h('h2', { id: 'wiz-done-h' }, 'You are set up'),
       h('p', null, 'Press New task on the board. Conductor plans it, Cursor builds it, Claude verifies it.'),
-      h('a', { class: 'btn btn-primary', href: '#/', 'data-focus': 'go-board' }, 'Go to the board')) : null);
+      h('a', { class: 'btn btn-primary', href: '#/board', 'data-focus': 'go-board' }, 'Go to the board')) : null);
   view.replaceChildren(root);
   if (fid) { const el = view.querySelector('[data-focus="' + CSS.escape(fid) + '"]'); if (el) el.focus({ preventScroll: true }); }
 }
@@ -2373,6 +3034,7 @@ function init() {
   window.addEventListener('error', crash);
   window.addEventListener('unhandledrejection', crash);
   S.route = parseHash();
+  if (S.route.view === 'home' || S.route.view === 'board') S.baseView = S.route.view;
   boot();
 }
 init();

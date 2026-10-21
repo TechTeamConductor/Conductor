@@ -24,7 +24,7 @@
 | `test/ui-safety.test.ts` | `d0e2a693b974` |
 | `test/ui-static.test.ts` | `e0073c0605c8` |
 
-Verdict: Approved with conditions
+Round 1 result: Approved with conditions (C1–C4). Superseded by Round 2 at the end.
 
 ## What I ran
 
@@ -103,3 +103,27 @@ None.
 
 - Artifact: `.techteam/reviews/workspace-v2-m8-u-code-review.md`.
 - Next action: Frontend fixes C1 (plus any of N1, N2, N6 it chooses). Then the Lead runs C2 on the settled tree, the Security checkpoint completes, the Lead commits per C3, and the slice report covers C4.
+
+---
+
+## Round 2: follow-up fixes (2026-10-21)
+
+Re-checked files: `ui/app.js`, `ui/modes.js`, `ui/style.css` and `test/ui-*.test.ts`. M8-1 is now committed (`98174a4`, `c5a8b20`).
+
+Verdict: Approved
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| C1 "No repository" goes stale | **Closed** | `noneAllowed(mode, repoCount)` moved into `modes.js`. `resolveRepo` takes `allowNone`, and a `NONE` that is not allowed counts as Auto. `app.js:897` passes `noneAllowed(effMode())`. The chip text now comes from `res.how` (`:988`), so the chip, the Send name and the request body all agree. The repo menu checks "No repository" only where it is allowed (`:1090`). Unit test at `test/ui-modes.test.ts:261` covers each mode with one repo and with several. |
+| C2 Gates on the final tree | **Closed** | M8-1 is committed. `tsc --noEmit` has 0 errors (my run). The `ui-*` tests pass 25/25 (my run). The author reports full `npm test` at 851 tests, 847 pass, 0 fail. |
+| C3 Commit hygiene | **Open, for the Lead at commit time** | Commit M8-U on its own, separate from the in-progress M8-2 and M8-6 builders: stage `docs/*` hunk by hunk, and include `ui/*`, the `http.ts` line, `test/ui-*` and the evidence. |
+| C4 Who decided D-U1 | **Closed** | The Lead reports the user's own answer in chat: "Remove it, match the design (Recommended)". `HDR.askBtn` and `askFromHeader` are gone (0 matches in `app.js`). |
+| N1 Back-to-back confirms | Fixed | `confirmDialog` closes an open confirm before reusing the dialog (`:2597`). |
+| N2 Stop during a Build | Fixed | `canStop` drives Stop. A Build that is sending shows Send, disabled. |
+| N4 `allowChange` survives a mode switch | Fixed | The tick resets whenever the mode or the resolved repo changes (`allowKey`, `:1019`). |
+| N5 Spinner under reduced motion | Fixed | A CSS comment says the spinner keeps turning on purpose. |
+| N6 Popover focus while loading | Fixed | The popover has `tabindex="-1"`. |
+| N3 Hints not reachable by keyboard | Not taken; **accepted** | The author's reason holds: a focusable span with no role is an accessibility anti-pattern. The wizard shows every hint as visible text. |
+| Security L1–L3 | Not judged here | These belong to Security's own checkpoint. The added test cases pass. |
+
+Next action: the Lead commits M8-U per C3 and finishes the slice report.
