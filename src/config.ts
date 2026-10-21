@@ -10,6 +10,7 @@ import { backupPaths } from './schema/backup.ts';
 import { logger } from './log.ts';
 import { ROLES, cursorFollowsClaude, defaultRoles, firstReadOnlyProvider, normalizeRoles, type Roles } from './agents/roles.ts';
 import type { ProviderId } from './agents/providers/types.ts';
+import { MODEL_ID_BASE_RE } from './models/sanitize.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
@@ -36,8 +37,8 @@ export function migrateConfigV3ToV4(raw: any): any {
   const legacy = stages !== undefined || onClaudeLimit !== undefined ? { ...(rest.legacy ?? {}), v3: { stages, onClaudeLimit } } : rest.legacy;
   return { ...rest, ...(pipeline !== undefined ? { pipeline: pl } : {}), roles, ...(legacy !== undefined ? { legacy } : {}) };
 }
-/** A Codex model name: letters/digits first, then letters, digits and . _ : / - (max 64). Anything else is dropped. */
-export const CODEX_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/;
+/** A Codex model name: letters/digits first, then letters, digits and . _ : / - (max 64). Anything else is dropped. The id rules live in models/sanitize.ts (M8-1); Codex keeps the NARROW base rule — no bracket suffix (Security W3). */
+export const CODEX_MODEL_RE = MODEL_ID_BASE_RE;
 /** v4 → v5 (M4): per-project settings (`projects`, keyed by board project key) join the config; an older file simply has none. */
 export function migrateConfigV4ToV5(raw: any): any {
   return { ...(raw ?? {}), projects: raw && typeof raw.projects === 'object' && raw.projects !== null && !Array.isArray(raw.projects) ? raw.projects : {} };
