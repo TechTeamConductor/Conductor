@@ -1052,3 +1052,14 @@ dialog::backdrop { background: var(--scrim); }
 .td-row { display: grid; gap: 4px; }
 .menu-who .who-model .who-ctl { display: grid; gap: 8px; }
 .menu-who .who-model .who-extra { font-size: 12px; }
+
+/* ───────── M8-U2: board research cards, "Part n/N" chip, model-written badge ───────── */
+.research-card .card-top { gap: 5px; }
+.research-card .chip-kind { color: var(--text-2); font-weight: 600; }
+.research-card .card-title { font-weight: 600; overflow-wrap: anywhere; margin: 0; }
+.research-card .card-reason { overflow-wrap: anywhere; }
+.card-meta .badge { font-size: 11.5px; }
+.rr-foot { display: contents; }
+.rr-q { overflow-wrap: anywhere; margin: 0 0 12px; }
+.rr-body .doc { overflow-wrap: anywhere; }
+.rr-body code { overflow-wrap: anywhere; word-break: break-word; }

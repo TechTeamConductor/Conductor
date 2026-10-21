@@ -1,0 +1,10 @@
+{
+  "horizontalScroll": {
+    "board-desktop-light": false,
+    "board-phone-light": false,
+    "board-desktop-dark": false,
+    "board-phone-dark": false
+  },
+  "consoleErrors": [],
+  "note": "Board run (4 shots) and report run (4 shots, View report on the Ready for review research card) each reported 0 console errors and 0 exceptions over CDP."
+}

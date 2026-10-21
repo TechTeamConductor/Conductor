@@ -263,10 +263,74 @@
     return n > 0 ? '+' + n + ' more ' + what + ', not listed' : '';
   }
 
+  /* ───────── M8-U2: the board's research projection and design-card origin (GET /api/board, read-only) ───────── */
+  /** Research projection lane → Board column. `done` (converted / dismissed) and `canceled` are not drawn. */
+  const RESEARCH_COL = Object.freeze({ active: 'planning', review: 'ready', needs_you: 'needs_human' });
+  const ASK_ID_RE = /^ask-[0-9a-f]{16,32}$/;
+  /** An ask id as the server issues it (checked before it goes into a path; the path also encodes it). */
+  const isAskId = (id) => typeof id === 'string' && ASK_ID_RE.test(id);
+  const posInt = (n) => typeof n === 'number' && Number.isInteger(n) && n > 0;
+  const str = (s) => (typeof s === 'string' ? s : '');
+  /**
+   * Reduce a GET /api/board response to what the Board draws: per card key, whether a model made it (`createdBy === 'design'`, C1), its
+   * part n/N and its dependencies as keys; and the research cards per column. Never throws: bad input gives empty results.
+   */
+  function boardExtras(board) {
+    const out = { cards: Object.create(null), research: { planning: [], ready: [], needs_human: [] } };
+    const b = board && typeof board === 'object' ? board : {};
+    const items = Array.isArray(b.items) ? b.items.filter((i) => i && typeof i === 'object' && typeof i.id === 'string' && typeof i.key === 'string') : [];
+    const byId = new Map(items.map((i) => [i.id, i]));
+    for (const i of items) {
+      if (i.createdBy !== 'design') continue;
+      const d = i.design && typeof i.design === 'object' ? i.design : null;
+      const ok = !!d && posInt(d.part) && posInt(d.parts) && d.part <= d.parts && d.parts <= 8 && d.parts > 1;
+      const after = []; const waiting = []; let unknown = 0;
+      for (const id of Array.isArray(i.dependsOn) ? i.dependsOn : []) {
+        const dep = typeof id === 'string' ? byId.get(id) : undefined;
+        if (!dep) { unknown++; continue; }
+        after.push(dep.key);
+        if (dep.lane !== 'done') waiting.push(dep.key);
+      }
+      out.cards[i.key] = { model: true, part: ok ? d.part : 0, parts: ok ? d.parts : 0, after, waiting, unknown };
+    }
+    const rows = (Array.isArray(b.research) ? b.research : [])
+      .filter((r) => r && typeof r === 'object' && isAskId(r.id) && Object.prototype.hasOwnProperty.call(RESEARCH_COL, r.lane));
+    rows.sort((x, y) => (Number(y.updatedAt) || 0) - (Number(x.updatedAt) || 0));
+    for (const r of rows) {
+      const c = r.counts && typeof r.counts === 'object' ? r.counts : {};
+      const n = (k) => (Number.isInteger(c[k]) && c[k] > 0 ? c[k] : 0);
+      out.research[RESEARCH_COL[r.lane]].push({
+        id: r.id, title: str(r.title), lane: r.lane, status: str(r.status), deep: r.depth === 'deep', repo: str(r.repo) || null,
+        createdAt: Number(r.createdAt) || 0, updatedAt: Number(r.updatedAt) || 0,
+        counts: { opened: n('opened'), listed: n('listed'), unverified: n('unverified') }, convertedTo: str(r.convertedTo) || null, error: str(r.error) || null,
+      });
+    }
+    return out;
+  }
+  /** The "Part n/N" chip's tooltip (design wording, plus the dependency keys). */
+  function partTip(p) {
+    const base = 'One part of a larger piece of work';
+    const after = p && Array.isArray(p.after) ? p.after : [];
+    return after.length ? base + ' · After ' + after.join(', ') : base;
+  }
+  /** An idle To-do card's note while dependencies are open (the server starts it once each one is in Done). */
+  function waitNote(p) {
+    if (!p) return '';
+    const w = Array.isArray(p.waiting) ? p.waiting : [];
+    if (w.length) return 'Waits for ' + w.join(', ') + ' to be done.';
+    return p.unknown > 0 ? 'Waits for other cards to be done.' : '';
+  }
+  /** "3 opened · 1 listed · 0 unverified": the report's findings by source state. */
+  function researchCounts(c) {
+    const n = (k) => (c && Number.isInteger(c[k]) && c[k] > 0 ? c[k] : 0);
+    return n('opened') + ' opened · ' + n('listed') + ' listed · ' + n('unverified') + ' unverified';
+  }
+
   const deepFreeze = (o) => { if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const k of Object.keys(o)) deepFreeze(o[k]); } return o; };
   globalThis.ConductorModes = deepFreeze({
     detectMode, MODE_META, NONE, noneAllowed, matchRepo, resolveRepo, taskFromText, TITLE_MAX,
     ROLE_ROWS, leadOf, setLead, roleEdit, rolesPatch, acksNeeded, withAck, safeHttp, safeAttr, toolJobs, colHints, flowText,
     selFields, selOf, sameSel, withSel, moreNote,
+    RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
   });
 })();

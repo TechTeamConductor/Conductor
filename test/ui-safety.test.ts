@@ -103,3 +103,18 @@ test('no code for controls whose backend is not built yet (M8-U §2.0; each slic
     assert.ok(!app.includes(id), `ui/app.js mentions ${id}`);
   }
 });
+
+/** M8-U2 (S15): an id that goes into an /api/asks/ or /api/items/ path is always encodeURIComponent-ed (`enc(`) right after the prefix. */
+function rawPathJoins(src: string): string[] {
+  const hits: string[] = [];
+  for (const m of src.matchAll(/['"`]\/api\/(asks|items)\/['"`]?\s*\+\s*([^\n;]{0,12})/g)) if (!/^enc\(/.test(m[2]!)) hits.push(m[0]);
+  for (const m of src.matchAll(/`\/api\/(asks|items)\/\$\{([^}]*)\}/g)) if (!/^enc\(/.test(m[2]!)) hits.push(m[0]);
+  return hits;
+}
+test('every /api/asks/ and /api/items/ path in ui/app.js encodes its id (M8-U2)', () => {
+  assert.deepEqual(rawPathJoins(code(read('app.js'))), []);
+  assert.ok(code(read('app.js')).includes("'/api/asks/' + enc(id) + '/dismiss'"), 'the dismiss call is present and encoded');
+  assert.equal(rawPathJoins("api('POST', '/api/asks/' + id + '/dismiss')").length, 1, 'self-test: a raw id is found');
+  assert.equal(rawPathJoins('api(\'POST\', `/api/items/${key}/move`)').length, 1, 'self-test: a raw template id is found');
+  assert.equal(rawPathJoins("api('DELETE', '/api/asks/' + enc(id))").length, 0);
+});

@@ -178,3 +178,19 @@ The Frontend agent (ae49c55b92c8dd875) applied all three. I read each change and
 - **Other changes, no security impact.** The header Ask button is removed (the user's D-U1 decision). `confirmDialog` closes an open confirm before showing the next. The popover gets `tabindex=-1`. The CSS uses `white-space: pre-line` for the 409 detail.
 
 Verdict: Approved
+
+---
+
+## M8-U2 Board UI checkpoint (2026-10-21)
+
+Request from ae4ac80ef883da1c9. Scope is the uncommitted `ui/app.js`, `ui/modes.js`, `ui/style.css`, `test/ui-modes.test.ts` and `test/ui-safety.test.ts`. I read the research-card, extras and report code and re-ran `test/ui-*.test.ts`: 33/33 pass.
+
+1. **Model and server strings are text only.** This covers research title, error, repo, counts and report fields, and the confirm body. They go through `setText`, `h()` text children or `aria-label`. The report reuses the DOM-only `renderReport` plus a constant disclaimer. The raw sink scan and the URL-attribute allow-list pass with no new entries.
+2. **Ask ids are checked and encoded.** The `/^ask-[0-9a-f]{16,32}$/` check (`isAskId`) gates every delegated research action and filters the projection (`boardExtras`). Every `/api/asks/` and `/api/items/` path uses `enc(`, and a new static test enforces it.
+3. **Mutations use existing CSRF endpoints only.** These are `POST …/dismiss {}`, `POST …/convert` and `DELETE /api/asks/:id`. Remove sits behind a danger `confirmDialog` that says it cannot be undone, and the title appears in it as text.
+4. **The S16 badge is constant.** "Written by a model" is a constant label and tooltip. It is driven only by `createdBy === 'design'` in `boardExtras`, never by model text.
+5. **`modes.js` is still pure and deeply frozen**, and the frozen-namespace test passes.
+
+No findings.
+
+Verdict: Approved

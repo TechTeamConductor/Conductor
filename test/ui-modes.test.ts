@@ -10,6 +10,9 @@ type Chain = string[];
 type RoleEntry = { providers: Chain; [k: string]: unknown };
 type Roles = Record<string, RoleEntry>;
 type Choices = Record<string, Record<string, { ok: boolean; reason?: string; needsAck?: boolean }>>;
+type Origin = { model: boolean; part: number; parts: number; after: string[]; waiting: string[]; unknown: number };
+type RCard = { id: string; title: string; lane: string; status: string; deep: boolean; repo: string | null; createdAt: number; updatedAt: number; counts: { opened: number; listed: number; unverified: number }; convertedTo: string | null; error: string | null };
+type Extras = { cards: Record<string, Origin>; research: { planning: RCard[]; ready: RCard[]; needs_human: RCard[] } };
 interface Modes {
   detectMode(t: string): 'ask' | 'research' | 'work';
   NONE: string;
@@ -29,6 +32,12 @@ interface Modes {
   sameSel(a: unknown, b: unknown): boolean;
   withSel(patch: { roles: Record<string, RoleEntry> }, roles: unknown, sels: Record<string, unknown>): { roles: Record<string, any> };
   moreNote(total: unknown, shown: number, what: string): string;
+  RESEARCH_COL: Record<string, string>;
+  isAskId(id: unknown): boolean;
+  boardExtras(board: unknown): Extras;
+  partTip(p: unknown): string;
+  waitNote(p: unknown): string;
+  researchCounts(c: unknown): string;
   safeHttp(u: string): string | null;
   safeAttr(name: string, value: unknown): string | null;
   toolJobs(roles: Roles, provider: string): string;
@@ -327,4 +336,69 @@ test('M8-6 S14/F1 moreNote: "+N more … not listed" only when the true total ex
   assert.equal(M.moreNote(undefined, 10, 'searches'), '', 'older reports have no total');
   assert.equal(M.moreNote('999', 10, 'searches'), '', 'a non-number total is ignored');
   assert.equal(M.moreNote(1.5, 0, 'searches'), '');
+});
+
+/* ───────── M8-U2: board extras (GET /api/board) ───────── */
+const A1 = 'ask-' + 'a'.repeat(16), A2 = 'ask-' + 'b'.repeat(16), A3 = 'ask-' + 'c'.repeat(16), A4 = 'ask-' + 'd'.repeat(16), A5 = 'ask-' + 'e'.repeat(16);
+const rc = (id: string, lane: string, updatedAt: number, extra: Record<string, unknown> = {}) => ({ id, title: 'Q ' + id.slice(-1), lane, status: lane === 'active' ? 'running' : 'done', depth: 'standard', repo: null, createdAt: 1, updatedAt, counts: { opened: 2, listed: 1, unverified: 0 }, convertedTo: null, error: null, ...extra });
+const item = (id: string, key: string, o: Record<string, unknown> = {}) => ({ id, key, lane: 'todo', createdBy: 'user', dependsOn: [], ...o });
+
+test('M8-U2 boardExtras: research lanes map to Board columns; done and canceled are not drawn; newest first; bad ids dropped', () => {
+  const x = j(M.boardExtras({ items: [], research: [
+    rc(A1, 'active', 10), rc(A2, 'review', 20), rc(A3, 'needs_you', 30, { status: 'failed', error: 'Interrupted by a restart.' }),
+    rc(A4, 'done', 40), rc(A5, 'canceled', 50), rc('ask-../../x', 'review', 60), rc('ASK-' + 'a'.repeat(16), 'review', 61),
+    rc(A5.replace('e', 'f'), 'review', 25, { depth: 'deep', counts: { opened: -1, listed: 1.5, unverified: '3' } }), rc(A4.replace('d', '9'), 'weird', 70),
+  ] }));
+  assert.deepEqual(x.research.planning.map((r) => r.id), [A1]);
+  assert.deepEqual(x.research.ready.map((r) => r.id), [A5.replace('e', 'f'), A2], 'newest first');
+  assert.deepEqual(x.research.needs_human.map((r) => [r.id, r.error]), [[A3, 'Interrupted by a restart.']]);
+  const deep = x.research.ready[0]!;
+  assert.equal(deep.deep, true);
+  assert.deepEqual(deep.counts, { opened: 0, listed: 0, unverified: 0 }, 'only non-negative integer counts are kept');
+  assert.deepEqual(j(M.RESEARCH_COL), { active: 'planning', review: 'ready', needs_you: 'needs_human' });
+});
+
+test('M8-U2 boardExtras: design origin, the model-written flag on every design card (C1), deps as keys, waiting = not done', () => {
+  const x = j(M.boardExtras({ research: [], items: [
+    item('i1', 'D-1', { createdBy: 'design', design: { briefId: 'brf-0', part: 1, parts: 3 }, lane: 'done' }),
+    item('i2', 'D-2', { createdBy: 'design', design: { briefId: 'brf-0', part: 2, parts: 3 }, dependsOn: ['i1'] }),
+    item('i3', 'D-3', { createdBy: 'design', design: { briefId: 'brf-0', part: 3, parts: 3 }, dependsOn: ['i1', 'i2', 'gone'] }),
+    item('i4', 'D-4', { createdBy: 'design', design: { briefId: 'brf-1', part: 1, parts: 1 } }),
+    item('i5', 'D-5', { createdBy: 'design' }),
+    item('i6', 'D-6', { createdBy: 'design', design: { part: 4, parts: 3 } }),
+    item('i7', 'D-7', { createdBy: 'design', design: { part: 1.5, parts: 2 } }),
+    item('i8', 'D-8', { createdBy: 'design', design: { part: 1, parts: 9 } }),
+    item('i9', 'U-1', { createdBy: 'user', design: { part: 1, parts: 2 } }),
+    item('i10', 'R-1', { createdBy: 'research' }),
+  ] }));
+  assert.deepEqual(x.cards['D-1'], { model: true, part: 1, parts: 3, after: [], waiting: [], unknown: 0 });
+  assert.deepEqual(x.cards['D-2'], { model: true, part: 2, parts: 3, after: ['D-1'], waiting: [], unknown: 0 }, 'a dependency in Done is not waited for');
+  assert.deepEqual(x.cards['D-3'], { model: true, part: 3, parts: 3, after: ['D-1', 'D-2'], waiting: ['D-2'], unknown: 1 });
+  assert.deepEqual(x.cards['D-4'], { model: true, part: 0, parts: 0, after: [], waiting: [], unknown: 0 }, 'parts === 1: no chip, still model-written');
+  assert.deepEqual(x.cards['D-5'], { model: true, part: 0, parts: 0, after: [], waiting: [], unknown: 0 }, 'brief deleted (no design field): still model-written');
+  for (const k of ['D-6', 'D-7', 'D-8']) assert.equal(x.cards[k]!.parts, 0, k + ': malformed design ignored');
+  assert.equal(x.cards['U-1'], undefined, 'only createdBy design counts, never a design field alone');
+  assert.equal(x.cards['R-1'], undefined);
+});
+
+test('M8-U2 boardExtras never throws on bad input', () => {
+  for (const bad of [null, undefined, 'x', 42, [], {}, { items: 'x', research: {} }, { items: [null, 1, { id: 1, key: 'K' }], research: [null, 'x', { id: 5 }] }]) {
+    const x = j(M.boardExtras(bad));
+    assert.deepEqual(x, { cards: {}, research: { planning: [], ready: [], needs_human: [] } }, JSON.stringify(bad));
+  }
+});
+
+test('M8-U2 partTip / waitNote / researchCounts / isAskId wording', () => {
+  assert.equal(M.partTip({ after: [] }), 'One part of a larger piece of work');
+  assert.equal(M.partTip({ after: ['D-1', 'D-2'] }), 'One part of a larger piece of work · After D-1, D-2');
+  assert.equal(M.partTip(null), 'One part of a larger piece of work');
+  assert.equal(M.waitNote({ waiting: ['D-2'], unknown: 0 }), 'Waits for D-2 to be done.');
+  assert.equal(M.waitNote({ waiting: ['D-1', 'D-2'], unknown: 1 }), 'Waits for D-1, D-2 to be done.');
+  assert.equal(M.waitNote({ waiting: [], unknown: 2 }), 'Waits for other cards to be done.', 'N4: unresolved dependency');
+  assert.equal(M.waitNote({ waiting: [], unknown: 0 }), '');
+  assert.equal(M.waitNote(null), '');
+  assert.equal(M.researchCounts({ opened: 3, listed: 1, unverified: 0 }), '3 opened · 1 listed · 0 unverified');
+  assert.equal(M.researchCounts(null), '0 opened · 0 listed · 0 unverified');
+  assert.equal(M.isAskId(A1), true);
+  for (const bad of ['ask-123', 'ask-' + 'g'.repeat(16), '../ask-' + 'a'.repeat(16), 'ask-' + 'a'.repeat(33), 7, null]) assert.equal(M.isAskId(bad), false, String(bad));
 });

@@ -283,6 +283,7 @@ function showExpired() {
   for (const d of document.querySelectorAll('dialog[open]')) { try { d.close(); } catch { /* noop */ } }
   for (const id of ['topbar', 'banners', 'main']) { const el = document.getElementById(id); if (el) el.inert = true; }
   dropHome();
+  leaveBoard();
   closeHomeMenus(false);
   $('#view').replaceChildren();
   S.view = null;
@@ -389,12 +390,13 @@ function renderAll() {
   updateHeader(wizard);
   renderBanners(wizard);
   if (wizard) {
-    if (S.view !== 'wizard') { closeDrawerSilently(); if (S.view === 'home') leaveHome(); S.view = 'wizard'; $('#view').replaceChildren(); W.sig = ''; }
+    if (S.view !== 'wizard') { closeDrawerSilently(); if (S.view === 'home') leaveHome(); if (S.view === 'board') leaveBoard(); S.view = 'wizard'; $('#view').replaceChildren(); W.sig = ''; }
     renderWizard();
   } else {
     const v = S.route.view === 'board' ? 'board' : 'home';
     if (S.view !== v) {
       if (S.view === 'home') leaveHome();
+      if (S.view === 'board') leaveBoard();
       S.view = v;
       if (v === 'board') buildBoardView(); else buildHomeView();
     }
@@ -485,6 +487,7 @@ function onStateEvent(d) {
   if (d.quota) S.state.quota = d.quota;
   if (d.now) S.offset = d.now - Date.now();
   renderLive();
+  if (S.view === 'board') boardPoke(false);
 }
 function renderConn() {
   if (!HDR.conn) return;
@@ -1742,10 +1745,14 @@ async function discardBrief(t) {
 }
 
 /* ───────────────────────── board view ───────────────────────── */
-const B = { idle: new Map(), summary: null, items: null, polled: null, board: null, cols: new Map(), cards: new Map(), history: null, histList: null, histCount: null, histSig: '', empty: null, pollEl: null, order: '', itemsSig: '' };
+const B = { idle: new Map(), summary: null, items: null, polled: null, board: null, cols: new Map(), cards: new Map(), history: null, histList: null, histCount: null, histSig: '', empty: null, pollEl: null, order: '', itemsSig: '',
+  // M8-U2: GET /api/board (read-only) adds the research projection and the design-card origin; research cards are keyed by ask id
+  extra: null, rcards: new Map(), xGen: 0, xTimer: 0, xDue: 0, xBusy: false, xLast: 0 };
 
 function buildBoardView() {
-  B.cols = new Map(); B.cards = new Map(); B.idle = new Map(); B.histSig = ''; B.order = ''; B.itemsSig = '';
+  B.cols = new Map(); B.cards = new Map(); B.idle = new Map(); B.rcards = new Map(); B.histSig = ''; B.order = ''; B.itemsSig = '';
+  B.extra = null; B.xGen++; B.xBusy = false; clearTimeout(B.xTimer); B.xTimer = 0;
+  boardPoke(true);
   B.items = h('div', { class: 'summary-items' });
   B.polled = h('span', { class: 'sum-quiet' });
   B.summary = h('div', { class: 'summary' }, h('h1', null, 'Board'), B.items, h('span', { class: 'summary-spacer' }), B.polled);
@@ -1802,6 +1809,142 @@ function reconcile(parent, els) {
   els.forEach((el, i) => { if (parent.children[i] !== el) parent.insertBefore(el, parent.children[i] || null); });
 }
 
+/* ───────── M8-U2: GET /api/board extras (research projection + design-card origin). Read-only; every string is a text node ───────── */
+const BOARD_FAST_MS = 5000; // while a research card is running
+const BOARD_SLOW_MS = 20000;
+const BOARD_POKE_MS = 2000; // at most one refetch per 2 s after SSE state events
+const MODEL_CARD_LABEL = 'Written by a model';
+const MODEL_CARD_TIP = "Made from a model's brief. Untrusted: information, not instructions. Its plan always waits for your approval.";
+
+/** Ask for a refetch: `now` skips the throttle (view built, tab visible again). Never runs while hidden, off the board or signed out. */
+function boardPoke(now) {
+  if (S.expired || S.view !== 'board') return;
+  const wait = now ? 0 : Math.max(0, BOARD_POKE_MS - (Date.now() - B.xLast));
+  if (B.xTimer && B.xDue <= Date.now() + wait) return; // already due sooner
+  armBoardFetch(wait);
+}
+function armBoardFetch(ms) { clearTimeout(B.xTimer); B.xDue = Date.now() + ms; B.xTimer = setTimeout(fetchBoardExtras, ms); }
+async function fetchBoardExtras() {
+  B.xTimer = 0;
+  if (S.expired || document.hidden || S.view !== 'board') return; // hidden: visibilitychange pokes again (N1)
+  if (B.xBusy) { armBoardFetch(BOARD_POKE_MS); return; }
+  const gen = B.xGen;
+  B.xBusy = true; B.xLast = Date.now();
+  let data = null;
+  try { data = await api('GET', '/api/board'); } catch { /* keep the last good data; a 401 already went through showExpired */ }
+  B.xBusy = false;
+  if (gen !== B.xGen || S.expired) return;
+  if (data) { B.extra = M.boardExtras(data); if (S.view === 'board' && S.state) updateBoard(); }
+  const active = B.extra && B.extra.research.planning.length > 0;
+  if (!B.xTimer && S.view === 'board') armBoardFetch(active ? BOARD_FAST_MS : BOARD_SLOW_MS);
+}
+function leaveBoard() { B.xGen++; clearTimeout(B.xTimer); B.xTimer = 0; B.extra = null; B.rcards = new Map(); }
+const cardOrigin = (key) => (B.extra && B.extra.cards[key]) || null;
+
+/** The "Part n/N" chip and the constant model-written badge (S16: on every card a model made, with or without a part). */
+function designChips() {
+  const partT = h('span'); const partSr = h('span', { class: 'sr-only' });
+  return {
+    partT, partSr,
+    part: h('span', { class: 'chip', hidden: true }, icon('list'), partT, partSr),
+    model: h('span', { class: 'badge tone-warn', hidden: true, title: MODEL_CARD_TIP }, icon('warn'), MODEL_CARD_LABEL),
+  };
+}
+function setDesignChips(c, o) {
+  const hasPart = !!(o && o.parts);
+  toggleHidden(c.part, !hasPart);
+  if (hasPart) {
+    setText(c.partT, 'Part ' + o.part + '/' + o.parts);
+    setText(c.partSr, o.after.length ? ', after ' + o.after.join(', ') : '');
+    const tip = M.partTip(o);
+    if (c.part.title !== tip) c.part.title = tip;
+  }
+  toggleHidden(c.model, !(o && o.model));
+}
+
+/* Research cards: created once per ask id, updated in place. No drawer, no move, no edit (S15). */
+function researchEl(r) {
+  let el = B.rcards.get(r.id);
+  if (!el) { el = createResearchCard(r.id); B.rcards.set(r.id, el); }
+  updateResearchCard(el, r);
+  return el;
+}
+function createResearchCard(id) {
+  const p = {};
+  p.deep = h('span', { class: 'chip', hidden: true, title: 'Deep research: more sources, takes longer' }, 'Deep');
+  p.title = h('p', { class: 'card-title' });
+  p.ic = h('span', { class: 'ic' });
+  p.sentence = h('span');
+  p.timer = h('span', { class: 't-elapsed' });
+  p.tail = h('span', { hidden: true }, ' · ', p.timer);
+  p.act = h('p', { class: 'card-activity' }, p.ic, h('span', null, p.sentence, p.tail));
+  p.reason = h('p', { class: 'card-reason', hidden: true });
+  p.repoT = h('span', { class: 'card-repo' });
+  p.repo = h('span', { class: 'chip', hidden: true, title: 'Repository' }, icon('folder'), p.repoT);
+  p.countsT = h('span');
+  p.counts = h('span', { class: 'chip', hidden: true, title: "Findings in the report, by the state of their sources" }, icon('file'), p.countsT);
+  p.meta = h('div', { class: 'card-meta' }, p.repo, p.counts);
+  p.bReport = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'r-report', rid: id } }, icon('file'), h('span', null, 'View report'));
+  p.bDismiss = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', hidden: true, data: { act: 'r-dismiss', rid: id } }, 'Dismiss');
+  p.bRemove = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', hidden: true, data: { act: 'r-remove', rid: id } }, icon('x-circle'), h('span', null, 'Remove'));
+  p.actions = h('div', { class: 'card-actions', hidden: true }, p.bReport, p.bDismiss, p.bRemove);
+  const el = h('li', { class: 'card research-card', data: { rid: id } },
+    h('div', { class: 'card-top' }, h('span', { class: 'chip chip-kind', title: 'A research task: web research, no code changes' }, icon('shield'), h('span', null, 'Research')), p.deep),
+    p.title, p.act, p.reason, p.meta, p.actions);
+  el._p = p;
+  return el;
+}
+function updateResearchCard(el, r) {
+  const p = el._p;
+  const col = M.RESEARCH_COL[r.lane];
+  const cls = 'card research-card st-' + (col === 'needs_human' ? 'needs_human' : col === 'ready' ? 'ready' : 'planning');
+  if (el.className !== cls) el.className = cls;
+  toggleHidden(p.deep, !r.deep);
+  setText(p.title, r.title || 'Research');
+  const running = r.lane === 'active';
+  const sentence = running ? (r.status === 'paused' ? "Waiting for Claude's usage limit to reset" : 'Claude is researching')
+    : r.lane === 'review' ? 'Report ready — ready for your review' : 'Research did not finish';
+  setText(p.sentence, sentence);
+  const icKey = running && r.status !== 'paused' ? 'dot' : col;
+  if (p._ic !== icKey) { p._ic = icKey; p.ic.replaceChildren(icKey === 'dot' ? h('span', { class: 'dot pulse' }) : icon(r.status === 'paused' ? 'pause' : COLUMN_ICON[col] || 'info')); }
+  if (running && r.createdAt) { setTimer(p.timer, 't0', r.createdAt); toggleHidden(p.tail, false); } else toggleHidden(p.tail, true);
+  const reason = r.lane === 'needs_you' ? r.error || '' : '';
+  setText(p.reason, reason); toggleHidden(p.reason, !reason);
+  setText(p.repoT, r.repo || ''); toggleHidden(p.repo, !r.repo);
+  const showCounts = r.lane === 'review';
+  toggleHidden(p.counts, !showCounts);
+  if (showCounts) setText(p.countsT, M.researchCounts(r.counts));
+  toggleHidden(p.meta, p.repo.hidden && p.counts.hidden);
+  const ready = r.lane === 'review'; const failed = r.lane === 'needs_you';
+  toggleHidden(p.bReport, !ready); toggleHidden(p.bDismiss, !ready); toggleHidden(p.bRemove, !failed);
+  const lbl = (v) => v + ': ' + (r.title || 'research');
+  if (p.bDismiss.getAttribute('aria-label') !== lbl('Dismiss report')) p.bDismiss.setAttribute('aria-label', lbl('Dismiss report'));
+  if (p.bRemove.getAttribute('aria-label') !== lbl('Remove research')) p.bRemove.setAttribute('aria-label', lbl('Remove research'));
+  toggleHidden(p.actions, !(ready || failed));
+  setBusy(p.bDismiss, S.busy.has(r.id + ':dismiss'));
+  setBusy(p.bRemove, S.busy.has(r.id + ':remove'));
+}
+const researchById = (id) => {
+  const X = B.extra ? B.extra.research : null;
+  return X ? [...X.planning, ...X.ready, ...X.needs_human].find((r) => r.id === id) || null : null;
+};
+async function actDismissResearch(id) {
+  const ok = await runAction(id, 'dismiss', () => api('POST', '/api/asks/' + enc(id) + '/dismiss', {}), 'Report moved off the board.');
+  if (ok) boardPoke(true);
+  return ok;
+}
+async function actRemoveResearch(id) {
+  const r = researchById(id);
+  const yes = await confirmDialog({
+    title: 'Remove this research?',
+    body: 'The research record' + (r && r.title ? ' "' + r.title + '"' : '') + ' is deleted, with anything it found. This cannot be undone.',
+    confirmLabel: 'Remove', danger: true,
+  });
+  if (!yes) return;
+  const ok = await runAction(id, 'remove', () => api('DELETE', '/api/asks/' + enc(id)), 'Research removed.');
+  if (ok) boardPoke(true);
+}
+
 function updateBoard() {
   const st = S.state;
   const open = st.runs.filter((r) => r.column !== 'closed');
@@ -1812,7 +1955,10 @@ function updateBoard() {
   const extra = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const c of st.cards) if (ORPHAN_COL[c.lane]) extra.get(ORPHAN_COL[c.lane]).push(c);
   const orphanCount = [...extra.values()].reduce((n, l) => n + l.length, 0);
-  const idle = cardsBy.backlog.length + cardsBy.todo.length + orphanCount;
+  const RX = B.extra ? B.extra.research : null;
+  const rx = new Map(COLUMNS.map((c) => [c.id, (RX && RX[c.id]) || []]));
+  const researchCount = [...rx.values()].reduce((n, l) => n + l.length, 0);
+  const idle = cardsBy.backlog.length + cardsBy.todo.length + orphanCount + researchCount;
   const byCol = new Map(COLUMNS.map((c) => [c.id, []]));
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
@@ -1845,8 +1991,9 @@ function updateBoard() {
       return el;
     });
     const ex = extra.get(c.id) || [];
-    reconcile(col.list, els.concat(ex.map(idleEl)));
-    const total = list.length + ex.length;
+    const rs = rx.get(c.id) || [];
+    reconcile(col.list, els.concat(ex.map(idleEl), rs.map(researchEl)));
+    const total = list.length + ex.length + rs.length;
     setText(col.count, total);
     col.count.setAttribute('aria-label', plural(total, 'card'));
     col.el.classList.toggle('is-empty', !total);
@@ -1857,7 +2004,9 @@ function updateBoard() {
   for (const [k, el] of B.cards) if (!seen.has(k)) { el.remove(); B.cards.delete(k); }
   const liveIdle = new Set(st.cards.map((c) => c.key + '|' + c.lane));
   for (const [id, rec] of B.idle) if (!liveIdle.has(id)) { rec.el.remove(); B.idle.delete(id); }
-  updateSummary(byCol, extra);
+  const liveR = new Set([...rx.values()].flat().map((r) => r.id));
+  for (const [id, el] of B.rcards) if (!liveR.has(id)) { el.remove(); B.rcards.delete(id); }
+  updateSummary(byCol, extra, rx);
   updateHistory(closed);
 }
 
@@ -1865,10 +2014,13 @@ function updateBoard() {
 function idleEl(c) {
   const id = c.key + '|' + c.lane;
   let rec = B.idle.get(id);
-  if (!rec) { rec = { el: idleCard(c), title: null, note: null }; B.idle.set(id, rec); }
+  if (!rec) { rec = { el: idleCard(c), title: null, note: null }; rec.dc = rec.el._dc; B.idle.set(id, rec); }
   const t = rec.el.querySelector('.card-title');
   if (t && rec.title !== c.title) { t.textContent = c.title; rec.title = c.title; }
-  const n = c.note || '';
+  const o = cardOrigin(c.key);
+  setDesignChips(rec.dc, o);
+  toggleHidden(rec.dc.meta, rec.dc.part.hidden && rec.dc.model.hidden);
+  const n = c.note || (c.lane === 'todo' ? M.waitNote(o) : '');
   if (rec.note !== n) {
     rec.note = n;
     let np = rec.el.querySelector('.card-note');
@@ -1885,11 +2037,15 @@ function idleCard(c) {
     : [h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: move('todo', `${c.key} will start now.`) }, c.lane === 'backlog' ? 'Start' : 'Run it'),
       ...(c.lane === 'backlog' ? [] : [h('button', { type: 'button', class: 'btn btn-sm', onclick: move('backlog', `${c.key} moved to Backlog.`) }, 'Park')])];
   btns.push(h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: move('canceled', `${c.key} canceled.`) }, 'Cancel'));
-  return h('li', { class: 'card idle-card' }, h('div', { class: 'card-top' }, h('span', { class: 'card-key' }, c.key)), h('p', { class: 'card-title' }, c.title), h('div', { class: 'card-actions' }, btns));
+  const dc = designChips();
+  dc.meta = h('div', { class: 'card-meta', hidden: true }, dc.part, dc.model);
+  const el = h('li', { class: 'card idle-card' }, h('div', { class: 'card-top' }, h('span', { class: 'card-key' }, c.key)), h('p', { class: 'card-title' }, c.title), dc.meta, h('div', { class: 'card-actions' }, btns));
+  el._dc = dc;
+  return el;
 }
 
-function updateSummary(byCol, extra) {
-  const n = (id) => byCol.get(id).length + ((extra && extra.get(id)) || []).length;
+function updateSummary(byCol, extra, rx) {
+  const n = (id) => byCol.get(id).length + ((extra && extra.get(id)) || []).length + ((rx && rx.get(id)) || []).length;
   const working = n('planning') + n('building') + n('verifying');
   const items = [];
   if (n('needs_human')) items.push({ col: 'needs_human', cls: 'st-needs_human', ic: 'alert', n: n('needs_human'), text: n('needs_human') === 1 ? 'needs you' : 'need you' });
@@ -1954,7 +2110,8 @@ function createCard(key) {
   p.loop = h('span', { class: 'chip', title: 'Fix loops used / allowed', hidden: true }, icon('repeat'), p.loopT);
   p.bugs = h('span', { class: 'chip is-bad', hidden: true }, icon('bug'), p.bugsT);
   p.unv = h('span', { class: 'badge tone-warn', hidden: true, title: 'No reliable gates: regressions cannot be ruled out' }, icon('warn'), 'Unverified');
-  p.meta = h('div', { class: 'card-meta' }, p.repo, p.loop, p.bugs, p.unv);
+  p.dc = designChips();
+  p.meta = h('div', { class: 'card-meta' }, p.dc.part, p.dc.model, p.repo, p.loop, p.bugs, p.unv);
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
@@ -2010,7 +2167,8 @@ function updateCard(el, r) {
   toggleHidden(p.bugs, !(r.bugsOpen > 0));
   if (r.bugsOpen > 0) setText(p.bugsT, plural(r.bugsOpen, 'open bug'));
   toggleHidden(p.unv, !r.unverified);
-  toggleHidden(p.meta, p.repo.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
+  setDesignChips(p.dc, cardOrigin(r.key));
+  toggleHidden(p.meta, p.dc.part.hidden && p.dc.model.hidden && p.repo.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
 
   const showApprove = !!r.canApprove;
   const showRetry = !!r.canRetry && r.column === 'needs_human';
@@ -2035,6 +2193,9 @@ function onViewClick(e) {
     case 'jump': jumpToColumn(t.dataset.col); break;
     case 'new-task': openNewTask(); break;
     case 'open-setup': navigate('#/setup'); break;
+    case 'r-report': if (M.isAskId(t.dataset.rid)) openResearchReport(t.dataset.rid, t); break;
+    case 'r-dismiss': if (M.isAskId(t.dataset.rid)) actDismissResearch(t.dataset.rid); break;
+    case 'r-remove': if (M.isAskId(t.dataset.rid)) actRemoveResearch(t.dataset.rid); break;
     default: break;
   }
 }
@@ -3036,6 +3197,71 @@ function renderReport(rp) {
   return out;
 }
 
+/* M8-U2: a research card's report, opened from the Board. Same DOM-only renderer as the Home thread; actions are the existing endpoints. */
+const RESEARCH_DISCLAIMER = 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.';
+function openResearchReport(id, opener) {
+  const st = { rec: null, err: null, notFound: false, busy: '', actErr: '' };
+  const body = h('div', { class: 'rr-body' });
+  const foot = h('div', { class: 'rr-foot' });
+  const dlg = dlgShell('Research report', [body], [foot], (e) => e.preventDefault(), true);
+  const close = () => dlg.close();
+  dlg.addEventListener('close', () => { if (opener && opener.isConnected) opener.focus(); }, { once: true });
+  const draw = () => {
+    const r = st.rec;
+    const kids = [];
+    if (st.notFound) kids.push(h('p', { class: 'muted' }, 'This report no longer exists.'));
+    else if (st.err) kids.push(h('p', { class: 'err', role: 'alert' }, icon('warn'), h('span', null, st.err)), h('p', null, h('button', { type: 'button', class: 'btn btn-sm', onclick: load }, icon('refresh'), h('span', null, 'Try again'))));
+    else if (!r) kids.push(h('p', { class: 'muted', role: 'status' }, 'Loading the report…'));
+    else {
+      kids.push(h('p', { class: 'rr-q' }, h('span', { class: 'muted' }, 'Question: '), r.question || ''));
+      if (r.report) {
+        kids.push(h('div', { class: 'doc' }, h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
+          h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, badge('warn', MODEL_LABEL, 'warn'), ' ', RESEARCH_DISCLAIMER))));
+      } else kids.push(h('p', { class: 'muted' }, r.error || 'There is no report for this research.'));
+      if (r.convertedTo) kids.push(h('p', null, 'Turned into task ', h('b', null, r.convertedTo), '.'));
+      else if (r.report && !r.repo) kids.push(h('p', { class: 'muted' }, 'Choose a repository before asking if you want to turn the findings into an engineering plan.'));
+    }
+    if (st.actErr) kids.push(h('p', { class: 'err', role: 'alert' }, icon('warn'), h('span', null, st.actErr)));
+    body.replaceChildren(...kids);
+    const acts = [h('button', { type: 'button', class: 'btn', onclick: close }, 'Close')];
+    if (r && r.status === 'done' && !r.convertedTo && !r.dismissedAt) {
+      acts.push(h('button', { type: 'button', class: 'btn' + (st.busy === 'dismiss' ? ' is-busy' : ''), disabled: !!st.busy, onclick: doDismiss }, 'Dismiss'));
+    }
+    if (r && r.report && r.repo && !r.convertedTo) {
+      acts.push(h('button', { type: 'button', class: 'btn btn-primary' + (st.busy === 'convert' ? ' is-busy' : ''), disabled: !!st.busy, onclick: doConvert }, icon('plus'), h('span', null, 'Turn into an engineering plan')));
+    }
+    foot.replaceChildren(...acts);
+  };
+  async function load() {
+    st.err = null; st.notFound = false; draw();
+    try { st.rec = await api('GET', '/api/asks/' + enc(id)); }
+    catch (e) {
+      if (e instanceof ApiFail && e.status === 401) return;
+      if (e instanceof ApiFail && e.status === 404) st.notFound = true; else st.err = (e && e.message) || "Couldn't load the report.";
+    }
+    if (dlg.open) draw();
+  }
+  async function doDismiss() {
+    st.busy = 'dismiss'; st.actErr = ''; draw();
+    try { await api('POST', '/api/asks/' + enc(id) + '/dismiss', {}); toast('good', 'Report moved off the board.'); boardPoke(true); close(); return; }
+    catch (e) { if (e instanceof ApiFail && e.status === 401) return; st.actErr = (e && e.message) || 'Something went wrong.'; }
+    st.busy = ''; draw();
+  }
+  async function doConvert() {
+    st.busy = 'convert'; st.actErr = ''; draw();
+    try {
+      const c = await api('POST', '/api/asks/' + enc(id) + '/convert');
+      toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.');
+      loadState().catch(() => {}); boardPoke(true);
+      st.rec = await api('GET', '/api/asks/' + enc(id));
+    } catch (e) { if (e instanceof ApiFail && e.status === 401) return; st.actErr = (e && e.message) || 'Something went wrong.'; }
+    st.busy = ''; draw();
+  }
+  draw();
+  dlg.showModal();
+  load();
+}
+
 function openNewTask() {
   const repos = (S.state && S.state.repos) || [];
   const idT = uid('nt'); const idD = uid('nt'); const idR = uid('nt');
@@ -3415,7 +3641,7 @@ function init() {
   drawer.addEventListener('close', () => { if (D.silent) { D.silent = false; return; } if (S.route.key) closeRoute(); });
   $('#expired-copy').addEventListener('click', async () => { const ok = await copyText('conductor open'); toast(ok ? 'good' : 'warn', ok ? 'Copied. Paste it in a terminal.' : "Couldn't copy. Type it in a terminal."); });
   $('#expired-retry').addEventListener('click', () => location.reload());
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && S.state && !S.expired) loadState().catch(() => {}); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && S.state && !S.expired) { loadState().catch(() => {}); if (S.view === 'board') boardPoke(true); } });
   setInterval(tick, 1000);
   setInterval(() => { if (!document.hidden && S.state && !S.expired) loadState().catch(() => {}); }, STATE_POLL_MS);
   setInterval(() => {
