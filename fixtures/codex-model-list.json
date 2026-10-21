@@ -1,0 +1,57 @@
+{
+  "_note": "NOT recorded from a real binary (the Codex install on the development machine does not start). Written by hand from the documented app-server `model/list` result shape (codex app-server protocol: Model {id, model, displayName, description, supportedReasoningEfforts[{reasoningEffort, description}], defaultReasoningEffort, isDefault}, paginated by nextCursor). Not generated with `codex app-server generate-json-schema`. Ids are placeholders, not a catalogue.",
+  "pages": [
+    {
+      "data": [
+        {
+          "id": "fixture-model-a",
+          "model": "fixture-model-a",
+          "displayName": "Fixture model A",
+          "description": "First page, the server default",
+          "supportedReasoningEfforts": [
+            { "reasoningEffort": "low", "description": "fast" },
+            { "reasoningEffort": "medium", "description": "balanced" },
+            { "reasoningEffort": "high", "description": "deep" },
+            { "reasoningEffort": "xhigh", "description": "deepest" }
+          ],
+          "defaultReasoningEffort": "medium",
+          "isDefault": true
+        },
+        {
+          "id": "fixture-model-b",
+          "model": "fixture-model-b",
+          "displayName": "Fixture model B",
+          "description": "Plain string efforts",
+          "supportedReasoningEfforts": ["minimal", "low", "medium", "high"],
+          "defaultReasoningEffort": "low",
+          "isDefault": false
+        }
+      ],
+      "nextCursor": "page-2"
+    },
+    {
+      "data": [
+        {
+          "id": "fixture-model-c-mini",
+          "model": "fixture-model-c-mini",
+          "displayName": "Fixture model C mini",
+          "description": "Second page",
+          "supportedReasoningEfforts": [
+            { "reasoningEffort": "medium", "description": "balanced" },
+            { "reasoningEffort": "high", "description": "deep" }
+          ],
+          "defaultReasoningEffort": "medium",
+          "isDefault": false
+        },
+        {
+          "id": "fixture-model-a",
+          "model": "fixture-model-a",
+          "displayName": "Duplicate of A on a later page (first wins)",
+          "supportedReasoningEfforts": [],
+          "isDefault": false
+        }
+      ],
+      "nextCursor": null
+    }
+  ]
+}

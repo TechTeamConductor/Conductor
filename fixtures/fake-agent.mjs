@@ -24,6 +24,43 @@ if (argv[0] === 'status' || argv[0] === 'whoami') {
 }
 const dir = process.env.FAKE_DIR || '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ───────── model discovery (M8-1): `agent --list-models` (no prompt, no stdin) ─────────
+// Scenario key `listModels`: ok | auth | fail | empty | hang | flood | text (uses `listText`, exit `listExit`) | stderr-email.
+if (argv.includes('--list-models')) {
+  let sc = {};
+  try {
+    sc = JSON.parse(readFileSync(join(dir, 'scenario.json'), 'utf8'));
+  } catch {}
+  const mode = sc.listModels ?? 'ok';
+  if (dir) {
+    mkdirSync(dir, { recursive: true });
+    let cwdEntries = [];
+    try {
+      cwdEntries = (await import('node:fs')).readdirSync(process.cwd());
+    } catch {}
+    appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'cursor', mode: 'models', scenario: mode, argv, cwd: process.cwd(), cwdEntries, envKeys: Object.keys(process.env), at: Date.now() }) + '\n');
+  }
+  const here = new URL('.', import.meta.url).pathname;
+  if (mode === 'ok') process.stdout.write(readFileSync(join(here, 'real', 'cursor-list-models-2026.10.19.txt')));
+  else if (mode === 'auth') {
+    process.stderr.write(readFileSync(join(here, 'real', 'cursor-list-models-signed-out.txt')), () => process.exit(1));
+    await sleep(5000);
+  } else if (mode === 'stderr-email') {
+    process.stderr.write('Error: Authentication required for decoy.person@example.com\n', () => process.exit(1));
+    await sleep(5000);
+  } else if (mode === 'fail') {
+    process.stderr.write('Error: something else at /Users/decoy/.cursor\n', () => process.exit(2));
+    await sleep(5000);
+  } else if (mode === 'empty') process.stdout.write('Available models\n\nTip: nothing here\n');
+  else if (mode === 'text') process.stdout.write(String(sc.listText ?? ''));
+  else if (mode === 'hang') await sleep(120_000);
+  else if (mode === 'flood') {
+    const chunk = 'z'.repeat(64 * 1024);
+    for (let i = 0; i < 80; i++) if (!process.stdout.write(chunk)) await new Promise((r) => process.stdout.once('drain', r));
+  }
+  await new Promise((r) => process.stdout.write('', r));
+  process.exit(mode === 'text' ? Number(sc.listExit ?? 0) : 0);
+}
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const flag = (n) => argv.includes(n);
 const val = (n) => {

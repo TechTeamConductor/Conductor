@@ -30,6 +30,106 @@ const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
 
+// ───────── model discovery (M8-1): one `initialize` control request on stdin, never a prompt ─────────
+// Scenario key `models` (top level of scenario.json): in | out | decoy | stderr-email | turn | garbage | wrong-id | nomodels | error |
+// hang | flood | manylines | longline | plant. `modelsInner` replaces response.response; `modelsRaw` is written verbatim as the reply line.
+if (argv.includes('--input-format') && prompt.startsWith('{"type":"control_request"')) await discovery();
+
+async function discovery() {
+  const flush = () => new Promise((r) => process.stdout.write('', () => process.stderr.write('', r)));
+  const here = new URL('.', import.meta.url).pathname;
+  let sc = {};
+  try {
+    sc = JSON.parse(readFileSync(join(dir, 'scenario.json'), 'utf8'));
+  } catch {}
+  const mode = sc.models ?? 'in';
+  const stdinLines = prompt.split('\n').filter(Boolean);
+  let reqId = 'r1';
+  let prompts = 0;
+  for (const l of stdinLines) {
+    try {
+      const o = JSON.parse(l);
+      if (o.type === 'control_request' && o.request?.subtype === 'initialize') reqId = o.request_id;
+      else prompts++;
+    } catch {
+      prompts++;
+    }
+  }
+  if (dir) {
+    mkdirSync(dir, { recursive: true });
+    let cwdEntries = [];
+    try {
+      cwdEntries = (await import('node:fs')).readdirSync(process.cwd());
+    } catch {}
+    appendFileSync(join(dir, 'calls.jsonl'), JSON.stringify({ who: 'claude', mode: 'models', scenario: mode, argv, cwd: process.cwd(), cwdEntries, envKeys: Object.keys(process.env), stdinLines: stdinLines.length, prompts, at: Date.now() }) + '\n');
+  }
+  const fixture = (f) => JSON.parse(readFileSync(join(here, 'real', f), 'utf8'));
+  const reply = (inner, subtype = 'success', id = reqId) => out({ type: 'control_response', response: { subtype, request_id: id, response: inner, pending_permission_requests: [], pending_user_dialog_requests: [] } });
+  const linger = () => sleep(sc.lingerMs ?? 30_000); // the real CLI exits on EOF; the fake lingers so tests prove Conductor kills it (S1)
+  out({ type: 'system', subtype: 'ui_invalidate', event: 'ui.render', uuid: randomUUID(), session_id: randomUUID() });
+  const signedIn = () => fixture('claude-initialize-2.1.304.json').response.response;
+  if (mode === 'in' || mode === 'plant') {
+    if (mode === 'plant') writeFileSync(join(process.cwd(), 'left-behind.txt'), 'x');
+    reply(signedIn());
+    await linger();
+  } else if (mode === 'out') {
+    reply(fixture('claude-initialize-2.1.304-signed-out.json').response.response);
+    await linger();
+  } else if (mode === 'decoy') {
+    process.stderr.write('Logged in as decoy.person@example.com (DECOY_ORG_7f3) at /Users/decoy/.claude\n');
+    const inner = signedIn();
+    reply({ commands: [{ name: 'DECOY_CMD_7f3', description: 'decoy.person@example.com' }], agents: ['DECOY_AGENT_7f3'], output_style: 'DECOY_STYLE_7f3', pid: 4242, ...inner, account: { email: 'decoy.person@example.com', organization: 'DECOY_ORG_7f3', subscriptionType: 'Claude Team', apiProvider: 'firstParty', tokenSource: 'DECOY_TOKEN_7f3', userID: 'DECOY_USER_7f3' } });
+    await linger();
+  } else if (mode === 'stderr-email') {
+    process.stderr.write('Error: account decoy.person@example.com at /Users/decoy/.claude/x.json is not usable\n');
+    await flush(); process.exit(1);
+  } else if (mode === 'turn') {
+    out({ type: 'system', subtype: 'init', session_id: randomUUID(), tools: [], model: 'claude-fake-1' });
+    out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'a turn started' }] } });
+    reply(signedIn());
+    await linger();
+  } else if (mode === 'garbage') {
+    process.stdout.write('this is not json\n{"half": \n');
+    reply(signedIn(), 'success', 'not-ours');
+    await flush(); process.exit(0);
+  } else if (mode === 'wrong-id') {
+    reply(signedIn(), 'success', 'r2');
+    await flush(); process.exit(0);
+  } else if (mode === 'nomodels') {
+    const { models, ...rest } = signedIn();
+    void models;
+    reply(rest);
+    await linger();
+  } else if (mode === 'error') {
+    out({ type: 'control_response', response: { subtype: 'error', request_id: reqId, error: 'no' } });
+    await linger();
+  } else if (mode === 'inner') {
+    reply(sc.modelsInner);
+    await linger();
+  } else if (mode === 'raw') {
+    process.stdout.write(String(sc.modelsRaw).replace('__REQ__', reqId) + '\n');
+    await linger();
+  } else if (mode === 'hang') {
+    await sleep(120_000);
+  } else if (mode === 'flood') {
+    const chunk = 'x'.repeat(64 * 1024);
+    for (let i = 0; i < 80; i++) if (!process.stdout.write(chunk)) await new Promise((r) => process.stdout.once('drain', r));
+    reply(signedIn());
+    await linger();
+  } else if (mode === 'manylines') {
+    let buf = '';
+    for (let i = 0; i < 50_000; i++) buf += `{"type":"system","subtype":"noise","n":${i},"pad":"${'p'.repeat(20)}"}\n`;
+    process.stdout.write(buf);
+    reply(signedIn()); // a valid reply after the cap: it must never be used (R2-5)
+    await linger();
+  } else if (mode === 'longline') {
+    process.stdout.write('{"pad":"' + 'y'.repeat(600 * 1024) + '"}\n');
+    reply(signedIn());
+    await linger();
+  }
+  await flush(); process.exit(0);
+}
+
 const stageMatch = /^# Stage: (\w+)/m.exec(prompt);
 const stage = (stageMatch?.[1] ?? 'UNKNOWN').toLowerCase();
 const key = /^Issue key: ([A-Z][A-Z0-9]*-\d+)\s*$/m.exec(prompt)?.[1] ?? 'UNKNOWN-0';

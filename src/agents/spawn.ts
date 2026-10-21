@@ -18,6 +18,12 @@ export interface SpawnOpts {
   clock?: Clock;
   graceMs?: number; // SIGTERM → SIGKILL delay (default 5000)
   tickMs?: number; // watchdog period (default 1000)
+  /**
+   * Raw byte cap on stdout+stderr together, counted on every `data` chunk BEFORE line splitting (M8-1 S4/B2). Exceeding it kills the
+   * process group, stops delivering lines and sets `SpawnResult.overflow`. Undefined (the default) ⇒ no cap and no `overflow` field:
+   * every existing caller is unchanged.
+   */
+  maxOutputBytes?: number;
 }
 export interface SpawnResult {
   code: number | null;
@@ -28,6 +34,8 @@ export interface SpawnResult {
   stderrTail: string;
   durationMs: number;
   spawnError?: string;
+  /** Present only when `maxOutputBytes` was set: true when the cap was exceeded and the group was killed. */
+  overflow?: boolean;
 }
 
 const TAIL_BYTES = 64 * 1024;
@@ -77,6 +85,9 @@ export function runProcess(opts: SpawnOpts): Promise<SpawnResult> {
     let lastTick = startedAt;
     let slept = 0; // wall-clock the machine spent asleep: never counted against idle OR hard budgets
     let killTimer: NodeJS.Timeout | null = null;
+    const cap = opts.maxOutputBytes;
+    let outBytes = 0;
+    let overflow = false;
 
     let child: ReturnType<typeof spawn>;
     try {
@@ -109,7 +120,7 @@ export function runProcess(opts: SpawnOpts): Promise<SpawnResult> {
       if (killTimer) clearTimeout(killTimer);
       if (pid) active.delete(pid);
       opts.signal?.removeEventListener('abort', onAbort);
-      resolve({ ...r, durationMs: clock.now() - startedAt });
+      resolve({ ...r, ...(cap !== undefined ? { overflow } : {}), durationMs: clock.now() - startedAt });
     };
 
     const watchdog = setInterval(() => {
@@ -144,6 +155,16 @@ export function runProcess(opts: SpawnOpts): Promise<SpawnResult> {
       let buf = '';
       return (chunk: Buffer | string) => {
         lastOutput = clock.now();
+        if (cap !== undefined) {
+          if (overflow) return; // nothing more is kept or delivered after the cap tripped
+          outBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+          if (outBytes > cap) {
+            overflow = true;
+            buf = '';
+            terminate();
+            return;
+          }
+        }
         const s = String(chunk);
         if (stream === 'stdout') stdoutTail = (stdoutTail + s).slice(-TAIL_BYTES);
         else stderrTail = (stderrTail + s).slice(-TAIL_BYTES);
