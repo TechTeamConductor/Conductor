@@ -14,3 +14,20 @@
 - UPDATE 2026-10-20 (late): M4, M5 (minus research), M6 core and the macOS .dmg are built — see final-report-workspace-v2.md. Next: re-verification by Reviewer/Security of the latest fix commits, then the deferred M6 items and M5 research.
 - Next exact action (older): (a) read both M3 review reports, fix findings, re-verify; (b) fold the plan text conditions into M4/M5/M6/M7; (c) start M4 commit 1 (store + scanner + incremental update; create `src/limits/budget.ts` with M4's first counter).
 - Retry count / alternate strategy tried: 0
+
+## M8 product layer (started 2026-10-21)
+- Brief: `.techteam/briefs/product-layer.md` (incl. user decisions); design copy `.techteam/design/v16/`.
+- Plans: master `.techteam/plans/workspace-v2-m8.md`; slice 1 `workspace-v2-m8-1.md` (model discovery) — pending Reviewer + Security design.
+- Live facts (zero quota, 2026-10-21): Claude 2.1.304 `initialize` → 13 models (signed in) / 5 aliases (signed out, empty CLAUDE_CONFIG_DIR), ~1.3 s, stdin closed immediately is fine; it writes `.claude.json`/backups/empty `sessions/` to its config dir even with `--no-session-persistence`. Cursor 2026.10.19 `--list-models` → 265 ids; signed out exit 1 "Authentication required … CURSOR_API_KEY/CURSOR_AUTH_TOKEN". Codex broken (ENOENT).
+- Baseline before M8: clone HEAD `8eaab46`, `npm run check` clean, `npm test` 713 / 709 pass / 4 live skips.
+- Next: Reviewer + Security verdicts on M8-1 → fix plan → implement M8-1.
+- 2026-10-21 (later): user asked to build "the same UI and the code" now → new slice **M8-U** (`plans/workspace-v2-m8-u.md`): port the design into `ui/*`, wired to existing APIs, unbuilt-backend controls feature-detected. Runs in parallel with M8-1 (disjoint files: `ui/*` vs `src/models/*`, `src/runtime.ts`, `src/agents/spawn.ts`, `src/server/api.ts`, `src/cli.ts`). Pending Reviewer.
+- M8 master: Reviewer **Approved** (direction). M8-1 rev 1: Reviewer Changes requested (B1–B5) → rev 2 written; Security design **Approved with conditions** (S1–S20 folded in as §2b) → rev 2 sent to both for confirmation.
+- 2026-10-21 status (parallel subagents, cross-agent messaging allowed):
+  - M8-1 discovery: plan approved (Reviewer + Security, conditions folded); **implementing** (backend agent). Then: Reviewer code review + Security code review (S1–S17 tests, S5/S16 evidence).
+  - M8-U UI port: rev 2 approved (Reviewer C1–C3, Security U1–U10); **implementing** (frontend agent) after folding U1–U3/C1–C3. D-U1 (header Ask button) → user in slice report.
+  - M8-4 run mode: **approved** (B1–B3 folded). Commit 1 may land early; PUT /api/run-mode after M8-3 (C1 contract verbatim in M8-3).
+  - M8-6 design-work: **approved** (Reviewer B1–B2 + Security S1–S18 folded). Starts after M8-1 is committed (shared files api.ts/runtime.ts). S17 live check NOT authorised.
+  - M8-2 model/effort: Security approved w/ conditions; Reviewer **changes requested** (B1–B5) → rev 2 in progress, B4 table to agree with M8-3.
+  - M8-3 accounts: rev 2 in progress (user: CLI-login accounts; Claude CLAUDE_CONFIG_DIR + `claude auth login`; Cursor per-account HOME + AGENT_CLI_CREDENTIAL_STORE=file + `agent login`; chain-only switching). Reviewer + Security reviewing.
+  - Follow-ups noted: (a) pre-existing board-version downgrade hole (M5 bump) — fixed going forward by M8-6 B1/S4; (b) `route()` refuses `research` in production (dead webResearchIsolated gate) and Settings shows a false "not isolated" reason for Claude research — separate Security-reviewed follow-up; (c) Claude `opus[1m]`-style model values rejected by the id rule — told user.

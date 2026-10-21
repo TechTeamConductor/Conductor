@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Conductor board</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body { margin: 0; overflow-x: hidden; background: #0d1015; }
+</style>
+</helmet>
+<dc-import name="Main" screen="board" theme="{{theme}}" scenario="{{scenario}}" speed="{{speed}}" hint-size="100%,900px"></dc-import>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"scenario":{"editor":"enum","options":["busy","warnings","empty"],"default":"busy"},"speed":{"editor":"range","min":1,"max":8,"step":1,"default":1},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      theme: this.props.theme || 'dark',
+      scenario: this.props.scenario || 'busy',
+      speed: this.props.speed || 1
+    };
+  }
+}
+</script>
+</body>
+</html>
