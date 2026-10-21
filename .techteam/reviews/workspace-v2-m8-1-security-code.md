@@ -77,3 +77,16 @@ No new HTML sink, shell use, path built from a model id, or credential handling 
   - showing the email is a separate Security decision.
 
 Verdict: Approved
+
+---
+
+## Follow-up check of L1–L4 (2026-10-21)
+
+The builder (a6f0e675534e1a73a) applied all four. I read each change and re-ran `test/models/*.test.ts`: 105/105 pass.
+
+- **L1 (closed).** `workdir.ts securePrivateDir` now opens the folder with `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` and runs `fstat` and `fchmod` on that handle. It then re-lstats the path and refuses if the dev or inode changed. The same function is used by `cache.ts`.
+- **L2 (closed).** `writeCache` no longer goes through `saveVersioned` / `assertNotNewer`. It writes with `atomicWriteFile` (random temp file, then rename, mode 0600, version stamped) after the no-follow newer check. A test confirms the target of a link to a "version 2" decoy is left untouched.
+- **L3 (closed).** The Cursor sign-in signal now comes only from stderr, or from a non-model stdout line together with a non-zero exit. A test confirms a hostile label containing the auth phrase still gives a fresh list.
+- **L4 (closed).** At the `claudeEnv` call there is now a comment: never allow-list `CLAUDE_CODE_ENTRYPOINT` without a Security review.
+
+Verdict: Approved
