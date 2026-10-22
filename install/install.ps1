@@ -257,7 +257,7 @@ function Install-Conductor {
         Write-Host 'Start it:                      conductor start'
         Write-Host 'Try it without any keys first: conductor demo'
         Write-Host 'Check your setup:              conductor doctor'
-        Write-Host 'Update later:                  run the install command again'
+        Write-Host 'Stop / update:                  conductor stop | conductor update (on Windows: Ctrl+C to stop, then run the install command again)'
         Write-Host 'Remember: Windows support is experimental (see the note above).' -ForegroundColor Yellow
     } finally {
         if ($lock) { $lock.Close() }

@@ -101,7 +101,8 @@ That's it. Try it without any keys first with `conductor demo`, and check your s
 
 | | |
 | --- | --- |
-| **Update** | Run the install command again. |
+| **Update** | `conductor update` (it checks for a newer release, verifies it and installs it; stop Conductor first with `conductor stop`). Or run the install command again. On Windows, Ctrl+C in its terminal, then run the install command again. |
+| **Stop / restart** | `conductor stop` stops the running Conductor and frees its port. `conductor restart` stops it and starts it again. |
 | **Uninstall** | macOS: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh \| bash -s -- --uninstall`. Windows: `$env:CONDUCTOR_UNINSTALL='1'; irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 \| iex; Remove-Item Env:CONDUCTOR_UNINSTALL`. Your data (`~/.conductor-v2`) is never deleted by it. |
 | **Where it goes** | The app is unpacked into `~/.conductor-app` (Windows: `%LOCALAPPDATA%\Conductor\app`) and a `conductor` launcher into `~/.local/bin` (Windows: `%LOCALAPPDATA%\Conductor\bin`, added to your user PATH). If `~/.local/bin` is not on your PATH, the installer prints the one line to add. |
 | **Safe by design** | HTTPS only, the download is checked against `SHA256SUMS.txt` before anything is unpacked (this catches corrupted downloads; what you trust is HTTPS plus this GitHub repository), no `sudo`, no edits to your shell profile on macOS. Prefer to read first? Download `install.sh` from the release page, read it, and run `bash install.sh`. |
@@ -225,6 +226,9 @@ Tested with scripted fake agents and real git: **1,000+ tests, no network, no qu
 ```bash
 conductor start                # run + open the dashboard (--no-open, --port <n>)
 conductor open                 # open a fresh signed-in tab while it's running
+conductor stop                 # stop the running Conductor (frees its port); --port <n> stops the Conductor on that port, --force as a last resort
+conductor restart              # stop it and start it again (same port)
+conductor update [--check]     # update to the latest release (--check only reports)
 conductor demo                 # scripted agents, no keys, no quota
 conductor doctor               # check the setup  (--isolation proves Claude is locked down)
 conductor models [--refresh]   # what each CLI says it offers

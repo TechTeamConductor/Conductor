@@ -20,7 +20,7 @@ Task card (To do)
 
 ## Quick start (about 5 minutes, once)
 
-1. **Install Conductor** (needs Node.js 22.18 or newer). macOS, in Terminal: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh | bash`. Windows (experimental), in PowerShell: `irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 | iex`. Run the same command again to update. Details, uninstall and pinning a version: the [README](../README.md#install) and [`DESKTOP.md`](DESKTOP.md).
+1. **Install Conductor** (needs Node.js 22.18 or newer). macOS, in Terminal: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh | bash`. Windows (experimental), in PowerShell: `irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 | iex`. Update later with `conductor update` (or run the same command again); `conductor stop` / `conductor restart` stop and restart it. Details, uninstall and pinning a version: the [README](../README.md#install) and [`DESKTOP.md`](DESKTOP.md).
 2. **Install the two CLIs and sign in** (you probably already have them): Claude Code (`claude`) and the Cursor CLI (`agent login`).
 3. **Try it without any keys:** `conductor demo` — a dashboard with scripted agents so you can click around.
 4. **Start for real:** `conductor start` — the dashboard opens in your browser and walks you through two steps: check Claude + Cursor are signed in, then add a repo folder (tests/lint are auto-detected). Open it again any time with `conductor open`.
@@ -96,6 +96,9 @@ Settings → "Accounts and limits", or `conductor accounts list | add <claude|cu
 ```
 conductor start            run + open the dashboard   (--no-open, --port <n>)
 conductor open             open a fresh signed-in tab while it's running
+conductor stop             stop the running Conductor and free its port   (--port <n>: the Conductor on that port, --force)
+conductor restart          stop it and start it again on the same port
+conductor update           update to the latest release   (--check only reports; stop Conductor first)
 conductor demo             scripted demo (no keys / quota)
 conductor doctor           check the setup   (--isolation proves Claude is locked down, --probe)
 conductor doctor --isolation codex --yes      the Codex isolation check (uses quota; marks Codex partial or blocked)

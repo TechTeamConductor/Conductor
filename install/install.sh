@@ -253,7 +253,7 @@ main() {
   esac
   say "Try it without any keys first:   conductor demo"
   say "Check your setup:               conductor doctor"
-  say "Update later:                   run the install command again"
+  say "Stop / restart / update:        conductor stop | conductor restart | conductor update"
   if [ "$platform" = "linux" ]; then
     say ""
     say "Note: Linux support is experimental. The dashboard runs, but the full build flow is only tested on macOS."

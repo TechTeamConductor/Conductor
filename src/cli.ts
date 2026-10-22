@@ -19,6 +19,7 @@ import { createRuntime, VERSION } from './runtime.ts';
 import { agentHealth, isolationProbe, probe, runChecks } from './doctor.ts';
 import { installService, serviceStatus, uninstallService, plistPath } from './service.ts';
 import { startDemo } from './demo.ts';
+import { parsePort, realStopDeps, realUpdateDeps, runStop, runUpdate } from './lifecycle.ts';
 import { errMsg, sha256 } from './util.ts';
 import { accountsCli, socketClient } from './accounts/cli.ts';
 import { AccountService } from './accounts/service.ts';
@@ -39,6 +40,9 @@ Usage: conductor <command>
 
   start              run Conductor and open the dashboard (default)
   open               open a fresh signed-in dashboard tab (when it is already running)
+  stop               stop the running Conductor   [--port <n> stops the Conductor listening on that port] [--force]
+  restart            stop it and start it again   [--no-open] [--port <n>]
+  update             update to the latest release   [--check only reports]
   demo               try everything with scripted agents — no keys, no quota
   doctor             check your setup   [--isolation [claude|codex]] [--probe] [--verify-build cursor] [--clear-block codex] [--yes]
   service install    keep Conductor running in the background (macOS launchd only)   [--dry-run]
@@ -108,6 +112,12 @@ async function main(): Promise<void> {
       return start();
     case 'open':
       return openCmd();
+    case 'stop':
+      return stopCmd();
+    case 'restart':
+      return restartCmd();
+    case 'update':
+      return updateCmd();
     case 'demo':
       return demo();
     case 'doctor':
@@ -311,6 +321,42 @@ async function openRunning(): Promise<void> {
   } catch (e) {
     console.log(`Could not reach the running Conductor: ${errMsg(e)}`);
   }
+}
+
+function portOption(): number | null | undefined {
+  const raw = opt('--port');
+  if (raw === undefined) return undefined;
+  const p = parsePort(raw);
+  if (p === null) {
+    console.error('--port must be a whole number between 1024 and 65535.');
+    process.exit(2);
+  }
+  return p;
+}
+
+async function stopCmd(): Promise<void> {
+  const r = await runStop({ port: portOption() ?? null, force: flag('--force') }, realStopDeps());
+  for (const l of r.lines) console.log(l);
+  process.exit(r.code);
+}
+
+async function restartCmd(): Promise<void> {
+  const explicit = portOption();
+  const r = await runStop({ port: null, force: false }, realStopDeps());
+  for (const l of r.lines) console.log(l);
+  if (r.code !== 0) {
+    console.error('Not restarting: the running Conductor could not be stopped.');
+    process.exit(r.code);
+  }
+  if (explicit === undefined && r.port !== null && parsePort(String(r.port)) !== null) argv.push('--port', String(r.port)); // keep the port the old instance used
+  console.log(r.stopped ? 'Restarting Conductor …' : 'Starting Conductor …');
+  return start();
+}
+
+async function updateCmd(): Promise<void> {
+  const r = await runUpdate({ check: flag('--check') }, { appDir: ROOT_DIR, version: VERSION, env: process.env }, realUpdateDeps());
+  for (const l of r.lines) console.log(l);
+  process.exit(r.code);
 }
 
 async function openCmd(): Promise<void> {

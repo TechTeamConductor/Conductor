@@ -9,7 +9,7 @@ There is no app store and no registry package: Conductor is installed by a one-l
 | Windows (experimental) | `irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 \| iex` | `conductor start` |
 | Linux (experimental) | the macOS command | `conductor start` |
 
-Needs Node.js 22.18 or newer. Run the same command again to update. See the [README](../README.md#install) for uninstalling, pinning a version and what the installer does and does not touch.
+Needs Node.js 22.18 or newer. Update with `conductor update` (or run the same command again). See the [README](../README.md#install) for uninstalling, pinning a version and what the installer does and does not touch.
 
 **Why not `npm install -g`?** Conductor runs its TypeScript directly (no build step) and Node refuses to run TypeScript from inside a `node_modules` folder, so an npm global install cannot work. The installer unpacks the app into `~/.conductor-app` (Windows: `%LOCALAPPDATA%\Conductor\app`) and writes a small `conductor` launcher. If you copy the app into a `node_modules` folder anyway, `conductor` stops with a message pointing here.
 
