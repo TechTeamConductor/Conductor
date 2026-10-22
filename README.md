@@ -12,6 +12,17 @@
 ![Platform](https://img.shields.io/badge/macOS-supported-black?logo=apple)
 ![Status](https://img.shields.io/badge/status-v2%20preview-f5a524)
 
+<!-- Live repo metrics: every badge below is fetched from GitHub/shields.io on page load, nothing is hard-coded. -->
+<a href="https://github.com/TechTeamConductor/Conductor/stargazers"><img src="https://img.shields.io/github/stars/TechTeamConductor/Conductor?style=flat&logo=github&label=stars" alt="GitHub stars"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/forks"><img src="https://img.shields.io/github/forks/TechTeamConductor/Conductor?style=flat&logo=github&label=forks" alt="GitHub forks"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/watchers"><img src="https://img.shields.io/github/watchers/TechTeamConductor/Conductor?style=flat&logo=github&label=watchers" alt="GitHub watchers"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/graphs/contributors"><img src="https://img.shields.io/github/contributors/TechTeamConductor/Conductor?style=flat&label=contributors" alt="Contributors"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/commits/main"><img src="https://img.shields.io/github/commit-activity/w/TechTeamConductor/Conductor?style=flat&label=commits%20%2F%20week" alt="Commits per week"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/commits/main"><img src="https://img.shields.io/github/last-commit/TechTeamConductor/Conductor?style=flat&label=last%20commit" alt="Last commit"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/issues"><img src="https://img.shields.io/github/issues/TechTeamConductor/Conductor?style=flat&label=issues" alt="Open issues"></a>
+<a href="https://github.com/TechTeamConductor/Conductor"><img src="https://img.shields.io/github/languages/top/TechTeamConductor/Conductor?style=flat&label=top%20language" alt="Top language"></a>
+<a href="https://github.com/TechTeamConductor/Conductor"><img src="https://img.shields.io/github/repo-size/TechTeamConductor/Conductor?style=flat&label=repo%20size" alt="Repo size"></a>
+
 **[Quick start](#quick-start)** · **[What you get](#what-you-get)** · **[How it works](#how-it-works)** · **[Screens](#screens)** · **[Safety](#safety-model)** · **[Status](#status)** · **[Docs](#documentation)**
 
 </div>
@@ -198,6 +209,15 @@ node bin/conductor.mjs service install | uninstall | status     # keep it runnin
 | [Desktop app](docs/DESKTOP.md) | The Electron shell and `.dmg` build |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | When something looks wrong |
 | [Plans & reviews](.techteam/) | Every plan, review and security sign-off behind each milestone |
+
+## Star history
+
+<a href="https://www.star-history.com/#TechTeamConductor/Conductor&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=TechTeamConductor/Conductor&type=Date&theme=dark" />
+    <img src="https://api.star-history.com/svg?repos=TechTeamConductor/Conductor&type=Date" alt="Star history chart" width="100%" />
+  </picture>
+</a>
 
 ## Built with
 
