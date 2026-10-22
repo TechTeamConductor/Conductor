@@ -164,11 +164,14 @@ jobs:
           try {
             $code = 0
             for ($i = 0; $i -lt 60; $i++) {
-              try { $code = (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:4399/' -MaximumRedirection 0 -SkipHttpErrorCheck).StatusCode } catch { $code = 0; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } }
+              # curl.exe (no -L: a 302 stays a 302). It prints 000 when nothing answers, so anything that is not three digits counts as 0.
+              $out = (& curl.exe -s -o NUL --max-time 3 --noproxy '*' -w '%{http_code}' 'http://127.0.0.1:4399/' | Out-String).Trim()
+              $curlExit = $LASTEXITCODE
+              $code = if ($out -match '^[0-9]{3}$') { [int]$out } else { 0 }
               if ($code -in 200, 302, 401) { break }
               Start-Sleep -Milliseconds 500
             }
-            if ($code -notin 200, 302, 401) { Get-Content $log, (Join-Path $env:RUNNER_TEMP 'start.err') -ErrorAction SilentlyContinue; throw "dashboard did not answer ($code)" }
+            if ($code -notin 200, 302, 401) { Get-Content $log, (Join-Path $env:RUNNER_TEMP 'start.err') -ErrorAction SilentlyContinue; throw "dashboard did not answer (last status $code, curl exit $curlExit)" }
           } finally {
             if ($p -and -not $p.HasExited) { & taskkill /T /F /PID $p.Id | Out-Null }
           }
