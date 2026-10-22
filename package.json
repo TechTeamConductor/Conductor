@@ -1,8 +1,16 @@
 {
-  "name": "techteam-conductor",
+  "name": "conductor",
   "version": "0.1.0",
   "private": true,
-  "description": "Local master UI and board that runs cards through Claude (plan) -> Cursor (build) -> Claude (verify) with bug loops.",
+  "description": "Local dashboard and board that runs your AI coding CLIs as a team: Claude plans, Cursor builds, Claude verifies \u2014 with bug loops, in isolated git worktrees.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TechTeamConductor/Conductor.git"
+  },
+  "homepage": "https://github.com/TechTeamConductor/Conductor",
+  "bugs": {
+    "url": "https://github.com/TechTeamConductor/Conductor/issues"
+  },
   "type": "module",
   "license": "UNLICENSED",
   "engines": {
@@ -18,7 +26,9 @@
     "open": "node bin/conductor.mjs open",
     "test": "node --test --import ./test/preload.ts --test-concurrency=4 \"test/**/*.test.ts\"",
     "test:live": "LIVE=1 node --test --import ./test/preload.ts --test-concurrency=1 \"test/live/**/*.test.ts\"",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "release:version": "node scripts/next-version.ts",
+    "check:workflows": "node scripts/check-workflows.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

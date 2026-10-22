@@ -2,8 +2,7 @@
  * Git worktree layer: repo validation, isolated worktrees, dependency install, commit hygiene, diff + scope guard,
  * backup refs (C5), resets, ancestor-instruction scan, builder no-push environment and Cursor deny-rule guard.
  *
- * Contract: see `.techteam/plans/conductor-v1.md` §2 (Isolation RC2/RC3, Verification integrity RC7, resume matrix,
- * carry-forwards C2 and C5). Erasable TypeScript only; node:* built-ins only; argv-only git calls.
+ * Erasable TypeScript only; node:* built-ins only; argv-only git calls.
  */
 import { ensureRealDir, safeWriteInside } from '../fsutil.ts';
 import { access, appendFile, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';

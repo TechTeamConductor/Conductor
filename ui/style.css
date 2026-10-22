@@ -772,7 +772,7 @@ dialog::backdrop { background: var(--scrim); }
 .tool { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
 .tool-name { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; min-width: 90px; }
 
-/* ═════════════ Version 16 design (M8-U). Ported from .techteam/design/v16/Main.dc.html on the tokens above.
+/* ═════════════ Version 16 design, built on the tokens above.
    Rescoped: no .app wrapper, no element resets, no theme classes (prefers-color-scheme stays). Classes that collide with
    the drawer / wizard are renamed for the Home thread: .home-hero, .tsteps/.tstep*, .doc-sec, .turn-actions. ═════════════ */
 

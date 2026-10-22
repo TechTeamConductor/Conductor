@@ -1,9 +1,9 @@
 'use strict';
-// Conductor desktop shell (macOS). Main process: window + sidecar lifecycle. The renderer is a hardened, sandboxed view of the loopback
+// Conductor desktop shell (macOS; Windows is experimental). Main process: window + sidecar lifecycle. The renderer is a hardened, sandboxed view of the loopback
 // dashboard; the server runs in a separate utilityProcess and hands over {port, otp} on its message channel (port 0 — never a fixed port).
 const { app, BrowserWindow, Menu, session, shell, utilityProcess, dialog } = require('electron');
 const { execFileSync } = require('node:child_process');
-const { join } = require('node:path');
+const { join, delimiter } = require('node:path');
 const { homedir } = require('node:os');
 
 app.enableSandbox();
@@ -16,18 +16,24 @@ let quitting = false;
 
 /** A Finder-launched app has a minimal PATH: take the user's login-shell PATH so the `claude` / `agent` CLIs are found. */
 function loginPath() {
-  const extra = ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local', 'bin'), join(homedir(), '.cursor', 'bin'), join(homedir(), '.claude', 'local')];
+  const extra = process.platform === 'win32'
+    ? [join(homedir(), '.local', 'bin'), join(homedir(), '.cursor', 'bin'), join(homedir(), '.claude', 'local')]
+    : ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local', 'bin'), join(homedir(), '.cursor', 'bin'), join(homedir(), '.claude', 'local')];
   let fromShell = '';
-  try {
-    const sh = process.env.SHELL && /^\/[A-Za-z0-9/_.-]+$/.test(process.env.SHELL) ? process.env.SHELL : '/bin/zsh';
-    fromShell = execFileSync(sh, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  } catch { /* fall back to the common locations */ }
-  return [...new Set([...(fromShell ? fromShell.split(':') : []), ...(process.env.PATH || '').split(':'), ...extra])].filter(Boolean).join(':');
+  if (process.platform !== 'win32') { // there is no login shell to ask on Windows: its PATH comes from the environment
+    try {
+      const sh = process.env.SHELL && /^\/[A-Za-z0-9/_.-]+$/.test(process.env.SHELL) ? process.env.SHELL : '/bin/zsh';
+      fromShell = execFileSync(sh, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    } catch { /* fall back to the common locations */ }
+  }
+  const sep = delimiter;
+  return [...new Set([...(fromShell ? fromShell.split(sep) : []), ...(process.env.PATH || process.env.Path || '').split(sep), ...extra])].filter(Boolean).join(sep);
 }
 
 function startSidecar() {
   const entry = join(__dirname, 'payload', 'src', 'desktop-sidecar.js');
-  const env = { ...process.env, PATH: loginPath(), CONDUCTOR_DESKTOP: '1' };
+  const pathKey = process.platform === 'win32' ? (Object.keys(process.env).find((k) => k.toLowerCase() === 'path') || 'Path') : 'PATH'; // Windows env keys are case-insensitive
+  const env = { ...process.env, [pathKey]: loginPath(), CONDUCTOR_DESKTOP: '1' };
   delete env.ELECTRON_RUN_AS_NODE;
   sidecar = utilityProcess.fork(entry, [], { env, serviceName: 'Conductor server', stdio: 'inherit' });
   sidecar.on('message', (m) => {

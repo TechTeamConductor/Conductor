@@ -1,0 +1,189 @@
+# Automatic versioning and releases.
+#
+# Every push to main is looked at: the next version is computed from Conventional Commits since the last vX.Y.Z tag
+# (feat -> minor, fix/perf/revert -> patch, breaking -> minor while 0.x / major from 1.0; docs/chore/ci/test/... never release).
+# If a release is due, the app is tested, built as a macOS .dmg and a Windows .exe, and published as a GitHub Release with
+# generated notes and SHA256SUMS.txt. The git tag is the version's source of truth; nothing is committed back to main.
+# Publishing is all-or-nothing: a failed build or test publishes nothing.
+#
+# Manual run: Actions -> Release -> Run workflow, with an optional bump override (use "major" to cut 1.0.0).
+# Roll back a bad release:  gh release delete vX.Y.Z --cleanup-tag --yes
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto = from commit messages)
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan version
+    if: github.repository == 'TechTeamConductor/Conductor' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Compute next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump || 'auto' }}
+        run: |
+          # no pipe: a failing script must fail this step, never look like "no release"
+          node scripts/next-version.ts --bump "$BUMP" > next-version.out
+          cat next-version.out
+          grep -qE '^release=(true|false)$' next-version.out
+          cat next-version.out >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build-mac:
+    name: Build macOS .dmg
+    needs: [plan, test]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: macos-14
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CONDUCTOR_VERSION: ${{ needs.plan.outputs.version }}
+      CONDUCTOR_REQUIRE_VERSION: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci
+      - run: npm ci
+        working-directory: desktop
+      - name: Build the .dmg
+        working-directory: desktop
+        run: npm run dist:mac -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
+      - name: Check the artifact carries the release version
+        run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-arm64.dmg"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conductor-mac
+          path: desktop/dist/Conductor-*-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  build-win:
+    name: Build Windows .exe
+    needs: [plan, test]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CONDUCTOR_VERSION: ${{ needs.plan.outputs.version }}
+      CONDUCTOR_REQUIRE_VERSION: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci
+      - run: npm ci
+        working-directory: desktop
+      - name: Build the .exe installer
+        working-directory: desktop
+        run: npm run dist:win -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
+      - name: Check the artifact carries the release version
+        run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-x64-setup.exe"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conductor-win
+          path: desktop/dist/Conductor-*-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [plan, test, build-mac, build-win]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the only job that can create a tag or a release
+    env:
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: conductor-*
+          merge-multiple: true
+          path: release-assets
+      - name: Checksums
+        working-directory: release-assets
+        run: |
+          ls -l
+          sha256sum Conductor-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Release notes header
+        run: |
+          cat > header.md <<'NOTES'
+          ## Downloads
+
+          | Platform | File | Status |
+          | --- | --- | --- |
+          | macOS (Apple Silicon) | `Conductor-*-arm64.dmg` | Ad-hoc signed, not notarized: right-click the app and choose Open the first time |
+          | Windows (x64) | `Conductor-*-x64-setup.exe` | **Experimental, unverified**, not code-signed (SmartScreen will warn). Secret storage, notifications and the background service are macOS-only |
+
+          Verify downloads against `SHA256SUMS.txt`. Releases below 1.0.0 are marked pre-release.
+
+          ## What changed
+          NOTES
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [ "${VERSION%%.*}" = "0" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" release-assets/* \
+            --target "$TARGET_SHA" \
+            --title "Conductor $TAG" \
+            --notes-file header.md \
+            --generate-notes \
+            "${flags[@]}"

@@ -1,4 +1,4 @@
-// Native board model (M1a). Pure data types — no behaviour. See .techteam/plans/workspace-v2-m1.md §2.
+// Native board model. Pure data types — no behaviour.
 
 /**
  * 2: items may be authored by `user-ask` / `ask-convert` / `research` — an older build refuses such a snapshot (no downgrade after Quick Ask is used).

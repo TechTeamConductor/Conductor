@@ -2,7 +2,7 @@
 // presses Send. Cards made from a brief are authored by the server-only actor `design` (TAINTED ⇒ forced plan approval under every policy
 // and run mode). Research keeps living in the asks store; this service only writes the brief and starts the existing web-only research.
 //
-// Hard rules (plan §2b/§2c — see .techteam/plans/workspace-v2-m8-6.md):
+// Hard rules:
 //  - model calls are read-only (`callAgent` → `Agents.readOnly`), never queued, never auto-retried beyond callAgent's one corrective re-ask;
 //  - the research brief runs on Claude ONLY (`onlyProviders`, S3), with the question only, in an empty scratch dir (no repository text);
 //  - `selRole` is a CODE CONSTANT here (S2/N1) — model/effort selection only;
@@ -53,7 +53,7 @@ const SWEEP_PREFIXES = ['conductor-ask-', 'conductor-research-', SCRATCH_PREFIX]
 const SWEEP_AGE_MS = 3 * 60 * 60_000;
 const RESEARCH_NEEDS_CLAUDE = 'The research brief needs Claude: it is not available for the Context job right now (check Settings → Who does what, or sign in to Claude).';
 
-/** Step labels = the design's STEPS wording (`.techteam/design/v16/Main.dc.html`). */
+/** Step labels = the design's STEPS wording. */
 const LABELS: Record<'work' | 'research', Partial<Record<StepId, string>>> = {
   work: { scan: 'Checking your request against the repo', brief: 'Writing the detailed brief', parts: 'Splitting it into tasks' },
   research: { scan: 'Checking the repo for context', brief: 'Writing the research brief' },

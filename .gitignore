@@ -10,3 +10,8 @@ coverage/
 desktop/node_modules/
 desktop/payload/
 desktop/dist/
+
+# internal planning, reviews and agent notes stay local, not in the product repo
+/.techteam/
+/CLAUDE.md
+release-assets/

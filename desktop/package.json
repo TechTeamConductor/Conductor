@@ -2,13 +2,15 @@
   "name": "conductor-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Conductor desktop shell (macOS). Packaging-only dependencies live here; the app itself has no runtime dependencies.",
+  "description": "Conductor desktop shell (macOS dmg, Windows installer). Packaging-only dependencies live here; the app itself has no runtime dependencies.",
   "main": "main.cjs",
-  "author": "Conductor <noreply@techtorch.io>",
-  "homepage": "https://github.com/techtorch/conductor",
+  "author": "Conductor <support@bargainn.io>",
+  "homepage": "https://github.com/TechTeamConductor/Conductor",
   "scripts": {
     "build:app": "node build-app.mjs",
-    "dist": "node build-app.mjs && electron-builder --mac dmg --config electron-builder.json"
+    "dist": "node build-app.mjs && electron-builder --mac dmg --config electron-builder.json",
+    "dist:mac": "node build-app.mjs && electron-builder --mac dmg --config electron-builder.json",
+    "dist:win": "node build-app.mjs && electron-builder --win nsis --config electron-builder.json"
   },
   "devDependencies": {
     "electron": "44.9.2",

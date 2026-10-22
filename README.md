@@ -13,6 +13,8 @@
 ![Status](https://img.shields.io/badge/status-v2%20preview-f5a524)
 
 <!-- Live repo metrics: every badge below is fetched from GitHub/shields.io on page load, nothing is hard-coded. -->
+<a href="https://github.com/TechTeamConductor/Conductor/releases"><img src="https://img.shields.io/github/v/release/TechTeamConductor/Conductor?include_prereleases&style=flat&label=release" alt="Latest release"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/actions/workflows/release.yml"><img src="https://github.com/TechTeamConductor/Conductor/actions/workflows/release.yml/badge.svg" alt="Release workflow"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/stargazers"><img src="https://img.shields.io/github/stars/TechTeamConductor/Conductor?style=flat&logo=github&label=stars" alt="GitHub stars"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/forks"><img src="https://img.shields.io/github/forks/TechTeamConductor/Conductor?style=flat&logo=github&label=forks" alt="GitHub forks"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/watchers"><img src="https://img.shields.io/github/watchers/TechTeamConductor/Conductor?style=flat&logo=github&label=watchers" alt="GitHub watchers"></a>
@@ -73,6 +75,10 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 | 🧠 | **Project context** | A local, incremental index of your repo so agents don't rescan it every time. Works offline. |
 | 🛡️ | **Approval policies** | `full-auto` · `approve-plan` · `approve-risky` · `manual-stages`, per project, with forced holds no setting can remove. |
 
+## Download
+
+Grab the latest build from [**Releases**](https://github.com/TechTeamConductor/Conductor/releases): a macOS `.dmg` (Apple Silicon) and an experimental Windows `.exe`. Every release comes with a `SHA256SUMS.txt`. Releases are cut automatically from the commit history, and while the version is below 1.0.0 they are marked *pre-release* on purpose. Neither app is code-signed yet, so macOS asks you to right-click → Open the first time and Windows SmartScreen will warn.
+
 ## Quick start
 
 > About five minutes, once. Node **22.18+**, plus the CLIs you already use.
@@ -96,7 +102,7 @@ The dashboard checks that Claude and Cursor are signed in, asks you to add a rep
 | --- | --- |
 | Data | `~/.conductor-v2` (override with `CONDUCTOR_HOME`) |
 | Port | `4327` (loopback only) |
-| macOS app | `desktop/` builds an unsigned `.dmg`. See [`docs/DESKTOP.md`](docs/DESKTOP.md) |
+| Desktop app | Download the `.dmg` (macOS) or the experimental `.exe` (Windows) from [**Releases**](https://github.com/TechTeamConductor/Conductor/releases). Build it yourself with the steps in [`docs/DESKTOP.md`](docs/DESKTOP.md) |
 | Coming from v1? | `node bin/conductor.mjs migrate` (dry run first). v1 and v2 run side by side and v2 never writes to v1's folder |
 
 ## Screens
@@ -115,7 +121,7 @@ The dashboard checks that Claude and Cursor are signed in, asks you to add a rep
 </tr>
 </table>
 
-<sub>Screenshots come from the built-in demo with scripted agents. Light theme and phone layouts are in [`.techteam/runs/evidence/`](.techteam/runs/evidence/).</sub>
+<sub>Screenshots come from the built-in demo with scripted agents.</sub>
 
 ## How it works
 
@@ -160,13 +166,13 @@ Conductor assumes the model can be wrong, and that text it writes can be hostile
 | **Everything is redacted** | Every agent-derived string is scrubbed before it reaches the board, logs or UI. |
 | **Data is versioned and backed up** | Newer files are refused, never downgraded. Older files are backed up before an upgrade. |
 
-Every feature in this repo went through a **written plan → independent Reviewer → independent Security review → tests → code review**, with the reviews kept in [`.techteam/reviews/`](.techteam/reviews/). Read the safety section of the [full guide](docs/GUIDE.md#safety-model-read-this-once) once before pointing it at a repo.
+Read the safety section of the [full guide](docs/GUIDE.md#safety-model-read-this-once) once before pointing it at a repo.
 
 > **Heads-up.** Like any coding agent, Cursor can run commands as you inside the worktree. Only register repositories you trust.
 
 ## Status
 
-**v2 preview.** Honest labels, no overclaiming:
+**Preview.** Honest labels, no overclaiming:
 
 | Area | State |
 | --- | --- |
@@ -176,10 +182,11 @@ Every feature in this repo went through a **written plan → independent Reviewe
 | Model and effort per job, model discovery | ✅ Done |
 | Several accounts, limit rules, run mode | ✅ Done, but **signing in extra accounts is switched off** until its live checks pass |
 | New UI (Home, Board, Settings) | ✅ Done and browser-checked on the demo |
-| macOS app | 🟡 Unsigned `.dmg`, built before the latest UI |
-| Windows `.exe` · Linux `.deb` | ⬜ Not built |
+| macOS app | ✅ `.dmg` (Apple Silicon), built automatically for every release. Ad-hoc signed, not notarized |
+| Windows app | 🟡 Experimental `.exe` installer: unsigned and **unverified**; secret storage, notifications and the background service are macOS-only |
+| Linux package | ⬜ Not built |
 | Codex as a builder · Cursor/Codex research | ⬜ Locked on purpose, one pairing at a time |
-| Codex on a real install | ⚠️ Never run against a real binary (install broken on the dev machine) |
+| Codex on a real install | ⚠️ Not yet exercised against a real Codex binary |
 
 Tested with scripted fake agents and real git: **1,000+ tests, no network, no quota.** Live tests against the real Cursor CLI are opt-in (`npm run test:live`).
 
@@ -206,9 +213,8 @@ node bin/conductor.mjs service install | uninstall | status     # keep it runnin
 | [**Full guide**](docs/GUIDE.md) | Everyday use, roles and providers, accounts, every command, the whole safety model |
 | [Architecture](docs/ARCHITECTURE.md) | Modules, data on disk, the router, known limits |
 | [API](docs/API.md) | Every endpoint, the transport and security rules the UI follows |
-| [Desktop app](docs/DESKTOP.md) | The Electron shell and `.dmg` build |
+| [Desktop app](docs/DESKTOP.md) | The Electron shell, the `.dmg` / `.exe` builds and how releases are versioned |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | When something looks wrong |
-| [Plans & reviews](.techteam/) | Every plan, review and security sign-off behind each milestone |
 
 ## Star history
 
@@ -221,7 +227,7 @@ node bin/conductor.mjs service install | uninstall | status     # keep it runnin
 
 ## Built with
 
-Plain **Node ≥ 22.18** running **TypeScript by type stripping** (erasable syntax only, no build step) and a vanilla-JS dashboard. **Zero runtime dependencies**. The only dev dependencies are `typescript`, `@types/node` and `graphql` (schema tests). Prompts are plain files in [`prompts/`](prompts/): edit them there, not in code.
+Plain **Node ≥ 22.18** running **TypeScript by type stripping** (erasable syntax only, no build step) and a vanilla-JS dashboard. **Zero runtime dependencies**. The only dev dependencies are `typescript` and `@types/node`. Prompts are plain files in [`prompts/`](prompts/): edit them there, not in code.
 
 ---
 

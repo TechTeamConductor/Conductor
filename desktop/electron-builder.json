@@ -27,7 +27,8 @@
     "category": "public.app-category.developer-tools",
     "identity": null,
     "hardenedRuntime": false,
-    "gatekeeperAssess": false
+    "gatekeeperAssess": false,
+    "artifactName": "Conductor-${version}-${arch}.${ext}"
   },
   "dmg": {
     "title": "Conductor",
@@ -42,5 +43,23 @@
     "enableEmbeddedAsarIntegrityValidation": true,
     "grantFileProtocolExtraPrivileges": false
   },
-  "afterSign": "after-pack.cjs"
+  "afterSign": "after-pack.cjs",
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "Conductor-${version}-${arch}-setup.${ext}",
+    "signAndEditExecutable": false
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  }
 }
