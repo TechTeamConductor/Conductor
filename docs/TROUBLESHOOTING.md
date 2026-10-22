@@ -22,7 +22,7 @@
 
 **Windows: repositories cannot be added, gates or agents do not run.** Native Windows is experimental: only the installer and the dashboard work. Use WSL2 (open Ubuntu, install Node, run the macOS install command inside it) or a Mac.
 
-**The browser did not open.** Conductor prints a link; open it yourself, or run `conductor open` (macOS/Linux) once it is running. The plain `http://127.0.0.1:4327` address needs the one-time sign-in link to work.
+**The browser did not open.** Conductor prints a link; open it yourself, or run `conductor open` (macOS/Linux) once it is running. The plain `http://127.0.0.1:4327` address needs the one-time sign-in link to work. On a headless machine or in CI set `CONDUCTOR_NO_OPEN=1` (exactly `1`): Conductor then never launches a browser and only prints the link.
 
 ## Using Conductor
 
@@ -48,7 +48,10 @@
 
 **"Session expired" in the dashboard.** Run `conductor open` (one-time sign-in link).
 
-**"Conductor is already running".** Only one instance runs per data folder. Use `conductor open` to reach it. (v1 and v2 can run at the same time: they use different data folders, ports, cookies and launchd labels.)
+**"Conductor is already running".** Only one instance runs per data folder. `conductor start` then opens the running dashboard for you (a fresh one-time sign-in link, same as `conductor open`; use `conductor start --no-open` to just see the message). (v1 and v2 can run at the same time: they use different data folders, ports, cookies and launchd labels.)
+
+**The page says `UI file index.html is missing` (or looks broken) although you just installed.** An older Conductor is still running from a folder that has since been moved, deleted or replaced, and it is holding the port. Stop it with `kill <pid>`, using the pid from the "already running" message (check what it is first with `ps -p <pid> -o command=`), then run `conductor start` again.
+
 
 **Cursor CLI hangs / prints nothing.** Conductor kills silent agents after 15 minutes and retries once; run `agent update`. A run that still fails goes to **Needs you** with the reason.
 

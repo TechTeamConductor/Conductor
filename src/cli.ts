@@ -54,6 +54,11 @@ Flags for start: --no-open (do not open a browser tab), --port <n>
 `;
 
 function openBrowser(url: string): void {
+  // CONDUCTOR_NO_OPEN=1 (exactly "1"): never launch a browser, just print the link (headless machines, CI, tests)
+  if (process.env.CONDUCTOR_NO_OPEN === '1') {
+    console.log(`Open this link: ${url}`);
+    return;
+  }
   if (process.platform === 'darwin') execFile('/usr/bin/open', [url], () => undefined);
   else if (process.platform === 'win32') {
     // explorer.exe hands the file to the default browser (it exits non-zero even on success, so the exit code is ignored)
@@ -164,7 +169,9 @@ async function start(): Promise<void> {
     lock = acquireLock(paths.lock());
   } catch (e) {
     if (e instanceof LockHeldError) {
-      console.log(`${e.message}\nOpen the dashboard with:  conductor open`);
+      console.log(e.message);
+      if (!flag('--no-open') && openBrowserSetting()) await openRunning();
+      console.log('Open the dashboard with:  conductor open');
       process.exit(0);
     }
     throw e;
@@ -279,6 +286,31 @@ async function accountsCmd(): Promise<void> {
     err: (l) => console.error(l),
   });
   process.exitCode = code;
+}
+
+/** `ui.openBrowser` from config.json, read-only: never writes, renames or quarantines (another Conductor owns the data folder). Default true. */
+function openBrowserSetting(): boolean {
+  try {
+    const v = JSON.parse(readFileSync(paths.config(), 'utf8')) as { ui?: { openBrowser?: unknown } };
+    return v?.ui?.openBrowser !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** Another Conductor is already running: ask it for a fresh one-time sign-in link and open it, like `conductor open`. Never throws. */
+async function openRunning(): Promise<void> {
+  try {
+    if (!existsSync(paths.control())) {
+      console.log('Its control socket is not available here, so a fresh sign-in link cannot be made. Use the link printed when it started.');
+      return;
+    }
+    const r = await controlRequest('/otp', 'POST');
+    openBrowser(r.file || r.url);
+    if (process.env.CONDUCTOR_NO_OPEN !== '1') console.log('Opened the dashboard in your browser (the sign-in link works once).');
+  } catch (e) {
+    console.log(`Could not reach the running Conductor: ${errMsg(e)}`);
+  }
 }
 
 async function openCmd(): Promise<void> {
