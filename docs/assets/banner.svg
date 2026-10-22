@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" role="img" aria-label="Conductor: Claude plans, Cursor builds, Claude verifies">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1015"/>
+      <stop offset="1" stop-color="#1b212a"/>
+    </linearGradient>
+    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b8dff"/>
+      <stop offset="1" stop-color="#5eead4"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="300" rx="20" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="298" rx="19" fill="none" stroke="#28313d" stroke-width="2"/>
+
+  <!-- mark -->
+  <rect x="64" y="62" width="76" height="76" rx="18" fill="#6f72ff"/>
+  <path d="M88 112 L100 94 L110 104 L124 82" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="124" cy="82" r="6" fill="#fff"/>
+
+  <text x="164" y="104" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="54" font-weight="700" fill="#e8ecf2">Conductor</text>
+  <text x="166" y="136" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="22" fill="#9aa6b8">One dashboard. Claude plans. Cursor builds. Claude verifies.</text>
+
+  <!-- pipeline -->
+  <g font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="17" font-weight="600" fill="#e8ecf2" text-anchor="middle">
+    <rect x="64" y="190" width="170" height="52" rx="26" fill="#151a21" stroke="#3a4554"/>
+    <text x="149" y="222">Plan</text>
+    <rect x="262" y="190" width="170" height="52" rx="26" fill="#151a21" stroke="#3a4554"/>
+    <text x="347" y="222">Review</text>
+    <rect x="460" y="190" width="170" height="52" rx="26" fill="#151a21" stroke="#3a4554"/>
+    <text x="545" y="222">Build</text>
+    <rect x="658" y="190" width="170" height="52" rx="26" fill="#151a21" stroke="#3a4554"/>
+    <text x="743" y="222">Gates</text>
+    <rect x="856" y="190" width="170" height="52" rx="26" fill="#151a21" stroke="#3a4554"/>
+    <text x="941" y="222">Verify</text>
+    <rect x="1054" y="190" width="100" height="52" rx="26" fill="#6f72ff"/>
+    <text x="1104" y="222" fill="#fff">You</text>
+  </g>
+  <g stroke="url(#ac)" stroke-width="3" stroke-linecap="round">
+    <path d="M238 216 H258"/><path d="M436 216 H456"/><path d="M634 216 H654"/><path d="M832 216 H852"/><path d="M1030 216 H1050"/>
+  </g>
+  <text x="1136" y="94" font-family="ui-monospace,SF Mono,Menlo,monospace" font-size="15" fill="#5eead4" text-anchor="end">never pushes · never merges · local only</text>
+</svg>

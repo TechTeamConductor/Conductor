@@ -1,0 +1,106 @@
+{
+  "_note": "Recorded from claude 2.1.304 (signed in) on 2026-10-21 with Conductor's own child env (claudeEnv: no CLAUDE_CODE_ENTRYPOINT), argv = CLAUDE_DISCOVERY_ARGS, zero quota; reduced to an allow-list (S7): models + account placeholders + version. This is the list Conductor really sees.",
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "r1",
+    "response": {
+      "models": [
+        {
+          "value": "default",
+          "resolvedModel": "claude-opus-5-5",
+          "displayName": "Default (recommended)",
+          "description": "Opus 5.5 · Best for everyday, complex tasks",
+          "supportsEffort": true,
+          "supportedEffortLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supportsAdaptiveThinking": true,
+          "supportsFastMode": true,
+          "supportsAutoMode": true,
+          "supportsThinkingOff": false
+        },
+        {
+          "value": "opus",
+          "resolvedModel": "claude-opus-5-5",
+          "displayName": "Opus",
+          "description": "Opus 5.5 · Best for everyday, complex tasks",
+          "supportsEffort": true,
+          "supportedEffortLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supportsAdaptiveThinking": true,
+          "supportsFastMode": true,
+          "supportsAutoMode": true,
+          "supportsThinkingOff": false
+        },
+        {
+          "value": "claude-fable-5-1[1m]",
+          "resolvedModel": "claude-fable-5-1[1m]",
+          "displayName": "Fable",
+          "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks",
+          "supportsEffort": true,
+          "supportedEffortLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supportsAdaptiveThinking": true,
+          "supportsAutoMode": true,
+          "supportsThinkingOff": false
+        },
+        {
+          "value": "sonnet",
+          "resolvedModel": "claude-sonnet-5-5",
+          "displayName": "Sonnet",
+          "description": "Sonnet 5.5 · Efficient for routine tasks",
+          "supportsEffort": true,
+          "supportedEffortLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supportsAdaptiveThinking": true,
+          "supportsAutoMode": true,
+          "supportsThinkingOff": false
+        },
+        {
+          "value": "haiku",
+          "resolvedModel": "claude-haiku-5-5",
+          "displayName": "Haiku",
+          "description": "Haiku 5.5 · Fastest for quick answers",
+          "supportsEffort": true,
+          "supportedEffortLevels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supportsAdaptiveThinking": true,
+          "supportsAutoMode": true,
+          "supportsThinkingOff": false
+        }
+      ],
+      "account": {
+        "email": "PLACEHOLDER_EMAIL",
+        "organization": "PLACEHOLDER_ORGANIZATION",
+        "subscriptionType": "Claude Team",
+        "apiProvider": "firstParty"
+      },
+      "claude_code_version": "2.1.304"
+    }
+  }
+}

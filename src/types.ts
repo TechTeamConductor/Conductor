@@ -1,0 +1,748 @@
+/**
+ * Shared contract for Conductor. Every module and the HTTP API/UI are typed against this file.
+ * Erasable TypeScript only (no enums, no parameter properties) — Node strips types at runtime.
+ */
+
+// ───────────────────────────── primitives ─────────────────────────────
+import type { ProviderId } from './agents/providers/types.ts';
+import type { Roles } from './agents/roles.ts';
+import type { LimitRule } from './accounts/limit-rule.ts';
+import type { Accounts, AccountRef } from './accounts/types.ts';
+export type { ProviderId };
+export type StageName = 'plan' | 'plan_review' | 'build' | 'verify';
+export type Severity = 'blocker' | 'major' | 'minor' | 'nit';
+export type Complexity = 'S' | 'M' | 'L';
+
+/** Where the run currently is in its lifecycle (local source of truth for execution facts). */
+export type RunStatus =
+  | 'queued' // claimed, waiting for a worker slot
+  | 'running' // a stage job is executing
+  | 'awaiting_approval' // plan ready, waiting for the human's Approve
+  | 'needs_human' // blocked; human must act (see needsHuman)
+  | 'paused' // provider usage limit; auto-resumes at pausedUntil
+  | 'parked' // human moved the card to Backlog; hold, do nothing
+  | 'ready' // verified; waiting for human to review/merge
+  | 'aborted' // human cancelled/removed the trigger
+  | 'failed' // infrastructure failure (retried by the poller)
+  | 'finished'; // human marked the card done
+
+/** The next step the engine will execute for a run. */
+export type NextStep = 'plan' | 'plan_review' | 'approval' | 'build' | 'verify' | 'none';
+
+/** Dashboard board column (derived server-side so the UI stays dumb). */
+export type BoardColumn =
+  | 'queued'
+  | 'planning'
+  | 'plan_ready'
+  | 'building'
+  | 'verifying'
+  | 'needs_human'
+  | 'paused'
+  | 'ready'
+  | 'closed';
+
+// ───────────────────────────── LLM structured outputs ─────────────────────────────
+export interface PlanAC {
+  id: string; // "AC1"
+  text: string;
+  verification: string; // test / command / observable behaviour
+}
+export interface PlanFile {
+  path: string;
+  action: 'create' | 'modify' | 'delete' | 'rename';
+  change: string;
+  reason: string;
+}
+export interface Plan {
+  summary: string;
+  blocked: { is: boolean; questions: string[] };
+  assumptions: string[];
+  currentState: string;
+  expectedState: string;
+  acceptanceCriteria: PlanAC[];
+  filesToChange: PlanFile[];
+  steps: string[];
+  testing: { commands: string[]; cases: string[] };
+  risks: string[];
+  coverage: { requirement: string; change: string; verification: string }[];
+  complexity: Complexity;
+  /** 'answer' = the task is a question/analysis that needs no code change: `answer` is the deliverable. Default 'code'. */
+  deliverable?: 'code' | 'answer';
+  answer?: string;
+  /** Optional decomposition (M3). A graph of fewer than 2 items is treated as no graph. */
+  taskGraph?: { items: PlanItem[] };
+}
+/** One planned unit of work. `files` are advisory for scope (build-class items only; ⊆ plan.filesToChange). */
+export interface PlanItem {
+  id: string; // T1, T2 …
+  title: string;
+  role: string; // implementation | documentation (build-class) · requirements | architecture | context (analysis-class); validated semantically
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[]; // acceptance-criterion ids this item satisfies
+  verification: string[];
+  parallelGroup?: string; // recorded for later parallel work; never used to schedule builds in v2.0
+}
+/** Stored item states. `ready` is DERIVED (pending with every dependency done), never stored. */
+export type ItemState = 'pending' | 'running' | 'done' | 'failed' | 'blocked';
+export interface ItemRun {
+  id: string;
+  /** Board key of this item's subtask card (null until the `subtasks` effect has created it). */
+  key: string | null;
+  title: string;
+  role: string;
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[];
+  verification: string[];
+  state: ItemState;
+  loop: number;
+  loopBudget: number;
+  agentRuns: number; // informational: Run.agentRuns governs budgets
+  /** HEAD before this item's builder started, and the per-attempt nonce its commit message must carry (crash adoption). */
+  startHead?: string;
+  nonce?: string;
+  /** Gate-regression / hook feedback for this item's next attempt (deterministic tool output, capped). */
+  feedback?: string;
+  /** HEAD before this item's FIRST attempt: a failed item's commits are backed up and the branch is reset here, so independent items continue on good code. */
+  floor?: string;
+  commitSha?: string;
+  note?: string;
+}
+export interface TaskGraphRun {
+  items: ItemRun[];
+  /** Plan revision this graph belongs to (a re-plan discards it). */
+  rev: number;
+  startedAt: number;
+  final: 'pending' | 'verifying' | 'done';
+}
+export interface PlanReview {
+  decision: 'approved' | 'changes_requested';
+  summary: string;
+  issues: { severity: 'blocking' | 'suggestion'; text: string }[];
+}
+export interface VerdictAC {
+  id: string;
+  status: 'met' | 'not_met' | 'unverifiable';
+  evidence: string;
+}
+export interface Bug {
+  title: string;
+  severity: Severity;
+  file?: string;
+  line?: number;
+  evidence: string;
+  repro?: string;
+  suggestedFix?: string;
+}
+export interface Verdict {
+  verdict: 'pass' | 'fail';
+  summary: string;
+  acceptance: VerdictAC[];
+  bugs: Bug[];
+}
+
+// ───────────────────────────── gates ─────────────────────────────
+export interface GateDef {
+  name: string; // "test", "lint", "typecheck"
+  cmd: string; // shell command line, run with `sh -c` in the worktree (repo-owned, user-registered)
+  kind: 'typecheck' | 'lint' | 'test' | 'build' | 'other';
+}
+export interface GateResult {
+  name: string;
+  cmd: string;
+  exitCode: number | null; // null when killed/timed out
+  timedOut: boolean;
+  durationMs: number;
+  outputTail: string; // redacted, last ~8 KB
+  /** Parsed failure keys (no line/column numbers — C2). null = output not parseable. */
+  failures: string[] | null;
+  failureCount: number | null;
+}
+export interface GateRun {
+  at: number;
+  sha: string; // commit the gates ran against
+  results: GateResult[];
+}
+export interface GateComparison {
+  /** Gate failed now with failure keys that were not failing at baseline (or baseline passed). */
+  regressions: { gate: string; newFailures: string[]; note?: string }[];
+  /** Gate failing at baseline with no new failure keys. */
+  preExisting: string[];
+  /** Gate failing at baseline whose output isn't parseable: regressions cannot be excluded. */
+  unverified: string[];
+  passed: string[];
+}
+
+// ───────────────────────────── events / logs ─────────────────────────────
+export type LogKind = 'system' | 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'result' | 'note';
+export interface LogEvent {
+  seq: number; // per-run monotonically increasing
+  ts: number;
+  agent: ProviderId | 'conductor';
+  stage: StageName | 'setup' | 'engine';
+  kind: LogKind;
+  text?: string; // redacted, truncated
+  tool?: string;
+  ok?: boolean;
+  sessionId?: string;
+}
+
+// ───────────────────────────── run record ─────────────────────────────
+export interface SessionRec {
+  id: string; // agent session id (uuid) — used for resume commands
+  agent: ProviderId;
+  stage: StageName;
+  loop: number;
+  rev: number;
+  startedAt: number;
+  endedAt?: number;
+  status: 'running' | 'ok' | 'error' | 'limit' | 'aborted' | 'timeout';
+  costUsd?: number;
+  model?: string;
+  cliVersion?: string;
+}
+export interface BugRec {
+  fp: string; // fingerprint: sha1(normalised title + file)
+  title: string;
+  severity: Severity;
+  file?: string;
+  detail: string; // markdown body used for the sub-issue
+  status: 'open' | 'closed';
+  itemId?: string; // the board item (kind 'bug') filed for this finding
+  itemKey?: string;
+  loops: number[]; // loops in which it was observed
+  graphItem?: string; // the plan item whose commit last touched `file` (task graphs only; see Stages.attributeBugs)
+}
+export interface EffectRec {
+  status: 'pending' | 'done';
+  refId?: string; // id of the board entity the effect produced (comment / bug item)
+  kind: 'comment' | 'subissue' | 'state' | 'close' | 'subtask' | 'subtask-cancel';
+  payload?: unknown; // everything needed to (re)apply the effect idempotently (already redacted)
+  attempts: number; // failures so far (reporting + back-off only; a local write cannot half-fail)
+  lastError?: string;
+}
+export interface HistoryLine {
+  ts: number;
+  text: string;
+}
+export interface Run {
+  /** On-disk data version of this record (see src/schema). Stamped on every write; absent in legacy files = 1 (migrated in memory to 2). */
+  schemaVersion?: number;
+  /** Fields carried over from a v1 (Linear) run, kept verbatim and never interpreted. */
+  legacy?: Record<string, unknown>;
+  key: string; // board key, e.g. "APP-12"
+  itemId: string; // board item id
+  title: string;
+  description: string; // snapshot at claim; a later edit halts the run at the next stage boundary
+  descHash: string;
+  repo: string; // RepoConfig.name
+  branch: string; // conductor-v2/<key-lower>
+  worktree: string;
+  baseSha: string;
+  commitSha?: string;
+  status: RunStatus;
+  next: NextStep;
+  stage: StageName | null; // current or last stage
+  loop: number; // 1-based build/verify loop
+  loopBudget: number; // max loop number allowed before needs_human
+  rev: number; // plan revision
+  agentRuns: number; // counts toward maxAgentRunsPerIssue
+  createdAt: number;
+  updatedAt: number;
+  stageStartedAt?: number;
+  pausedUntil?: number;
+  pauseReason?: string;
+  parkedFrom?: RunStatus;
+  needsHuman?: { reason: string; origin: NextStep; at: number };
+  unverified: boolean; // no gates, or gates unparseable for regressions
+  unverifiedWhy?: string;
+  guardEnvOnly: boolean; // the builder's own guard could not be written (e.g. a tracked .cursor/cli.json): protection is the git env alone
+  guardSha?: string; // sha256 of the provider's guard artefact written for the build
+  /** Source text was never verified (e.g. imported from another system): the plan always waits for human approval. */
+  untrusted?: boolean;
+  planApproved: boolean;
+  approvedBy?: 'auto' | 'human';
+  planReviewDone: boolean;
+  planReviewRounds: number; // revisions requested by plan review so far
+  answered?: boolean; // deliverable was an answer (no code); finished without build/verify
+  limitStreak?: number; // consecutive usage-limit rejections (back-off); reset on any successful agent call
+  limitEpisode?: number; // increments when a new limit streak starts (one board comment/notification per episode)
+  buildFails?: number; // consecutive failed Cursor build attempts in the current stage
+  feedback?: string; // reviewer/human feedback to include in the next plan prompt
+  commitNote?: string; // repo-hook output from a failed commit, fed to the fix prompt
+  lockfileHash?: string; // last installed lockfile hash (re-install when it changes)
+  lastError?: string;
+  complexity?: Complexity;
+  /** What Conductor last projected onto the board. */
+  expected: { written?: boolean; stage?: string };
+  sessions: SessionRec[];
+  bugs: BugRec[];
+  effects: Record<string, EffectRec>;
+  costUsd: number;
+  verdict: 'pass' | 'fail' | null;
+  history: HistoryLine[];
+  lastEventSeq: number;
+  /** Conversation comments already consumed into prompts (board comment ids). */
+  commentsSeen: string[];
+  /** Task-graph execution state (M3); absent for a plan without a graph. */
+  graph?: TaskGraphRun;
+  /** `status:rev:loop` of the last outcome digest written to the project's history (M4) — makes the digest idempotent. */
+  digestMark?: string;
+  /** Why the plan is waiting for approval, and the risk-rule hits that need an explicit confirmation (M6). */
+  holdReasons?: string[];
+  risks?: { rule: string; detail: string }[];
+  /**
+   * M8-4: the current hold is FORCED (large change, protected files, unverified source, more than 8 tasks) — no setting or run mode
+   * removes it. Written by the approval gate on hold, cleared on approval. ABSENT means forced (a run held before M8-4): no loader or
+   * migration defaults it to `false`.
+   */
+  forcedHold?: boolean;
+  /** Started from a Quick Ask with "make this change if it is small" ticked (M5): plan review is skipped, approval is NOT (see Stages.approvalGate). Assigned by server code only. */
+  fastPath?: boolean;
+  /** Offline bookkeeping (M4): pause episodes and the cumulative time spent offline. */
+  offline?: { episodes: number; streak: number; totalMs: number; pausedAt?: number };
+  /** Timestamps of human-initiated restarts (rolling limit against restart loops). */
+  restartTimes?: number[];
+  /** M8-3: the account the current (or last) stage ran on — label only, never a path. */
+  account?: AccountRef & { name: string };
+  /** M8-3: the last automatic move (static wording + labels + the real skip reason, N5). */
+  moved?: RunMove;
+  /** M8-3 (B3c): why a `paused` run waits. Absent on records written before M8-3 (treated as a limit unless the reason is `offline`). */
+  pauseKind?: 'limit' | 'offline';
+  /** M8-3 (B3b): limit episodes that ENDED IN A PAUSE (successful switches never count); > 6 ⇒ needs_human. */
+  limitPauses?: number;
+  /** The episode already counted in `limitPauses` (an episode is counted once). */
+  limitPausedEpisode?: number;
+}
+
+export interface RunMove {
+  kind: 'account' | 'tool';
+  /** true when a running stage started again on the next account/tool (build limit, removed account). */
+  restarted: boolean;
+  note: string;
+  at: number;
+  /** N5: the real reason (`Skipped.kind`): 'limit' | 'auth' | 'missing' | 'removed' | … — F5 shows "Switched" only for a limit. */
+  reason?: string;
+}
+
+// ───────────────────────────── config ─────────────────────────────
+export interface RepoConfig {
+  name: string; // unique; used for `repo:<name>` label / project mapping
+  path: string; // realpath of git toplevel
+  baseBranch: string;
+  gates: GateDef[];
+  setup?: string; // dependency install command (auto-detected if absent)
+  copyFiles: string[]; // git-ignored env files to copy into worktrees (e.g. ".env.local")
+  envPassthrough: string[]; // extra env var names that gates/deps may receive
+}
+export interface Config {
+  version: number;
+  /** Unknown top-level keys found on disk (e.g. written by a newer build) — preserved verbatim on save, never interpreted. */
+  extra?: Record<string, unknown>;
+  ui: { port: number; openBrowser: boolean };
+  /** Carried over from older configs (e.g. the v1 `linear` block), kept verbatim and never interpreted. */
+  legacy?: Record<string, unknown>;
+  repos: RepoConfig[];
+  agents: {
+    claude: {
+      bin: string;
+      isolation: 'safe-mode' | 'setting-sources';
+      maxTurns: { plan: number; review: number; verify: number };
+    };
+    cursor: { bin: string };
+    /** Codex CLI (read-only roles only in M2). */
+    codex: { bin: string };
+  };
+  /**
+   * "Default model for each tool" (config v6, M8-2): replaces v5's `agents.<tool>.model`. Absent = the tool chooses. For Cursor `model` is
+   * a discovered family (or, with `custom`, a listed id). Re-validated at use; never trusted as argv-safe just because it is stored.
+   */
+  toolModels: Partial<Record<ProviderId, { model: string; custom?: true }>>;
+  /** M8-3 (config v7): ordered accounts per tool; `default` = the user's own sign-in (today's env). Metadata only — never a secret or a path. */
+  accounts: Accounts;
+  /** Roles → ordered provider chains (config v4). Replaces v3's `stages` + `pipeline.onClaudeLimit`, which are derived for the dashboard (see Settings). */
+  roles: Roles;
+  pipeline: {
+    maxParallel: number;
+    maxLoops: number;
+    maxAgentRunsPerIssue: number;
+    planApproval: 'auto' | 'manual' | 'first'; // 'first' = manual for the first plan per repo
+    planReview: 'off' | 'auto' | 'always'; // 'auto' = only complexity M/L
+    failOn: Severity[];
+    noGates: 'warn' | 'block';
+    /** Task graph (M3): item ceiling (1–12; 12 is a hard v2.0 limit), concurrent analysis-item calls (1–4) and an optional AI check per item. */
+    maxItems: number;
+    readOnlyParallel: number;
+    /** Opt-in module summaries per local day (1–48; the ceiling is a code constant). */
+    contextRunsPerDay: number;
+    /** Quick Ask / Research limits (ceilings are code constants in src/limits/budget.ts). */
+    asksPerHour: number;
+    /** Deep Research runs per local day (ceiling 20 in code). */
+    researchPerDay: number;
+    /** "Design the work" / research-brief calls per hour (M8-6; 1–30, ceiling 30 in code). */
+    designPerHour: number;
+    /** Global approval policy default (M6). `full-auto` = v1 behaviour. */
+    policy: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
+    /** RESERVED: accepted and clamped, not used yet (per-task AI verification is not implemented; the whole change is verified once). */
+    verifyEachItem: boolean;
+    /** M8-3 (config v7, contract C1): what happens at a usage limit. Read ONLY through `effectiveLimitRule` (src/accounts/limit-rule.ts). */
+    limitRule: LimitRule;
+    /**
+     * M8-4 (contract C3): one global overlay. `complete-auto` makes the EFFECTIVE approval policy `full-auto` (first-plan and risk holds
+     * off) and the effective limit rule `switch`; forced holds never change and stored settings are never written. Read only through
+     * `isCompleteAuto` (exact equality: anything else is Per settings). Additive, no config version of its own.
+     */
+    runMode: 'per-settings' | 'complete-auto';
+    /** M8-4 N11: when the run mode last changed (epoch ms); written only by `PUT /api/run-mode`. */
+    runModeChangedAt?: number;
+    timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
+  };
+  /** Per-project settings keyed by board project key (config v5). */
+  projects: Record<string, ProjectSettings>;
+  worktreeRoot?: string;
+}
+/** Per-project settings (config v5). One record per board project key; M6 adds `policy` and `limits` here. */
+export interface ProjectContextSettings {
+  /** Opt-in LLM module summaries (spends quota). Off by default. */
+  summaries: boolean;
+  /** A context older than this many days reports stale. */
+  staleDays: number;
+  /** Size budget of a context pack in bytes (hard ceiling 32 KB). */
+  packBytes: number;
+}
+export interface ProjectSettings {
+  /** Approval policy (M6); absent ⇒ the global `pipeline.policy`. */
+  policy?: 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
+  context?: ProjectContextSettings;
+}
+/** Subset of Config editable from the dashboard. */
+export interface Settings {
+  planApproval: Config['pipeline']['planApproval'];
+  planReview: Config['pipeline']['planReview'];
+  maxLoops: number;
+  maxParallel: number;
+  /** Derived from `roles` (compat layer): 'cursor' iff Cursor follows Claude in the planning chain. */
+  onClaudeLimit: 'wait' | 'cursor';
+  noGates: Config['pipeline']['noGates'];
+  /** Derived from `roles`: the first claude|cursor provider of the planning / review / verification chains. */
+  stages: { plan: 'claude' | 'cursor'; review: 'claude' | 'cursor'; verify: 'claude' | 'cursor' };
+  /** M8-3 (C1): the stored limit rule, and the rule in effect (`effectiveLimitRule`). PUT accepts `limitRule` only. */
+  limitRule: LimitRule;
+  limitRuleEffective: LimitRule;
+  /** M8-4 (C4): the stored run mode. Changed ONLY through `PUT /api/run-mode`; `PUT /api/settings` refuses it. */
+  runMode: Config['pipeline']['runMode'];
+  /** M8-4 (C4): the settings the run mode currently overrides: empty under Per settings, all three under Complete auto. */
+  overriddenByRunMode: Array<'planApproval' | 'policy' | 'limitRule'>;
+}
+
+// ───────────────────────────── agents ─────────────────────────────
+export interface LimitInfo {
+  provider: ProviderId;
+  /** M8-3: the account the CALLER ran (never taken from provider output). Missing on a limit pause is a programming error. */
+  account?: string;
+  resetsAt: number | null; // epoch ms; null = unknown (use backoff)
+  kind?: string; // 'seven_day' | 'five_hour' | 'unknown'
+  message: string;
+}
+export interface AgentResult {
+  ok: boolean;
+  text: string; // final assistant text (redacted)
+  json?: unknown; // parsed structured output (unvalidated)
+  sessionId?: string;
+  costUsd?: number;
+  model?: string;
+  cliVersion?: string;
+  turns?: number;
+  exitCode: number | null;
+  error?: string;
+  errorKind?: 'limit' | 'auth' | 'max_turns' | 'timeout_idle' | 'timeout_hard' | 'aborted' | 'isolation' | 'spawn' | 'agent' | 'parse' | 'network';
+  limit?: LimitInfo;
+  /** Deep Research: what the session actually fetched/searched, taken from the tool events (never from model text). */
+  observed?: { read: string[]; listed: string[]; queries: string[] };
+  quota?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; status?: string };
+  /** M8-2 (S10): the CLI itself rejected the model — no result event, its own stderr says so. A boolean only; nothing else is kept. */
+  cliRejectedModel?: true;
+}
+
+// ───────────────────────────── HTTP API shapes (see docs/API.md) ─────────────────────────────
+export interface AgentHealth {
+  found: boolean;
+  version?: string;
+  ok: boolean;
+  loggedIn?: boolean;
+  detail?: string;
+  /** `broken-install`: the launcher exists but the program does not run (e.g. a shim whose native binary is missing). */
+  state?: 'missing' | 'broken-install' | 'ok';
+}
+export interface ApiProvider {
+  id: ProviderId;
+  label: string;
+  /** What the CLI said (redacted, truncated). */
+  state: 'ok' | 'missing' | 'broken-install' | 'not-logged-in' | 'unknown';
+  version?: string;
+  detail?: string;
+  /** A fixed instruction per provider — never CLI-originated text. Conductor never runs it. */
+  hint: string;
+  capabilities: { readOnly: boolean; build: boolean; buildIsolationVerified: boolean };
+  /** Read-only isolation tier: how much to trust it for read-only roles. */
+  tier: 'verified' | 'partial' | 'unverified' | 'blocked';
+  /** What backs the build isolation (display only): the code baseline or a re-verification record, and whether it matches the installed version. */
+  buildVerification?: { source: 'baseline' | 'live-suite'; verifiedOn: string; grandfathered: boolean; current: boolean | null };
+  /** Result of the last Codex isolation check, bound to the installed version (display only). */
+  isolationCheck?: { verdict: 'pass' | 'blocked' | 'inconclusive'; at: number; current: boolean; /** false until the canary's matchers have been validated against a real Codex transcript: a pass is then shown but does not lift the tier */ trusted: boolean };
+  /** The provider appears in at least one role chain. */
+  inUse: boolean;
+  /** Paused by a usage limit until this time (epoch ms). */
+  pausedUntil: number | null;
+}
+/** GET /api/roles `roles[r]` (M8-2): every PUT-accepted key, always present (null/false when unset) — PUT-round-trippable (R2-N4). */
+export interface ApiRoleEntry {
+  providers: ProviderId[];
+  autoByComplexity: Partial<Record<'S' | 'M' | 'L', ProviderId>> | null;
+  tool: ProviderId | null;
+  model: string | null;
+  custom: boolean;
+  effort: string | null;
+  fast: boolean;
+  thinking: boolean;
+}
+export interface ApiRoleView {
+  tool: ProviderId;
+  runsAs: string;
+  who: string;
+  status: 'ok' | 'no-longer-available' | 'list-unavailable' | 'not-in-list' | 'other-tool' | 'signed-out';
+  notes: string[];
+}
+export interface ApiToolModels {
+  effortLabel: string;
+  levels: { value: string; label: string }[];
+  state: 'reading' | 'fresh' | 'stale' | 'unavailable';
+  refreshing: boolean;
+  fetchedAt: number | null;
+  reason?: string;
+  defaultLabel: string;
+  defaultEfforts: string[] | null;
+  customEfforts: string[] | null;
+  customEffortHint: string;
+  options: { value: string; label: string; efforts: string[] | null; hasBase: boolean; fast: boolean; thinking: boolean; noZdr: boolean }[];
+}
+export interface ApiRoles {
+  roles: Record<string, ApiRoleEntry>;
+  /** For each role and provider: may it be assigned, and if not, why (human words). */
+  choices: Record<string, Record<string, { ok: boolean; reason?: string; needsAck?: boolean }>>;
+  needs: Record<string, { build?: true; research?: true }>;
+  toolModels: Record<ProviderId, { model: string | null; custom: boolean }>;
+  roleViews: Record<string, ApiRoleView>;
+  rows: { id: string; roles: string[] }[];
+  /** Static wording only — never the old value (B3b, S4a/S4c). */
+  legacyNotices: { tool: ProviderId; message: string }[];
+  models: Record<ProviderId, ApiToolModels>;
+}
+/** One task of a run's graph, as the dashboard shows it (strings were redacted when the plan was stored). */
+export interface ApiGraphItem {
+  id: string;
+  key: string | null;
+  title: string;
+  role: string;
+  objective: string;
+  dependsOn: string[];
+  files: string[];
+  criteria: string[];
+  state: ItemState | 'ready';
+  loop: number;
+  loopBudget: number;
+  commitSha: string | null;
+  note: string | null;
+}
+export interface ApiGraph {
+  rev: number;
+  final: TaskGraphRun['final'];
+  items: ApiGraphItem[];
+}
+export interface ApiGraphProgress {
+  total: number;
+  done: number;
+  running: number;
+  failed: number;
+  blocked: number;
+}
+export interface ApiRunSummary {
+  key: string;
+  title: string;
+  url: string;
+  repo: string;
+  status: RunStatus;
+  column: BoardColumn;
+  stage: StageName | null;
+  next: NextStep;
+  /** Human sentence, e.g. "Claude is planning · 2m 14s". */
+  activity: string;
+  agent: ProviderId | null; // who is working right now
+  loop: number;
+  maxLoops: number;
+  rev: number;
+  branch: string;
+  startedAt: number;
+  updatedAt: number;
+  stageStartedAt: number | null;
+  pausedUntil: number | null;
+  needsHuman: { reason: string; origin: NextStep } | null;
+  unverified: boolean;
+  costUsd: number;
+  bugsOpen: number;
+  verdict: 'pass' | 'fail' | null;
+  canApprove: boolean;
+  canRetry: boolean;
+  canAbort: boolean;
+  canCleanup: boolean;
+  canPark: boolean; // move the card to Backlog
+  canFinish: boolean; // mark it done
+  /** Progress of the task graph, when the run has one. */
+  taskProgress?: ApiGraphProgress;
+  /** M8-3: the account of the current/last stage, and the last automatic move. */
+  account?: { provider: ProviderId; id: string; name: string } | null;
+  moved?: RunMove | null;
+  /** M8-4 (C4/N3c): while `awaiting_approval`, the hold is forced (absent on the run counts as forced); `false` otherwise. */
+  forcedHold: boolean;
+  /** M8-4 (N3c): while `awaiting_approval`, the plan has risk-rule hits that need the per-card confirmation; `false` otherwise. */
+  risky: boolean;
+}
+export interface ApiSession extends SessionRec {
+  resumeCommand: string; // e.g. `cd '/path' && claude --resume <id>`
+}
+export interface ApiBug extends BugRec {}
+/** A card on the board that has NO run (Backlog / To do): shown as a plain card with Start / Park / Cancel. */
+export interface ApiCard {
+  key: string;
+  title: string;
+  lane: string;
+  kind: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Why Conductor is not running it (e.g. waiting for a dependency), when known. */
+  note?: string;
+}
+export interface ApiNote {
+  id: string;
+  author: 'user' | 'conductor';
+  body: string;
+  ts: number;
+}
+export interface ApiRunDetail extends ApiRunSummary {
+  notes: ApiNote[];
+  description: string;
+  worktree: string;
+  baseSha: string;
+  commitSha: string | null;
+  complexity: Complexity | null;
+  sessions: ApiSession[];
+  plan: Plan | null;
+  planMarkdown: string | null;
+  planReview: PlanReview | null;
+  verdicts: { loop: number; verdict: Verdict }[];
+  gates: {
+    baseline: GateRun | null;
+    loops: { loop: number; run: GateRun; comparison: GateComparison }[];
+  };
+  bugs: ApiBug[];
+  timeline: HistoryLine[];
+  diffStat: string | null;
+  noPushEnvOnly: boolean;
+  unverifiedWhy: string | null;
+  /** Why the plan waits for approval, and the risky steps that need an explicit confirmation (M6). */
+  holdReasons: string[];
+  risks: { rule: string; detail: string }[];
+  /** The task graph (items, states, dependencies, commits), or null for a single-task run. */
+  graph: ApiGraph | null;
+}
+export interface ApiQuota {
+  claude?: { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean };
+}
+export interface ApiEngine {
+  /** M8-4 (C4): the global run mode, live over SSE so a second tab's board header follows; and when it last changed (N11). */
+  runMode: Config['pipeline']['runMode'];
+  runModeChangedAt: number | null;
+  /** Cards Conductor deliberately does not run (e.g. in a Conductor-owned lane without a run), with the reason. */
+  ignored?: { key: string; reason: string }[];
+  /** Set when the board cannot be written (disk full, journal refused): effects stop retrying every tick until it recovers. */
+  storageProblem?: string | null;
+  /** The connectivity probe's last verdict is "offline" (M4). */
+  offline?: boolean;
+  paused: boolean;
+  pauseReason?: string;
+  providerPause: Partial<Record<ProviderId, { until: number; reason: string }>>;
+  running: number;
+  maxParallel: number;
+  /** Last time the engine looked at the board. */
+  lastPollAt: number | null;
+  lastPollError: string | null;
+  pollSeconds: number;
+}
+export interface ApiSetupStep {
+  id: 'agents' | 'repo';
+  label: string;
+  ok: boolean;
+  detail?: string;
+}
+export interface ApiRepo {
+  name: string;
+  path: string;
+  baseBranch: string;
+  gates: GateDef[];
+  approvedPlans: number;
+  noGates: boolean;
+  warnings: string[];
+}
+export interface ApiState {
+  now: number;
+  version: string;
+  csrf: string;
+  setup: { complete: boolean; steps: ApiSetupStep[] };
+  health: {
+    claude: AgentHealth;
+    cursor: AgentHealth;
+    codex: AgentHealth;
+    warnings: string[];
+  };
+  providers: ApiProvider[];
+  quota: ApiQuota;
+  engine: ApiEngine;
+  settings: Settings;
+  repos: ApiRepo[];
+  runs: ApiRunSummary[];
+  cards: ApiCard[];
+  /** M8-3: every account of every tool, in order (the field M8-U feature-detects). */
+  accounts?: AccountView[];
+  /**
+   * M8-5: plans in `awaiting_approval` right now. `eligible` is exactly what "Approve waiting plans" may send
+   * (titles redacted). Also on SSE `state` merges.
+   */
+  waiting?: { total: number; bulkApprovable: number; eligible: { key: string; rev: number; title: string }[] };
+  /** M8-6 C1 (additive): Home composer features — "Design the work" and the research brief — and the counters it shows. */
+  home?: { design: true; researchBrief: boolean; limits: { designPerHour: number; designUsed: number; researchPerDay: number; researchUsed: number } };
+}
+/** M8-3 §2.7 — an allow-listed view (S12): no path, no email, no secret. */
+export interface AccountView {
+  provider: ProviderId;
+  id: string;
+  name: string;
+  order: number;
+  isDefault: boolean;
+  status: 'ready' | 'in-use' | 'at-limit' | 'not-signed-in' | 'not-installed' | 'checking' | 'unknown' | 'unavailable';
+  until?: number;
+  untilKind?: 'reset' | 'retry';
+  plan?: string;
+  usage?: { utilization7d?: number; utilization5h?: number; resetsAt?: number };
+  checkedAt?: number;
+  inUse: number;
+  buildReady?: boolean;
+  signInCommand: string;
+  /** A short static reason (e.g. why it is unavailable). */
+  note?: string;
+}
+export interface ApiError {
+  error: { code: string; message: string };
+}

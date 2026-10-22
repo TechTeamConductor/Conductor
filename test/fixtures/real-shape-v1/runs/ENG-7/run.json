@@ -1,0 +1,46 @@
+{
+  "key": "ENG-7",
+  "issueId": "issue-0000",
+  "teamId": "team-0000",
+  "title": "Example question",
+  "description": "repo: demo-app\n\nWhat is the best feature?",
+  "descHash": "abc",
+  "url": "https://linear.app/example/issue/ENG-7",
+  "repo": "demo-app",
+  "branch": "conductor/eng-7",
+  "worktree": "",
+  "baseSha": "ee951e11bb",
+  "loopBudget": 3,
+  "status": "needs_human",
+  "next": "none",
+  "stage": "build",
+  "loop": 1,
+  "rev": 1,
+  "agentRuns": 0,
+  "createdAt": 1792501883151,
+  "updatedAt": 1792501883151,
+  "unverified": false,
+  "noPushEnvOnly": false,
+  "planApproved": false,
+  "planReviewDone": false,
+  "planReviewRounds": 0,
+  "expected": {},
+  "sessions": [],
+  "bugs": [],
+  "effects": {},
+  "costUsd": 0,
+  "verdict": null,
+  "history": [
+    {
+      "ts": 1792501883151,
+      "text": "Claimed by Conductor"
+    }
+  ],
+  "lastEventSeq": 0,
+  "commentsSeen": [],
+  "needsHuman": {
+    "reason": "The builder finished without changing any files.",
+    "origin": "build",
+    "at": 1700000000000
+  }
+}

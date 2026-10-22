@@ -1,0 +1,18 @@
+node_modules
+.DS_Store
+*.log
+.conductor/
+.claude/
+.conductor-worktrees/
+coverage/
+.env
+.env.*
+!.env.example
+desktop/node_modules/
+desktop/payload/
+desktop/dist/
+
+# internal planning, reviews and agent notes stay local, not in the product repo
+/.techteam/
+/CLAUDE.md
+release-assets/

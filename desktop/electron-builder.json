@@ -1,0 +1,65 @@
+{
+  "appId": "io.techtorch.conductor",
+  "productName": "Conductor",
+  "directories": {
+    "output": "dist",
+    "buildResources": "build"
+  },
+  "files": [
+    "main.cjs",
+    "package.json",
+    "payload/**/*"
+  ],
+  "asar": true,
+  "asarUnpack": [
+    "payload/prompts/**",
+    "payload/ui/**"
+  ],
+  "mac": {
+    "target": [
+      {
+        "target": "dmg",
+        "arch": [
+          "arm64"
+        ]
+      }
+    ],
+    "category": "public.app-category.developer-tools",
+    "identity": null,
+    "hardenedRuntime": false,
+    "gatekeeperAssess": false,
+    "artifactName": "Conductor-${version}-${arch}.${ext}"
+  },
+  "dmg": {
+    "title": "Conductor",
+    "sign": false
+  },
+  "electronFuses": {
+    "runAsNode": false,
+    "enableCookieEncryption": true,
+    "enableNodeOptionsEnvironmentVariable": false,
+    "enableNodeCliInspectArguments": false,
+    "onlyLoadAppFromAsar": true,
+    "enableEmbeddedAsarIntegrityValidation": true,
+    "grantFileProtocolExtraPrivileges": false
+  },
+  "afterSign": "after-pack.cjs",
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "artifactName": "Conductor-${version}-${arch}-setup.${ext}",
+    "signAndEditExecutable": false
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  }
+}

@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # TypeScript 7 changes tsc's output, which the gate parser reads (test/git/gates.test.ts "real tsc" fails);
+      # @types/node must stay on the oldest supported Node (22.x), not the newest.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: /desktop
+    schedule:
+      interval: weekly

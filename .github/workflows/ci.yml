@@ -1,0 +1,40 @@
+# Type-check and test. Runs on every pull request and is reused by the release workflow before anything is built.
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # one run per PR (newer pushes cancel older ones); called-from-release runs are unique and never cancelled
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Check and test (macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Require Node 22.18+ (TypeScript type stripping)
+        run: node -e "const [a,b]=process.versions.node.split('.').map(Number); if (a<22||(a===22&&b<18)) { console.error('Node '+process.versions.node+' is too old, need >=22.18'); process.exit(1); }"
+      - name: Git identity for tests that create commits
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+        env:
+          CI: '1'

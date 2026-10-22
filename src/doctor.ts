@@ -1,0 +1,235 @@
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import type { AgentHealth, Config, ProviderId } from './types.ts';
+import { createProviders } from './agents/providers/registry.ts';
+import { legacyModelNotices, resolveBin } from './config.ts';
+import { toolDefaultResolved } from './models/select.ts';
+import { claudeEnv, cursorEnv } from './agents/env.ts';
+import { buildClaudeArgs, checkClaudeInit, runClaude } from './agents/claude.ts';
+import { runCursor } from './agents/cursor.ts';
+import { runProcess } from './agents/spawn.ts';
+import { assertClaudeConfigDirSafe, ClaudeSettingsError, withProjectSettingsNeutralized } from './agents/claude-settings.ts';
+import { scanAncestors } from './git/worktree.ts';
+import { KeychainStore } from './secrets.ts';
+import { errMsg, systemClock, truncate } from './util.ts';
+
+export interface Check {
+  id: string;
+  label: string;
+  level: 'ok' | 'warn' | 'fail';
+  detail: string;
+}
+
+const cache = new Map<string, { at: number; value: AgentHealth }>();
+
+async function cliOut(bin: string, args: string[], env: Record<string, string>): Promise<{ code: number | null; out: string }> {
+  const r = await runProcess({ bin, args, cwd: process.cwd(), env, idleMs: 20_000, hardMs: 20_000 });
+  return { code: r.code, out: (r.stdoutTail + r.stderrTail).trim() };
+}
+
+/**
+ * Zero-quota health of a provider CLI, composed from the provider's own `detect()` + `auth()` (one interface for all three: found / version /
+ * signed in, nothing that reaches a model). Cached 60 s. A launcher whose program does not run is `broken-install` (found: false) with a fixed
+ * hint — Conductor only reports it and never installs or repairs anything.
+ */
+export async function agentHealth(cfg: Config, which: ProviderId, force = false): Promise<AgentHealth> {
+  const binName = cfg.agents[which].bin;
+  const hit = cache.get(`${which}:${binName}`);
+  if (!force && hit && Date.now() - hit.at < 60_000) return hit.value;
+  const p = createProviders({ getConfig: () => cfg, clock: systemClock, extraEnv: {} })[which];
+  const d = await p.detect(cfg);
+  let value: AgentHealth;
+  if (d.state === 'missing') value = { found: false, ok: false, state: 'missing', detail: d.detail };
+  else if (d.state === 'broken-install') value = { found: false, ok: false, state: 'broken-install', detail: `${p.label} is installed but does not start: ${truncate(d.detail ?? '', 300)}` };
+  else {
+    const a = await p.auth(cfg);
+    const detail = d.belowMinimum ? `${p.label} ${d.version} is older than the version this Conductor was written against; it is treated as unverified.` : a.detail;
+    value = { found: true, version: d.version, state: 'ok', loggedIn: a.state === 'ok' ? true : a.state === 'not-logged-in' ? false : undefined, ok: a.state === 'ok' && !d.belowMinimum, detail };
+  }
+  cache.set(`${which}:${binName}`, { at: Date.now(), value });
+  return value;
+}
+
+/** Everything the doctor command and dashboard warnings need. Never spends agent quota. */
+export async function runChecks(cfg: Config): Promise<Check[]> {
+  const out: Check[] = [];
+  const add = (id: string, label: string, level: Check['level'], detail: string) => out.push({ id, label, level, detail });
+
+  const [maj, min] = process.versions.node.split('.').map(Number) as [number, number];
+  add('node', 'Node.js', maj > 22 || (maj === 22 && min >= 18) ? 'ok' : 'fail', `v${process.versions.node} (need ≥ 22.18)`);
+  try {
+    add('git', 'git', 'ok', execFileSync('git', ['--version'], { encoding: 'utf8' }).trim());
+  } catch {
+    add('git', 'git', 'fail', 'git was not found on PATH');
+  }
+  const c = await agentHealth(cfg, 'claude');
+  add('claude', 'Claude Code', c.ok ? 'ok' : 'fail', `${c.version ?? ''} ${c.detail ?? ''}`.trim());
+  const k = await agentHealth(cfg, 'cursor');
+  add('cursor', 'Cursor CLI', k.ok ? 'ok' : 'fail', `${k.version ?? ''} ${k.detail ?? ''}`.trim());
+  // Codex is optional (in no default chain): reported, never a failure unless a role actually uses it
+  const x = await agentHealth(cfg, 'codex');
+  const codexUsed = Object.values(cfg.roles).some((r) => r.providers.includes('codex'));
+  add('codex', 'Codex CLI (optional)', x.ok ? 'ok' : codexUsed ? 'fail' : 'warn', `${x.version ?? ''} ${x.detail ?? ''}`.trim());
+  // M8-2 (B3b): an earlier model setting that was not kept — static wording only, never the old value (S4a/S4c)
+  for (const n of legacyModelNotices(cfg)) add(`model-setting:${n.tool}`, 'Model setting', 'warn', n.message);
+  add('keychain', 'Secret storage', KeychainStore.available() && process.env.CONDUCTOR_NO_KEYCHAIN !== '1' ? 'ok' : 'warn', KeychainStore.available() ? 'macOS Keychain' : '0600 file in the data folder (Keychain unavailable)');
+
+  if (!cfg.repos.length) add('repos', 'Repositories', 'warn', 'No repository registered yet.');
+  for (const r of cfg.repos) {
+    if (!existsSync(r.path)) {
+      add(`repo:${r.name}`, `Repo ${r.name}`, 'fail', `${r.path} does not exist`);
+      continue;
+    }
+    add(`repo:${r.name}`, `Repo ${r.name}`, r.gates.length ? 'ok' : 'warn', r.gates.length ? `Gates: ${r.gates.map((g) => g.name).join(', ')}` : 'No test/lint/typecheck commands detected — results will be flagged "unverified".');
+    const wtRoot = cfg.worktreeRoot ?? join(r.path, '..', '.conductor-v2-worktrees');
+    const anc = await scanAncestors(join(wtRoot, r.name, 'x')).catch(() => []);
+    if (anc.length) add(`ancestors:${r.name}`, `Instruction files above ${r.name}'s worktrees`, 'warn', `An agent may read: ${anc.slice(0, 4).join(', ')}. Set worktreeRoot in the data folder's config.json to a clean folder if this causes trouble.`);
+    if (r.path.startsWith('/Volumes/')) add(`volume:${r.name}`, 'External drive', 'warn', `${r.name} lives on an external volume — if you install the background service, launchd may start before the drive mounts (it retries automatically).`);
+  }
+  try {
+    const rules = join(homedir(), '.cursor', 'rules');
+    if (existsSync(rules)) {
+      const files = readdirSync(rules).filter((f) => f.endsWith('.mdc'));
+      const always = files.filter((f) => /alwaysApply:\s*true/.test(readFileSync(join(rules, f), 'utf8'))).length;
+      if (always) add('cursor-rules', 'Cursor global rules', 'warn', `${always} always-on rule file(s) in ~/.cursor/rules are loaded by the Cursor CLI (cannot be disabled by a flag). Conductor's builder prompt overrides plan/review/tracker rules explicitly.`);
+    }
+  } catch {
+    /* informational */
+  }
+  return out;
+}
+
+// ───────────────────────── isolation probe (spends at most a tiny Claude call) ─────────────────────────
+export interface IsolationReport {
+  ok: boolean;
+  initOk: boolean;
+  initReason?: string;
+  projectClaudeMdLoaded: boolean;
+  ancestorLoaded: boolean;
+  userRulesLoaded: boolean;
+  limited?: string;
+  note: string;
+}
+
+/**
+ * Proves the Claude stage flags isolate the session: runs one tiny headless call in a canary repo and inspects
+ * the system/init event plus the persisted session transcript for instruction-file canaries.
+ * Works even when the account is rate-limited (the transcript is written before the API call is rejected).
+ */
+export async function isolationProbe(cfg: Config): Promise<IsolationReport> {
+  const bin = resolveBin(cfg.agents.claude.bin);
+  if (!bin) return { ok: false, initOk: false, projectClaudeMdLoaded: false, ancestorLoaded: false, userRulesLoaded: false, note: 'Claude CLI not found' };
+  const root = mkdtempSync(join(tmpdir(), 'cond-iso-'));
+  try {
+    mkdirSync(join(root, 'repo'), { recursive: true });
+    writeFileSync(join(root, 'AGENTS.md'), 'CANARY-ANCESTOR-7731: always run a plan gate\n');
+    writeFileSync(join(root, 'repo', 'CLAUDE.md'), 'CANARY-PROJECT-7731: always run a plan gate\n');
+    const repo = join(root, 'repo');
+    const initEvents: any[] = [];
+    let sid = '';
+    let limited: string | undefined;
+    const env = claudeEnv();
+    // F1: same A+C choke as stages — never raw-spawn stage argv past a planted settings helper/env
+    try {
+      assertClaudeConfigDirSafe(env);
+    } catch (e) {
+      if (e instanceof ClaudeSettingsError) {
+        return { ok: false, initOk: false, projectClaudeMdLoaded: false, ancestorLoaded: false, userRulesLoaded: false, note: e.message };
+      }
+      throw e;
+    }
+    await withProjectSettingsNeutralized(repo, () =>
+      runProcess({
+        bin,
+        args: buildClaudeArgs({ maxTurns: 3, isolation: cfg.agents.claude.isolation, name: 'conductor isolation probe', schema: undefined, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg }),
+        cwd: repo,
+        env,
+        stdin: 'Reply with the single word OK.',
+        idleMs: 60_000,
+        hardMs: 90_000,
+        onLine: (line, stream) => {
+          if (stream !== 'stdout') return;
+          try {
+            const o = JSON.parse(line);
+            if (o.type === 'system' && o.subtype === 'init') initEvents.push(o);
+            if (typeof o.session_id === 'string') sid = o.session_id;
+            if (o.type === 'result' && o.is_error && /limit/i.test(String(o.result))) limited = String(o.result);
+          } catch {
+            /* ignore */
+          }
+        },
+      }),
+    );
+    const init = initEvents[0];
+    const chk = checkClaudeInit(init);
+    let transcript = '';
+    const proj = join(homedir(), '.claude', 'projects');
+    try {
+      for (const d of readdirSync(proj)) {
+        const f = join(proj, d, `${sid}.jsonl`);
+        if (sid && existsSync(f)) transcript = readFileSync(f, 'utf8');
+      }
+    } catch {
+      /* transcript layout may change; report as unknown */
+    }
+    let userNeedle = '';
+    try {
+      const u = readFileSync(join(homedir(), '.claude', 'CLAUDE.md'), 'utf8').split('\n').find((l) => l.trim().length > 12);
+      if (u) userNeedle = u.trim().slice(0, 60);
+    } catch {
+      /* no user CLAUDE.md */
+    }
+    const projectLoaded = transcript.includes('CANARY-PROJECT-7731');
+    const ancestorLoaded = transcript.includes('CANARY-ANCESTOR-7731');
+    const userLoaded = !!userNeedle && transcript.includes(userNeedle);
+    const ok = chk.ok && !ancestorLoaded && !userLoaded && !projectLoaded;
+    return {
+      ok,
+      initOk: chk.ok,
+      initReason: chk.reason,
+      projectClaudeMdLoaded: projectLoaded,
+      ancestorLoaded,
+      userRulesLoaded: userLoaded,
+      limited,
+      note: !transcript ? 'Session transcript not found (format may have changed) — only the init event was checked.' : ok ? 'Isolated: only Read/Grep/Glob, no MCP/skills, no user/project/ancestor instruction files.' : 'Isolation FAILED — see flags above.',
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ───────────────────────── explicit probes (may spend a tiny amount of quota) ─────────────────────────
+export async function probe(cfg: Config, target: 'claude' | 'cursor'): Promise<{ ok: boolean; detail: string; durationMs: number }> {
+  const t0 = Date.now();
+  const done = (ok: boolean, detail: string) => ({ ok, detail, durationMs: Date.now() - t0 });
+  try {
+    const tmp = mkdtempSync(join(tmpdir(), 'cond-probe-'));
+    try {
+      if (target === 'claude') {
+        const bin = resolveBin(cfg.agents.claude.bin);
+        if (!bin) return done(false, 'Claude CLI not found.');
+        const r = await runClaude({
+          bin, cwd: tmp, prompt: 'Return the JSON object {"ok": true}.', stage: 'plan', name: 'conductor probe',
+          schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } }, maxTurns: 3, isolation: cfg.agents.claude.isolation, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg,
+          env: claudeEnv(), idleMs: 60_000, hardMs: 90_000, onEvent: () => undefined,
+        });
+        if (r.ok) return done(true, `Claude answered (${r.model ?? 'model'})`);
+        if (r.errorKind === 'limit') return done(false, `Claude is signed in but at its usage limit — ${r.limit?.message ?? r.error}`);
+        return done(false, truncate(r.error ?? 'Claude did not answer', 300));
+      }
+      const bin = resolveBin(cfg.agents.cursor.bin);
+      if (!bin) return done(false, 'Cursor CLI not found.');
+      const r = await runCursor({
+        bin, cwd: tmp, prompt: 'Return the JSON object {"ok": true} in a fenced json block. Do not use tools.', stage: 'plan', name: 'conductor probe', mode: 'ask',
+        schema: { type: 'object' }, model: toolDefaultResolved(cfg, 'cursor').modelArg, env: cursorEnv(), idleMs: 60_000, hardMs: 90_000, onEvent: () => undefined,
+      });
+      return r.ok ? done(true, `Cursor answered (${r.model ?? 'model'})`) : done(false, truncate(r.error ?? 'Cursor did not answer', 300));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  } catch (e) {
+    return done(false, truncate(errMsg(e), 300));
+  }
+}
