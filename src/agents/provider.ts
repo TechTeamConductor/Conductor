@@ -29,6 +29,8 @@ export interface ReadOnlyReq {
   secrets?: string[];
   /** Multiply the Claude --max-turns cap (retry after error_max_turns). */
   maxTurnsFactor?: number;
+  /** Multiply the wall-clock limit (code research). */
+  timeoutFactor?: number;
   /** Plan complexity once known (drives `autoByComplexity`, post-plan roles only). */
   complexity?: Complexity;
   /** Provider health/pause/capability snapshot (the engine builds it). */
@@ -221,7 +223,7 @@ export class Agents {
       for (const n of sel.notes) req.onEvent({ agent: 'conductor', stage: req.stage, kind: 'note', text: redact(n, req.secrets ?? []) });
       const ref: AccountRef = { provider: cand.id, id: cand.account };
       req.onCandidate?.(ref);
-      const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor, sel, ...(cand.account !== DEFAULT_ACCOUNT ? { account: ref } : {}) });
+      const res = await provider.runReadOnly!({ stage: req.stage, cwd: req.cwd, prompt, schema: req.schema, name: req.name, onEvent: req.onEvent, signal: req.signal, secrets: req.secrets, maxTurnsFactor: req.maxTurnsFactor, ...(req.timeoutFactor ? { timeoutFactor: req.timeoutFactor } : {}), sel, ...(cand.account !== DEFAULT_ACCOUNT ? { account: ref } : {}) });
       this.noteRunResult(cand.id, sel, res, cand.account);
       const nextCand = r.candidates[i + 1];
       // mid-call rule (§2.2 step 3): a LIMIT advances only to a candidate whose crossOnLimit is true; spawn/auth advance as today

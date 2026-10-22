@@ -1231,11 +1231,36 @@ const SUGGEST = {
   work: ['Add filters by user and date to the audit log', 'Add a dark mode toggle to the settings page'],
   research: ['Compare job-queue options for webhook retries', 'What is the safest way to roll out feature flags?'],
 };
-const MODE_PILLS = [
-  { id: 'auto', label: 'Auto', icon: 'sparkle', title: 'Let Conductor decide from what you type' },
-  { id: 'ask', label: 'Ask', icon: 'help', title: 'Quick Ask: answered here, no task' },
-  { id: 'work', label: 'Build', icon: 'code', title: 'Engineering work: designed in detail, sent to the board' },
-  { id: 'research', label: 'Research', icon: 'shield', title: 'Deep Research: a detailed brief, then a web report with sources' },
+/** Scope-specific wording. Online has no Build entry anywhere: modes come from M.modesFor(scope). */
+const PLACEHOLDER_ONLINE = {
+  auto: 'Ask the web a question, or name something to research…',
+  ask: 'Ask the web, for example “What changed in Node 24?”',
+  research: PLACEHOLDER.research,
+};
+const SUGGEST_ONLINE = {
+  ask: ['What changed in the latest Node.js LTS release?', 'How do other teams roll out database migrations safely?'],
+  research: SUGGEST.research,
+};
+const PLACEHOLDER_CODE_RESEARCH = 'What should be investigated in the code?';
+const SUGGEST_CODE_RESEARCH = ['Review how retries and timeouts are handled across the codebase', 'Where could the authentication flow be hardened?'];
+const DISCLOSE_ONLINE_ASK = 'Answered from the web: no repository is read. Claude searches and opens pages, then answers with sources. Needs the internet; uses your Claude plan.';
+const DISCLOSE_CODE_RESEARCH = 'A deeper, multi-step investigation of your repository with a cited report; every cited file, line and quote is checked against a read-only copy of the repository. Nothing is changed.';
+const MODE_PILLS = {
+  code: [
+    { id: 'auto', label: 'Auto', icon: 'sparkle', title: 'Let Conductor decide from what you type' },
+    { id: 'ask', label: 'Ask', icon: 'help', title: 'Quick Ask: answered here from your code, no task' },
+    { id: 'work', label: 'Build', icon: 'code', title: 'Engineering work: designed in detail, sent to the board' },
+    { id: 'research', label: 'Research', icon: 'shield', title: 'Research the code: a multi-step investigation with a cited, checked report' },
+  ],
+  online: [
+    { id: 'auto', label: 'Auto', icon: 'sparkle', title: 'Let Conductor decide from what you type' },
+    { id: 'ask', label: 'Ask', icon: 'help', title: 'Ask the web: answered from web pages, no repository is read' },
+    { id: 'research', label: 'Research', icon: 'shield', title: 'Deep Research: a detailed brief, then a web report with sources' },
+  ],
+};
+const SCOPE_PILLS = [
+  { id: 'code', label: 'Code', title: 'Look in your repository' },
+  { id: 'online', label: 'Online', title: 'Look on the web: no repository is read' },
 ];
 const MODE_CARDS = [
   { id: 'ask', title: 'Quick Ask', desc: 'A question or an explanation. Answered right here from your code. No task, no plan.' },
@@ -1247,24 +1272,52 @@ const DISCLOSE = {
   research: 'First a short research brief for you to check, written by Claude from your question only (it cannot see your code). Then Claude searches and reads sources on the web and writes a report with citations. Needs the internet; uses your Claude plan.',
   work: 'Conductor reads a read-only copy of the repository, writes a detailed brief and splits it into tasks. Nothing goes to the board until you press Send.',
 };
+const cardText = (scope, id) => {
+  if (id === 'ask' && scope === 'online') return { title: 'Ask the web', desc: 'A question answered from web pages, with the sources it used. No repository is read, no task is created.' };
+  if (id === 'research' && scope === 'code') return { title: 'Research the code', desc: 'A deeper, multi-step investigation of your repository. A cited report where every file, line and quote is checked against a read-only copy.' };
+  const c = MODE_CARDS.find((x) => x.id === id);
+  return { title: c.title, desc: c.desc };
+};
+const placeholderFor = (scope, mode) => (scope === 'online' ? PLACEHOLDER_ONLINE : mode === 'research' ? Object.assign({}, PLACEHOLDER, { research: PLACEHOLDER_CODE_RESEARCH }) : PLACEHOLDER)[mode] || PLACEHOLDER.auto;
+const discloseFor = (scope, mode) => (scope === 'online' && mode === 'ask' ? DISCLOSE_ONLINE_ASK : scope === 'code' && mode === 'research' ? DISCLOSE_CODE_RESEARCH : DISCLOSE[mode]);
+const suggestFor = (scope, mode) => (scope === 'online' ? SUGGEST_ONLINE[mode] : mode === 'research' ? SUGGEST_CODE_RESEARCH : SUGGEST[mode]) || SUGGEST.ask;
+const scopeInit = () => M.scopeOf(storeGet('home:scope'));
 const MAX_TURNS = 20;
 const ASK_POLL_MS = 1500;
-S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
+S.home = { text: '', mode: 'auto', scope: scopeInit(), repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
 const HM = { root: null };
 
 const homeRepoNames = () => ((S.state && S.state.repos) || []).map((r) => r.name);
 function lastRepo() { const v = storeGet('home:lastRepo'); return v && homeRepoNames().includes(v) ? v : ''; }
-const effMode = () => (S.home.mode === 'auto' ? M.detectMode(S.home.text) : S.home.mode);
-const homeRepo = () => M.resolveRepo({ text: S.home.text, chosen: S.home.repo, lastUsed: lastRepo(), names: homeRepoNames(), allowNone: noneAllowed(effMode()) });
+const homeScope = () => M.scopeOf(S.home.scope);
+const effMode = () => (S.home.mode === 'auto' || !M.modesFor(homeScope()).includes(S.home.mode) ? M.detectMode(S.home.text, homeScope()) : S.home.mode);
+/** Online reads no repository, so nothing is resolved or sent. */
+const homeRepo = () => homeScope() === 'online' ? { name: null, how: 'none' } : M.resolveRepo({ text: S.home.text, chosen: S.home.repo, lastUsed: lastRepo(), names: homeRepoNames(), allowNone: noneAllowed(effMode()) });
 const homeBusy = () => S.home.turns.some((t) => t.phase === 'sending' || t.phase === 'running' || t.phase === 'briefing');
 /** A turn that can be stopped: a running ask/research, or a brief being written. */
 const stoppable = (t) => (t.phase === 'running' && t.askId) || (t.phase === 'briefing' && t.briefId);
 /** "No repository" is a real choice for Research, and for Ask unless exactly one repo is registered (the server then picks it). */
-const noneAllowed = (mode) => M.noneAllowed(mode, homeRepoNames().length);
+const noneAllowed = (mode) => M.noneAllowed(mode === 'research' && homeScope() === 'code' ? 'ask' : mode, homeRepoNames().length); // Code research needs a repo like Ask does
 /** M8-6: with "Design the work" (state.home.design) Build is first handled by the Design row (requirements); otherwise by planning. */
 const designOn = () => !!(S.state && S.state.home && S.state.home.design === true);
 const researchBriefOn = () => !!(S.state && S.state.home && S.state.home.researchBrief === true);
-const modeRow = (mode) => M.ROLE_ROWS.find((r) => r.id === (mode === 'work' && designOn() ? 'design' : M.MODE_META[mode].row));
+/** Which job row runs a turn: online Ask runs on the research profile, code research on the Quick Ask path. */
+const modeRow = (mode, scope) => {
+  const eff = mode === 'ask' && scope === 'online' ? 'research' : mode === 'research' && scope !== 'online' ? 'ask' : mode;
+  return M.ROLE_ROWS.find((r) => r.id === (eff === 'work' && designOn() ? 'design' : M.MODE_META[eff].row));
+};
+const turnLabel = (t) => (t.mode === 'ask' && t.scope === 'online' ? 'Web Ask' : t.mode === 'research' && t.scope !== 'online' ? 'Code Research' : M.MODE_META[t.mode].label);
+function setScope(id) {
+  const hm = S.home;
+  const next = M.scopeOf(id);
+  if (hm.scope === next) return;
+  hm.scope = next;
+  storeSet('home:scope', next);
+  if (!M.modesFor(next).includes(hm.mode)) hm.mode = 'auto'; // Build does not exist online
+  hm.newTopic = false; hm.err = '';
+  closeHomeMenus(false);
+  updateHome();
+}
 
 function buildHomeView() {
   HM.hero = h('section', { class: 'home-hero', 'aria-labelledby': 'hero-h' },
@@ -1283,7 +1336,11 @@ function buildHomeView() {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); homeSubmit(); }
     else if (e.key === 'Escape' && S.home.menu) { e.preventDefault(); closeHomeMenus(false); }
   });
-  HM.modes = pillGroup({ label: 'Type of request', items: MODE_PILLS, value: S.home.mode, onPick: (id) => { S.home.mode = id; S.home.menu = null; S.home.err = ''; updateHome(); } });
+  const pickMode = (id) => { S.home.mode = id; S.home.menu = null; S.home.err = ''; updateHome(); };
+  // two groups, only the current scope's is in the page: Build is never rendered online
+  HM.modesBy = { code: pillGroup({ label: 'Type of request', items: MODE_PILLS.code, value: S.home.mode, onPick: pickMode }), online: pillGroup({ label: 'Type of request', items: MODE_PILLS.online, value: S.home.mode, onPick: pickMode }) };
+  HM.modeSlot = h('span', { class: 'mode-slot' });
+  HM.scopePills = pillGroup({ label: 'Where to look', items: SCOPE_PILLS, value: S.home.scope, onPick: setScope });
   HM.repoLbl = h('span');
   HM.repoBtn = h('button', { type: 'button', class: 'chip-btn', 'aria-haspopup': 'menu', 'aria-expanded': 'false', onclick: () => toggleHomeMenu('repo') },
     icon('folder'), HM.repoLbl, icon('chevron', 'icon-sm'));
@@ -1309,14 +1366,17 @@ function buildHomeView() {
   HM.suggestSig = '';
   const dock = h('div', { class: 'dock' },
     h('div', { class: 'composer' }, HM.input,
-      h('div', { class: 'cmp-bar' }, HM.modes.el, h('span', { class: 'cmp-spacer' }), HM.repoWrap, HM.whoWrap, HM.send)),
+      h('div', { class: 'cmp-bar' }, HM.scopePills.el, HM.modeSlot, h('span', { class: 'cmp-spacer' }), HM.repoWrap, HM.whoWrap, HM.send)),
     HM.note, HM.ctx, HM.opt, HM.err, HM.suggest);
-  HM.cardWho = {};
-  HM.cards = h('div', { class: 'cards3' }, MODE_CARDS.map((c) => {
+  HM.cardWho = {}; HM.cardEl = {}; HM.cardT = {}; HM.cardD = {};
+  for (const c of MODE_CARDS) {
     HM.cardWho[c.id] = h('span', { class: 'mcard-who' });
-    return h('button', { type: 'button', class: 'mcard', data: { mode: c.id }, onclick: () => { S.home.mode = c.id; S.home.err = ''; updateHome(); HM.input.focus(); } },
-      h('span', { class: 'mcard-ic' }, icon(M.MODE_META[c.id].icon)), h('span', { class: 'mcard-t' }, c.title), h('span', { class: 'mcard-d' }, c.desc), HM.cardWho[c.id]);
-  }));
+    HM.cardT[c.id] = h('span', { class: 'mcard-t' }, c.title);
+    HM.cardD[c.id] = h('span', { class: 'mcard-d' }, c.desc);
+    HM.cardEl[c.id] = h('button', { type: 'button', class: 'mcard', data: { mode: c.id }, onclick: () => { S.home.mode = c.id; S.home.err = ''; updateHome(); HM.input.focus(); } },
+      h('span', { class: 'mcard-ic' }, icon(M.MODE_META[c.id].icon)), HM.cardT[c.id], HM.cardD[c.id], HM.cardWho[c.id]);
+  }
+  HM.cards = h('div', { class: 'cards3' });
   HM.tools = h('div', { class: 'tools-row' });
   HM.toolNotes = h('div', { class: 'tools-notes' });
   HM.recentList = h('ul');
@@ -1340,6 +1400,8 @@ function updateHome() {
   if (!HM.root || !S.state) return;
   const hm = S.home;
   const mode = effMode();
+  const scope = homeScope();
+  const online = scope === 'online';
   const busy = homeBusy();
   const idle = hm.turns.length === 0;
   HM.root.className = 'screen landing ' + (idle ? 'is-idle' : 'has-thread');
@@ -1348,9 +1410,14 @@ function updateHome() {
   toggleHidden(HM.idle, !idle);
   toggleHidden(HM.suggest, !idle);
   // pills, placeholder
-  const detected = hm.mode === 'auto' && hm.text.trim() ? M.detectMode(hm.text) : '';
-  HM.modes.set(hm.mode, [detected ? 'Auto · ' + M.MODE_META[detected].short : 'Auto']);
-  HM.input.placeholder = PLACEHOLDER[hm.mode] || PLACEHOLDER.auto;
+  const detected = hm.mode === 'auto' && hm.text.trim() ? M.detectMode(hm.text, scope) : '';
+  const grp = HM.modesBy[scope];
+  if (HM.modeSlot.firstChild !== grp.el) HM.modeSlot.replaceChildren(grp.el);
+  grp.set(hm.mode, [detected ? 'Auto · ' + M.MODE_META[detected].short : 'Auto']);
+  HM.scopePills.set(scope);
+  toggleHidden(HM.repoWrap, online && mode !== 'research'); // Online Research may still be turned into an engineering plan for a repository
+  HM.cards.classList.toggle('cards2', online);
+  HM.input.placeholder = placeholderFor(scope, hm.mode);
   // repo chip (the resolved repository is always visible before Send)
   const names = homeRepoNames();
   const res = homeRepo();
@@ -1361,7 +1428,7 @@ function updateHome() {
   setText(HM.repoLbl, repoText);
   HM.repoBtn.title = 'Repository: ' + repoText;
   // handled-by chip
-  const row = modeRow(mode);
+  const row = modeRow(mode, scope);
   const lead = roleLead(row.role);
   setText(HM.whoLbl, lead ? provLabel(lead) : 'Handled by');
   if (HM.whoIcon._id !== lead) { HM.whoIcon._id = lead; HM.whoIcon.replaceChildren(icon(lead ? AGENT_ICON[lead] || 'diamond' : 'sliders')); }
@@ -1370,8 +1437,8 @@ function updateHome() {
   // send / stop: the name says what happens and where (Security U4)
   const canStop = hm.turns.some(stoppable);
   const sendName = canStop ? 'Stop' : busy ? 'Sending…'
-    : mode === 'ask' ? (res.name ? 'Ask about ' + res.name : 'Ask (no repository)')
-      : mode === 'research' ? (researchBriefOn() ? 'Write a research brief' : 'Research on the web')
+    : mode === 'ask' ? (online ? 'Ask the web' : res.name ? 'Ask about ' + res.name : 'Ask (no repository)')
+      : mode === 'research' ? (online ? (researchBriefOn() ? 'Write a research brief' : 'Research on the web') : res.name ? 'Research the code in ' + res.name : 'Research the code')
         : designOn() ? (res.name ? 'Design the work in ' + res.name : 'Design the work')
           : res.name ? 'Send to the board (' + res.name + ')' : 'Send to the board';
   HM.send.setAttribute('aria-label', sendName);
@@ -1382,10 +1449,10 @@ function updateHome() {
   if (HM.sendIcon._k !== sk) { HM.sendIcon._k = sk; HM.sendIcon.replaceChildren(icon(canStop ? 'stop' : 'arrow-up', canStop ? 'is-fill' : '')); }
   // disclosure, Ask-only fast-path option, inline error
   const showNote = hm.mode !== 'auto' || !!hm.text.trim();
-  setText(HM.note, showNote ? DISCLOSE[mode] : '');
+  setText(HM.note, showNote ? discloseFor(scope, mode) : '');
   toggleHidden(HM.note, !showNote);
   // conversation context: does the next Ask continue the last answer?
-  const continues = mode === 'ask' && !!M.followTarget(hm.turns, res.name, false);
+  const continues = mode === 'ask' && !!M.followTarget(hm.turns, res.name, false, scope);
   const ctxShown = continues || (mode === 'ask' && hm.newTopic);
   if (!continues && hm.newTopic && mode !== 'ask') hm.newTopic = false;
   toggleHidden(HM.ctx, !ctxShown);
@@ -1393,8 +1460,8 @@ function updateHome() {
     setText(HM.ctxText, hm.newTopic ? 'New topic: your next question will not use the earlier answers. ' : 'Your next question continues this conversation: the earlier answers are kept as context. ');
     setText(HM.ctxBtn, hm.newTopic ? 'Keep the context' : 'New topic');
   }
-  const allow = mode === 'ask' && !!res.name;
-  const allowKey = mode + '|' + (res.name || '');
+  const allow = mode === 'ask' && !online && !!res.name;
+  const allowKey = scope + '|' + mode + '|' + (res.name || '');
   if (HM.allowKey !== allowKey) { HM.allowKey = allowKey; hm.allowChange = false; }
   toggleHidden(HM.opt, !allow);
   if (allow) setText(HM.allowLbl, 'Let Conductor make the change in ' + res.name + ' if it is small');
@@ -1402,8 +1469,8 @@ function updateHome() {
   setText(HM.err, hm.err);
   toggleHidden(HM.err, !hm.err);
   // examples
-  const sugModes = hm.mode === 'auto' ? ['ask', 'work', 'research'] : [hm.mode];
-  const sug = hm.mode === 'auto' ? sugModes.map((m) => SUGGEST[m][0]) : SUGGEST[hm.mode];
+  const sugModes = hm.mode === 'auto' ? M.modesFor(scope).slice(1) : [hm.mode];
+  const sug = hm.mode === 'auto' ? sugModes.map((m) => suggestFor(scope, m)[0]) : suggestFor(scope, hm.mode);
   if (sug.join('|') !== HM.suggestSig) {
     HM.suggestSig = sug.join('|');
     HM.suggest.replaceChildren(...sug.map((t) => h('button', { type: 'button', onclick: () => { S.home.text = t; HM.input.value = t; fitComposer(); updateHome(); HM.input.focus(); } }, t)));
@@ -1412,6 +1479,7 @@ function updateHome() {
   HM.clear.title = busy ? 'Stop it first' : 'Clear the conversation';
   renderThread();
   if (idle) renderHomeIdle();
+  if (hm.menu === 'repo' && online) hm.menu = null;
   if (hm.menu === 'repo' && !HM.repoMenu) openRepoMenu();
   if (hm.menu === 'who' && !HM.whoMenu) openWhoMenu();
 }
@@ -1419,17 +1487,25 @@ function updateHome() {
 function renderHomeIdle() {
   const st = S.state;
   const lw = (role) => provLabel(roleLead(role));
+  const online = homeScope() === 'online';
   const who = {
-    ask: roleLead('context') ? 'Answered by ' + lw('context') : '',
+    ask: online ? (roleLead('research') ? 'Answered by ' + lw('research') : '') : roleLead('context') ? 'Answered by ' + lw('context') : '',
     work: roleLead('planning') && roleLead('implementation') ? 'Planned by ' + lw('planning') + ' · built by ' + lw('implementation') : '',
-    research: roleLead('research') ? 'Researched by ' + lw('research') : '',
+    research: online ? (roleLead('research') ? 'Researched by ' + lw('research') : '') : roleLead('context') ? 'Investigated by ' + lw('context') : '',
   };
   const recent = st.runs.filter((r) => r.column !== 'closed').slice().sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
-  const sig = JSON.stringify([S.home.mode, who, providersSig(st.providers), (st.providers || []).map((p) => [p.version, p.hint, p.detail]), S.roles && S.roles.roles,
+  const sig = JSON.stringify([S.home.mode, homeScope(), who, providersSig(st.providers), (st.providers || []).map((p) => [p.version, p.hint, p.detail]), S.roles && S.roles.roles,
     recent.map((r) => [r.key, r.title, r.column, r.status])]);
   if (sig === HM.idleSig) return;
   HM.idleSig = sig;
-  for (const c of MODE_CARDS) { setText(HM.cardWho[c.id], who[c.id]); toggleHidden(HM.cardWho[c.id], !who[c.id]); }
+  const scope = homeScope();
+  const shown = M.modesFor(scope).slice(1);
+  HM.cards.replaceChildren(...shown.map((id) => HM.cardEl[id]));
+  for (const c of MODE_CARDS) {
+    const tx = cardText(scope, c.id);
+    setText(HM.cardT[c.id], tx.title); setText(HM.cardD[c.id], tx.desc);
+    setText(HM.cardWho[c.id], who[c.id]); toggleHidden(HM.cardWho[c.id], !who[c.id]);
+  }
   for (const b of HM.cards.children) b.classList.toggle('is-on', b.dataset.mode === S.home.mode);
   const ps = st.providers || [];
   HM.tools.replaceChildren(...(ps.length ? [h('span', null, 'Your tools')] : []), ...ps.map((p) => {
@@ -1481,7 +1557,7 @@ function openRepoMenu() {
 }
 /** The popover edits a GLOBAL setting: the pill choice is only a draft until the explicit Apply button (Security U2). */
 function openWhoMenu() {
-  const row = modeRow(effMode());
+  const row = modeRow(effMode(), homeScope());
   const pop = h('div', { class: 'menu menu-who', role: 'dialog', tabindex: '-1', 'aria-label': 'Handled by ' + row.label });
   pop.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeHomeMenus(true); } });
   HM.whoMenu = h('div', null, h('div', { class: 'menu-scrim', onclick: () => closeHomeMenus(false) }), pop);
@@ -1574,7 +1650,7 @@ function clearThread() {
 /** Sign-out / expired session: nothing of the conversation stays on the page (Security U5). */
 function dropHome() {
   for (const t of S.home.turns) { clearTimeout(t.timer); t.timer = 0; }
-  S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
+  S.home = { text: '', mode: 'auto', scope: scopeInit(), repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
   HM.root = null; HM.turnEls = null;
 }
 const askPhase = (r) => (r.status === 'running' || r.status === 'paused' ? 'running' : r.status === 'done' ? 'done' : r.status === 'canceled' ? 'canceled' : 'failed');
@@ -1584,6 +1660,7 @@ async function homeSubmit() {
   const text = HM.input ? HM.input.value.trim() : hm.text.trim();
   if (!text || homeBusy()) { if (HM.input) HM.input.focus(); return; }
   const mode = effMode();
+  const scope = homeScope();
   const names = homeRepoNames();
   const res = homeRepo();
   hm.err = '';
@@ -1591,9 +1668,9 @@ async function homeSubmit() {
     if (!names.length) { hm.err = 'Add a repository first (Settings, then Repositories and setup).'; updateHome(); return; }
     if (!res.name) { hm.err = 'Choose which repository this task belongs to.'; updateHome(); toggleHomeMenu('repo'); return; }
   }
-  const follow = mode === 'ask' ? M.followTarget(hm.turns, res.name, hm.newTopic) : null; // before pushTurn: the new turn must not be its own parent
+  const follow = mode === 'ask' ? M.followTarget(hm.turns, res.name, hm.newTopic, scope) : null; // before pushTurn: the new turn must not be its own parent
   hm.newTopic = false;
-  const t = { id: uid('turn'), mode, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && !!res.name && hm.allowChange,
+  const t = { id: uid('turn'), mode, scope, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && scope === 'code' && !!res.name && hm.allowChange,
     briefId: null, brief: null, unticked: new Set(), depth: 'standard', sendBusy: false, sendErr: '' };
   pushTurn(t);
   hm.allowChange = false;
@@ -1601,7 +1678,7 @@ async function homeSubmit() {
   updateHome();
   scrollToTurn(t);
   try {
-    if ((mode === 'work' && designOn()) || (mode === 'research' && researchBriefOn())) {
+    if ((mode === 'work' && designOn()) || (mode === 'research' && scope === 'online' && researchBriefOn())) {
       // M8-6: one line → a brief (and parts). Nothing reaches the board until the user presses Send.
       const body = { kind: mode === 'work' ? 'work' : 'research', line: text };
       if (t.repo) body.repo = t.repo;
@@ -1616,9 +1693,16 @@ async function homeSubmit() {
       loadState().catch(() => {});
     } else {
       const body = { question: text };
-      if (mode === 'research') body.mode = 'research';
-      if (t.repo) body.repo = t.repo;
-      if (t.allowChange) body.allowChange = true;
+      if (scope === 'online') {
+        // Online Ask reads no repository (question + mode only); Online Research keeps the chosen repository so its findings can become a plan
+        if (mode === 'research') { body.mode = 'research'; if (t.repo) body.repo = t.repo; } else body.mode = 'web-ask';
+      } else if (mode === 'research') {
+        body.mode = 'code-research'; // a checked investigation of the repo
+        if (t.repo) body.repo = t.repo;
+      } else {
+        if (t.repo) body.repo = t.repo;
+        if (t.allowChange) body.allowChange = true;
+      }
       if (follow && mode === 'ask') body.follow = follow;
       const r = await api('POST', '/api/ask', body);
       t.askId = r.id; t.rec = r; t.phase = askPhase(r);
@@ -1690,7 +1774,7 @@ function scrollToTurn(t) {
 function renderThread() {
   if (!HM.turnEls) return;
   const els = S.home.turns.map((t) => {
-    const sig = JSON.stringify([t.phase, t.error, t.created, t.busy, t.convertErr, t.rec && [t.rec.status, t.rec.basis, t.rec.provider, t.rec.updatedAt, t.rec.convertedTo, t.rec.error], t.phase === 'running' ? null : roleLead(modeRow(t.mode).role),
+    const sig = JSON.stringify([t.phase, t.error, t.created, t.busy, t.convertErr, t.rec && [t.rec.status, t.rec.basis, t.rec.provider, t.rec.updatedAt, t.rec.convertedTo, t.rec.error], t.phase === 'running' ? null : roleLead(modeRow(t.mode, t.scope).role), t.scope,
       t.brief && [t.brief.status, t.brief.updatedAt], t.unticked ? [...t.unticked].join() : '', t.depth, t.sendBusy, t.sendErr, briefLimitsSig()]);
     let rec = HM.turnEls.get(t.id);
     if (!rec) { rec = { el: h('article', { class: 'turn', data: { turn: t.id } }), sig: '' }; HM.turnEls.set(t.id, rec); }
@@ -1730,6 +1814,22 @@ function turnSteps(t) {
     return [{ label: t.phase === 'sent' ? 'Sent to the board as ' + t.created.key : 'Creating the task', state: t.phase === 'sent' ? 'done' : ended ? 'stopped' : 'running' }];
   }
   if (t.phase === 'error') return [{ label: 'Not sent', state: 'stopped' }];
+  if (t.mode === 'ask' && t.scope === 'online') {
+    const done = t.phase === 'done';
+    return [
+      { label: 'Searching the web', state: done ? 'done' : ended ? 'stopped' : 'running' },
+      { label: done ? 'Answered by ' + provLabel((r && r.provider) || 'claude') : 'Writing the answer', state: done ? 'done' : ended ? 'stopped' : 'pending' },
+    ];
+  }
+  if (t.mode === 'research' && t.scope !== 'online') {
+    const repo = (r && r.repo) || t.repo;
+    const read = !!(r && r.basis);
+    const done = t.phase === 'done';
+    return [
+      { label: repo ? 'Reading a read-only copy of ' + repo : 'Reading a read-only copy of the repository', detail: read ? r.basis : '', state: read ? 'done' : ended ? 'stopped' : 'running' },
+      { label: done ? 'Report written by ' + provLabel((r && r.provider) || 'claude') : 'Investigating the code. This can take a few minutes.', state: done ? 'done' : ended ? 'stopped' : read ? 'running' : 'pending' },
+    ];
+  }
   if (t.mode === 'research') {
     const done = t.phase === 'done';
     return [{ label: done ? 'Report written by ' + provLabel(r.provider || 'claude') : 'Researching on the web. This can take a few minutes.', state: done ? 'done' : ended ? 'stopped' : 'running' }];
@@ -1748,7 +1848,9 @@ function copyAnswerBtn(getText, label) {
 }
 function turnNodes(t) {
   const meta = M.MODE_META[t.mode];
-  const row = modeRow(t.mode);
+  const row = modeRow(t.mode, t.scope);
+  const webAsk = t.mode === 'ask' && t.scope === 'online';
+  const codeRes = t.mode === 'research' && t.scope !== 'online';
   const r = t.rec;
   const by = r && r.provider ? r.provider : t.brief && t.brief.handledBy ? t.brief.handledBy.provider : roleLead(row.role);
   const out = [];
@@ -1761,7 +1863,9 @@ function turnNodes(t) {
       h('span', { class: 'keys' }, h('span', { class: 'chip' }, t.created.key)),
       h('button', { type: 'button', class: 'btn btn-sm', data: { fid: 'view' }, onclick: () => navigate('#/board') }, 'View on board')));
   }
-  if (t.phase === 'done' && r && r.result && t.mode === 'ask') {
+  if (t.phase === 'done' && r && r.result && webAsk) out.push(...webAnswerNodes(r));
+  if (t.phase === 'done' && r && r.codeReport && codeRes) out.push(...codeReportNodes(r));
+  if (t.phase === 'done' && r && r.result && t.mode === 'ask' && !webAsk) {
     const res = r.result;
     const doc = h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.answerToText(res), 'answer')));
     if (res.answer) doc.appendChild(h('div', { class: 'doc-sec is-bare' }, renderMarkdown(res.answer)));
@@ -1771,7 +1875,7 @@ function turnNodes(t) {
     out.push(h('p', { class: 'cites' }, 'Based on ' + (r.basis || 'the repository') + '. The answer is model-written — check it before relying on it.' + (r.tierNote ? ' ' + r.tierNote : '')));
     out.push(...convertNodes(t, 'Turn into a task', 'Started as task ', 'Nothing was added to the board. Turning it into a task always waits for your approval.', 'Choose a repository before asking if you want to turn this into a task.'));
   }
-  if (t.phase === 'done' && r && r.report && t.mode === 'research') {
+  if (t.phase === 'done' && r && r.report && t.mode === 'research' && !codeRes) {
     out.push(h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.reportToText(r.report), 'report')), h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
       h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.'))));
     out.push(...convertNodes(t, 'Turn into an engineering plan', 'Turned into task ', '', 'Choose a repository before asking if you want to turn the findings into an engineering plan.', true));
@@ -1781,11 +1885,60 @@ function turnNodes(t) {
     h('div', { class: 'msg-ai' },
       h('div', { class: 'ai-head' },
         h('span', { class: 'ai-mark' }, icon('baton')), h('span', { class: 'ai-name' }, 'Conductor'),
-        h('span', { class: 'ai-tag' }, icon(meta.icon, 'icon-sm'), meta.label),
+        h('span', { class: 'ai-tag' }, icon(meta.icon, 'icon-sm'), turnLabel(t)),
         t.mode === 'ask' && r && r.historyCount > 0 ? h('span', { class: 'ai-tag', title: 'This answer was also shown the earlier questions and answers of this conversation' }, 'Follow-up · ' + r.historyCount + (r.historyCount === 1 ? ' earlier question' : ' earlier questions')) : null,
         by ? h('span', { class: 'ai-who', title: row.label + ' · ' + provLabel(by) }, provLabel(by)) : null),
       stepNodes(turnSteps(t)), out),
   ];
+}
+const SRC_BADGE = { opened: ['good', 'Opened'], listed: ['warn', 'Listed, not opened'], unverified: ['bad', 'Unverified'] };
+const VERDICT_BADGE = { verified: ['good', 'Verified'], partial: ['warn', 'Partly verified'], unverified: ['bad', 'Unverified'] };
+const arr = (a) => (Array.isArray(a) ? a : []);
+const strs = (a) => arr(a).filter((x) => typeof x === 'string' && x);
+function hostOf(u) { try { return new URL(String(u)).hostname; } catch { return ''; } }
+/** An Online Ask answer: markdown, the sources with how each was reached, and the caveat. Every model string is a text node. */
+function webAnswerNodes(r) {
+  const res = r.result && typeof r.result === 'object' ? r.result : {};
+  const sources = arr(r.sources).filter((s) => s && typeof s === 'object');
+  const doc = h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.webAnswerToText(res, sources), 'answer')));
+  if (res.answer) doc.appendChild(h('div', { class: 'doc-sec is-bare' }, renderMarkdown(String(res.answer), { links: 'plain' }))); // a web page can steer the model's link labels
+  if (sources.length) {
+    doc.appendChild(h('div', { class: 'doc-sec' }, h('h3', null, 'Sources'), h('ul', { class: 'kv-list' }, sources.map((s) => {
+      const b = SRC_BADGE[s.state] || SRC_BADGE.unverified;
+      const url = typeof s.url === 'string' ? s.url : '';
+      return h('li', null, badge(b[0], b[1]), ' ', (typeof s.title === 'string' && s.title) || hostOf(url) || 'source', url ? h('span', { class: 'muted' }, ' (', h('code', null, url), ')') : null,
+        s.quote ? h('div', { class: 'ac-sub' }, '“' + String(s.quote) + '”') : null);
+    }))));
+  }
+  doc.appendChild(h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'Written by a model from web pages. Opened = really fetched in this session; Listed, not opened = it only appeared in search results; Unverified = could not be confirmed. Check it before relying on it.')));
+  return [doc];
+}
+/** A code research report: findings with per-evidence verdicts (file:lines + quote), risks, recommendation, steps, limits. */
+function renderCodeReport(rp) {
+  const out = [h('h3', null, 'Summary'), h('p', null, String(rp.summary || ''))];
+  const findings = arr(rp.findings).filter((f) => f && typeof f === 'object');
+  if (findings.length) {
+    out.push(h('h3', null, 'Findings'), h('ul', { class: 'kv-list' }, findings.map((f) => {
+      const b = VERDICT_BADGE[f.status] || VERDICT_BADGE.unverified;
+      const ev = arr(f.evidence).filter((e) => e && typeof e === 'object');
+      return h('li', null, badge(b[0], b[1]), ' ', String(f.claim || ''),
+        ev.length ? h('div', { class: 'muted' }, ev.map((e) => {
+          const eb = e.state === 'verified' ? VERDICT_BADGE.verified : VERDICT_BADGE.unverified;
+          return h('div', { class: 'ev' }, '— ', h('code', null, String(e.file || 'file') + (e.lines ? ':' + String(e.lines) : '')), ' ', badge(eb[0], eb[1]),
+            e.quote ? h('blockquote', { class: 'ev-quote' }, String(e.quote)) : null);
+        })) : h('div', { class: 'muted' }, 'No evidence cited.'));
+    })));
+  }
+  if (strs(rp.risks).length) out.push(h('h3', null, 'Risks'), h('ul', { class: 'kv-list' }, strs(rp.risks).map((x) => h('li', null, x))));
+  out.push(h('h3', null, 'Recommendation'), h('p', null, String(rp.recommendation || '')));
+  if (strs(rp.steps).length) out.push(h('h3', null, 'Suggested next steps'), h('ol', { class: 'kv-list' }, strs(rp.steps).map((x) => h('li', null, x))));
+  out.push(h('h3', null, 'Limits of this report'), h('p', null, rp.limitations ? String(rp.limitations) : 'None stated.'));
+  return out;
+}
+function codeReportNodes(r) {
+  const rp = r.codeReport && typeof r.codeReport === 'object' ? r.codeReport : {};
+  return [h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.codeReportToText(rp), 'report')), h('div', { class: 'doc-sec is-bare' }, renderCodeReport(rp)),
+    h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'Model-written. Verified means the cited file, lines and quote were found in a read-only copy of the repository at ' + (r.basis || 'its base branch') + '.' + (r.tierNote ? ' ' + r.tierNote : ''))))];
 }
 function convertNodes(t, label, doneText, hint, noRepo, primary) {
   const r = t.rec;
@@ -3006,6 +3159,8 @@ function appendEv(parent, ev) {
 }
 
 /* ───────────────────────── markdown (DOM-only, safe subset) ───────────────────────── */
+/** `plain` = model-written links from untrusted web content are never clickable: the label stays, with its destination host beside it. */
+let MD_LINKS = 'link';
 function mdInline(text) {
   const frag = document.createDocumentFragment();
   const re = /`([^`]+)`|\*\*([^*]+)\*\*|\*([^*\s][^*]*)\*|\[([^\]]+)\]\(([^)\s]+)\)/g;
@@ -3017,7 +3172,8 @@ function mdInline(text) {
     else if (m[3] !== undefined) frag.append(h('em', null, m[3]));
     else {
       const href = safeHttp(m[5]);
-      if (href) frag.append(h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, m[4]));
+      if (href && MD_LINKS === 'plain') { let host = ''; try { host = new URL(href).host; } catch { host = ''; } frag.append(m[4] + ' (' + (host || 'link') + ')'); }
+      else if (href) frag.append(h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, m[4]));
       else frag.append(m[4] + ' (' + m[5] + ')');
     }
     last = re.lastIndex;
@@ -3036,7 +3192,12 @@ const mdIsTableSep = (s) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.
 function mdStartsBlock(line) {
   return /^\s*```/.test(line) || /^#{1,6}\s/.test(line) || MD_LIST.test(line) || /^\s*>/.test(line) || /^\s*([-*_])(\s*\1){2,}\s*$/.test(line);
 }
-function renderMarkdown(src) {
+function renderMarkdown(src, opts) {
+  const prev = MD_LINKS;
+  MD_LINKS = opts && opts.links === 'plain' ? 'plain' : prev; // nested calls (block quotes) keep the caller's policy
+  try { return renderMarkdownBody(src); } finally { MD_LINKS = prev; }
+}
+function renderMarkdownBody(src) {
   const root = h('div', { class: 'md' });
   const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
   let i = 0;

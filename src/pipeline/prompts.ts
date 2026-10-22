@@ -94,6 +94,6 @@ export function planToMarkdown(p: Plan): string {
 }
 const esc = (s: string) => String(s).replace(/\|/g, '\\|').replace(/\n+/g, ' ');
 
-export function loadTemplate(name: 'plan' | 'plan-review' | 'build' | 'build-item' | 'item-analysis' | 'fix' | 'verify' | 'ask' | 'research' | 'design-work' | 'research-brief'): string {
+export function loadTemplate(name: 'plan' | 'plan-review' | 'build' | 'build-item' | 'item-analysis' | 'fix' | 'verify' | 'ask' | 'research' | 'design-work' | 'research-brief' | 'web-ask' | 'code-research'): string {
   return load(`${name}.md`);
 }

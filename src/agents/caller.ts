@@ -33,6 +33,10 @@ export interface CallAgentReq {
   /** M8-3 (C1): REQUIRED — `effectiveLimitRule(cfg)` (code review B1); and the per-attempt account callback (removal ⇒ abort). */
   rule: LimitRule;
   onCandidate?: (ref: AccountRef) => void;
+  /** Starting multiplier of the turn cap (code research uses a larger budget; default 1). A max-turns retry multiplies it by 1.5. */
+  baseTurnsFactor?: number;
+  /** Multiplier of the wall-clock limit (default 1). */
+  timeoutFactor?: number;
 }
 export type CallAgentResult =
   | { kind: 'ok'; json: unknown; agent: string; fellBackFrom?: string }
@@ -44,7 +48,8 @@ export type CallAgentResult =
 export async function callAgent(req: CallAgentReq): Promise<CallAgentResult> {
   let corrective = '';
   let retried = false;
-  let turnsFactor = 1;
+  const base = req.baseTurnsFactor && req.baseTurnsFactor > 0 ? req.baseTurnsFactor : 1;
+  let turnsFactor = base;
   for (let attempt = 0; attempt < 4; attempt++) {
     if (req.signal?.aborted) return { kind: 'aborted' };
     const res = await req.agents.readOnly({
@@ -61,6 +66,7 @@ export async function callAgent(req: CallAgentReq): Promise<CallAgentResult> {
       signal: req.signal,
       secrets: req.secrets,
       maxTurnsFactor: turnsFactor,
+      ...(req.timeoutFactor ? { timeoutFactor: req.timeoutFactor } : {}),
       ...(req.selRole ? { selRole: req.selRole } : {}),
       ...(req.onlyProviders ? { onlyProviders: req.onlyProviders } : {}),
       rule: req.rule,
@@ -88,7 +94,7 @@ export async function callAgent(req: CallAgentReq): Promise<CallAgentResult> {
       case 'max_turns':
         if (retried) return { kind: 'failed', reason: 'The agent ran out of turns twice.' };
         retried = true;
-        turnsFactor = 1.5;
+        turnsFactor = base * 1.5;
         continue;
       case 'parse':
         if (retried) return { kind: 'failed', reason: res.error ?? 'could not parse the agent reply' };

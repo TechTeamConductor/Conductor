@@ -8,7 +8,8 @@ import { paths } from '../paths.ts';
 import { atomicWriteFile } from '../util.ts';
 import { quarantine } from '../schema/version.ts';
 import { cleanCommand } from '../context/facts.ts';
-import { validateReport, type ResearchReport } from './research.ts';
+import { validateReport, validateSources, type ResearchReport, type ResearchSource } from './research.ts';
+import { validateCodeReport, type CodeReport } from './evidence.ts';
 import { shapeResearchBrief } from '../briefs/schemas.ts';
 import type { ResearchBrief } from '../briefs/types.ts';
 
@@ -17,7 +18,8 @@ export const ASK_LIMITS = Object.freeze({ question: 4000, answer: 20_000, file: 
 /** What a follow-up question may see of the conversation so far (Quick Ask only): per-item caps, a total budget and a depth limit. */
 export const HISTORY_LIMITS = Object.freeze({ pairs: 4, question: 600, answer: 2000, basis: 200, total: 8000 });
 export type AskStatus = 'running' | 'paused' | 'done' | 'failed' | 'canceled';
-export type AskMode = 'quick' | 'research';
+/** quick = Ask about the code; research = web Deep Research; web-ask = Ask online; code-research = deep research against the code. */
+export type AskMode = 'quick' | 'research' | 'web-ask' | 'code-research';
 export interface AskCitation { file: string; lines: string }
 export interface AskResult { kind: 'answer' | 'change'; answer: string; change?: { title: string; description: string; files: string[]; complexity: 'S' | 'M' | 'L' }; citations: AskCitation[] }
 export interface AskRecord {
@@ -37,6 +39,10 @@ export interface AskRecord {
   result?: AskResult;
   /** Deep Research: the report, with citation status computed by Conductor from the session's tool events. */
   report?: ResearchReport;
+  /** Online Ask: the cited web sources, each marked opened / listed / unverified from the session's tool events. */
+  sources?: ResearchSource[];
+  /** Code Research: the report, every evidence item verified by Conductor against the read-only snapshot. */
+  codeReport?: CodeReport;
   error?: string;
   events: string[];
   convertedTo?: string;
@@ -87,7 +93,7 @@ const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.rep
 export function validateAsk(raw: unknown, id: string): AskRecord | null {
   if (own(raw, 'id') !== id || !STATUSES.includes(own(raw, 'status') as AskStatus)) return null;
   const mode = own(raw, 'mode');
-  if (mode !== 'quick' && mode !== 'research') return null;
+  if (mode !== 'quick' && mode !== 'research' && mode !== 'web-ask' && mode !== 'code-research') return null;
   const r = own(raw, 'result');
   let result: AskResult | undefined;
   if (r && typeof r === 'object') {
@@ -117,13 +123,15 @@ export function validateAsk(raw: unknown, id: string): AskRecord | null {
     provider: typeof own(raw, 'provider') === 'string' ? cleanCommand(own(raw, 'provider')).slice(0, 40) : undefined,
     tierNote: typeof own(raw, 'tierNote') === 'string' ? cleanCommand(own(raw, 'tierNote')).slice(0, 300) : undefined,
     result,
-    report: own(raw, 'report') ? validateReport(own(raw, 'report')) ?? undefined : undefined,
+    report: mode === 'research' && own(raw, 'report') ? validateReport(own(raw, 'report')) ?? undefined : undefined,
+    ...(mode === 'web-ask' && Array.isArray(own(raw, 'sources')) ? { sources: validateSources(own(raw, 'sources')) } : {}),
+    ...(mode === 'code-research' && own(raw, 'codeReport') ? (() => { const c = validateCodeReport(own(raw, 'codeReport')); return c ? { codeReport: c } : {}; })() : {}),
     error: typeof own(raw, 'error') === 'string' ? text(own(raw, 'error'), 500) : undefined,
     events: (Array.isArray(own(raw, 'events')) ? (own(raw, 'events') as unknown[]) : []).filter((e): e is string => typeof e === 'string').slice(-ASK_LIMITS.events).map((e) => e.slice(0, ASK_LIMITS.eventChars)),
     convertedTo: typeof conv === 'string' && /^[A-Z]{2,6}-\d{1,9}$/.test(conv) ? conv : undefined,
     allowChange: own(raw, 'allowChange') === true,
-    ...(mode === 'quick' && typeof own(raw, 'follow') === 'string' && ASK_ID_RE.test(own(raw, 'follow') as string) ? { follow: own(raw, 'follow') as string } : {}),
-    ...(mode === 'quick' && Number.isInteger(own(raw, 'historyCount')) && (own(raw, 'historyCount') as number) >= 0 && (own(raw, 'historyCount') as number) <= HISTORY_LIMITS.pairs ? { historyCount: own(raw, 'historyCount') as number } : {}),
+    ...((mode === 'quick' || mode === 'web-ask') && typeof own(raw, 'follow') === 'string' && ASK_ID_RE.test(own(raw, 'follow') as string) ? { follow: own(raw, 'follow') as string } : {}),
+    ...((mode === 'quick' || mode === 'web-ask') && Number.isInteger(own(raw, 'historyCount')) && (own(raw, 'historyCount') as number) >= 0 && (own(raw, 'historyCount') as number) <= HISTORY_LIMITS.pairs ? { historyCount: own(raw, 'historyCount') as number } : {}),
     ...(mode === 'research' && own(raw, 'brief') ? (() => { const b = shapeResearchBrief(own(raw, 'brief')); return b ? { brief: b } : {}; })() : {}),
     ...(mode === 'research' && (own(raw, 'depth') === 'standard' || own(raw, 'depth') === 'deep') ? { depth: own(raw, 'depth') as 'standard' | 'deep' } : {}),
     ...(typeof own(raw, 'briefId') === 'string' && /^brf-[0-9a-f]{16}$/.test(own(raw, 'briefId') as string) ? { briefId: own(raw, 'briefId') as string } : {}),

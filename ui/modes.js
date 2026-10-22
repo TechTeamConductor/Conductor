@@ -6,12 +6,19 @@
   'use strict';
 
   /* ───────── mode detection (verbatim from the approved design, Main.dc.html detectMode) ───────── */
-  function detectMode(t) {
+  function detectMode(t, scope) {
     const s = String(t == null ? '' : t).trim().toLowerCase();
-    if (!s) return 'work';
-    if (/\b(research|compare|comparison|versus|vs\.?|alternatives?|options for|evaluate|pros and cons|best (way|practice|library|tool)|state of the art|survey|benchmark|safest way)\b/.test(s)) return 'research';
+    const online = scope === 'online'; // Online never builds: no repository, so no task
+    if (!s) return online ? 'ask' : 'work';
+    if (/\b(research|compare|comparison|versus|vs\.?|alternatives?|options for|evaluate|pros and cons|best (way|practice|library|tool)|state of the art|survey|benchmark|safest way)\b/.test(s)) return online ? 'research' : 'ask'; // Auto never starts code research (3 asks, minutes of work): that is the explicit Research chip
     if (/\?\s*$/.test(s) || /^(how|what|why|where|when|which|who|does|do|is|are|can|could|should|explain|show|list|tell me|find)\b/.test(s)) return 'ask';
-    return 'work';
+    return online ? 'ask' : 'work';
+  }
+  /** The Home scope: where a request looks. Anything but 'online' is 'code'. */
+  const scopeOf = (s) => (s === 'online' ? 'online' : 'code');
+  /** The modes the composer offers (and the idle cards and examples show) per scope. Build exists only for code. */
+  function modesFor(scope) {
+    return scopeOf(scope) === 'online' ? ['auto', 'ask', 'research'] : ['auto', 'ask', 'work', 'research'];
   }
 
   /** Which v2 role answers each Home mode (Build: `planning` until M8-6 adds "Design the work"). */
@@ -370,10 +377,11 @@
    * The earlier ask a new Ask question continues: ONLY the last turn, and only when it is a finished Ask in the same repository and the
    * user did not start a new topic. Anything else (Build, Research, still running, failed, another repository) starts fresh.
    */
-  function followTarget(turns, repo, newTopic) {
+  function followTarget(turns, repo, newTopic, scope) {
     if (newTopic || !Array.isArray(turns) || !turns.length) return null;
     const t = turns[turns.length - 1];
     if (!t || t.mode !== 'ask' || t.phase !== 'done' || !isAskId(t.askId)) return null;
+    if (scopeOf(t.scope) !== scopeOf(scope)) return null; // a turn without a scope is a code turn
     return String(t.repo || '') === String(repo || '') ? t.askId : null;
   }
 
@@ -412,6 +420,41 @@
     return out.join('\n\n');
   }
 
+  /** A web answer as plain text: the answer, then one line per source with how it was reached. */
+  function webAnswerToText(res, sources) {
+    const parts = [];
+    if (res && typeof res === 'object' && res.answer) parts.push(String(res.answer).trim());
+    const src = (Array.isArray(sources) ? sources : []).filter((s) => s && typeof s === 'object').map((s) => {
+      const url = typeof s.url === 'string' ? s.url : '';
+      const title = typeof s.title === 'string' ? s.title : '';
+      return '- ' + (title || url || 'source') + (title && url ? ' (' + url + ')' : '') + ' [' + (STATE_TEXT[s.state] || 'unverified') + ']';
+    });
+    if (src.length) parts.push('Sources:\n' + src.join('\n'));
+    return parts.join('\n\n');
+  }
+  const VERDICT_TEXT = Object.freeze({ verified: 'verified', partial: 'partly verified', unverified: 'unverified' });
+  /** A code research report as plain text (reading order; every evidence line says whether it was verified). */
+  function codeReportToText(rp) {
+    if (!rp || typeof rp !== 'object') return '';
+    const out = [];
+    if (rp.summary) out.push('Summary\n' + String(rp.summary));
+    const findings = Array.isArray(rp.findings) ? rp.findings : [];
+    if (findings.length) {
+      out.push('Findings\n' + findings.map((f, i) => {
+        const ev = (Array.isArray(f && f.evidence) ? f.evidence : []).filter((e) => e && typeof e === 'object').map((e) =>
+          '   - ' + String(e.file || 'file') + (e.lines ? ':' + String(e.lines) : '') + ' [' + (e.state === 'verified' ? 'verified' : 'unverified') + ']' + (e.quote ? ' "' + String(e.quote) + '"' : ''));
+        return (i + 1) + '. [' + (VERDICT_TEXT[f && f.status] || 'unverified') + '] ' + String((f && f.claim) || '') + (ev.length ? '\n' + ev.join('\n') : '');
+      }).join('\n'));
+    }
+    const risks = lines(rp.risks);
+    if (risks.length) out.push('Risks\n' + risks.map((r) => '- ' + r).join('\n'));
+    if (rp.recommendation) out.push('Recommendation\n' + String(rp.recommendation));
+    const steps = lines(rp.steps);
+    if (steps.length) out.push('Suggested next steps\n' + steps.map((s, i) => (i + 1) + '. ' + s).join('\n'));
+    out.push('Limits of this report\n' + (rp.limitations ? String(rp.limitations) : 'None stated.'));
+    return out.join('\n\n');
+  }
+
   const deepFreeze = (o) => { if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const k of Object.keys(o)) deepFreeze(o[k]); } return o; };
   globalThis.ConductorModes = deepFreeze({
     detectMode, MODE_META, NONE, noneAllowed, matchRepo, resolveRepo, taskFromText, TITLE_MAX,
@@ -420,6 +463,6 @@
     RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
     LIMIT_RULE_LABEL, LIMIT_RULE_HINT, movedChip,
     COMPLETE_AUTO_CONFIRM, isCompleteAuto, runModeOverridden, approveWaitingBody, skipReasonLabel,
-    followTarget, answerToText, reportToText,
+    followTarget, answerToText, reportToText, webAnswerToText, codeReportToText, modesFor, scopeOf,
   });
 })();

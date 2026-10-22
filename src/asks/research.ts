@@ -64,16 +64,47 @@ const own = (o: unknown, k: string): unknown => (o && typeof o === 'object' && O
 const line = (v: unknown, n: number): string => cleanCommand(v).slice(0, n);
 const block = (v: unknown, n: number): string => (typeof v === 'string' ? v.replace(/[\p{Cf}\p{Co}\p{Cn}]/gu, '').slice(0, n) : '');
 
+type Observed = { read: string[]; listed: string[]; queries: string[] };
+const urlSet = (xs: string[]): Set<string> => new Set(xs.map(normalizeUrl).filter((x): x is string => !!x));
+
+/** Cited sources with their state computed from the session's tool events only: `opened` = that exact (normalised) URL was fetched. */
+export function classifySources(rawSources: unknown, read: Set<string>, listed: Set<string>): ResearchSource[] {
+  return arr(rawSources).slice(0, 8).flatMap((s) => {
+    const n = normalizeUrl(own(s, 'url'));
+    if (!n) return []; // not http(s), has credentials, or unparseable: dropped
+    return [{ url: n, title: line(own(s, 'title'), 200), quote: block(own(s, 'quote'), 400), state: (read.has(n) ? 'opened' : listed.has(n) ? 'listed' : 'unverified') as SourceState }];
+  });
+}
+
+/** Online Ask: a short web-searched answer with its sources (the state of each computed from what was really opened). */
+export const WEB_ASK_SCHEMA: Schema = {
+  type: 'object',
+  required: ['answer', 'sources'],
+  properties: {
+    answer: { ...str, description: 'the answer in markdown, concise and direct' },
+    sources: { type: 'array', maxItems: 8, items: { type: 'object', required: ['url', 'title'], properties: { url: str, title: str, quote: { ...str, description: 'a short exact quote from the page, if useful' } } } },
+  },
+};
+export const WEB_ANSWER_LIMIT = 20_000;
+export function buildWebAnswer(raw: unknown, observed: Observed): { answer: string; sources: ResearchSource[] } {
+  return { answer: block(own(raw, 'answer'), WEB_ANSWER_LIMIT), sources: classifySources(own(raw, 'sources'), urlSet(observed.read), urlSet(observed.listed)) };
+}
+/** Stored web sources from untrusted bytes: urls normalised, states re-checked, strings capped. */
+export function validateSources(raw: unknown): ResearchSource[] {
+  const states: readonly string[] = ['opened', 'listed', 'unverified'];
+  return arr(raw).slice(0, 8).flatMap((x) => {
+    const n = normalizeUrl(own(x, 'url'));
+    const st = own(x, 'state');
+    return n ? [{ url: n, title: line(own(x, 'title'), 200), quote: block(own(x, 'quote'), 400), state: (states.includes(st as string) ? st : 'unverified') as SourceState }] : [];
+  });
+}
+
 /** Turn the model's (schema-valid) JSON into a report whose citation status Conductor computed from what was really opened. */
-export function buildReport(raw: unknown, observed: { read: string[]; listed: string[]; queries: string[] }): ResearchReport {
-  const read = new Set(observed.read.map(normalizeUrl).filter((x): x is string => !!x));
-  const listed = new Set(observed.listed.map(normalizeUrl).filter((x): x is string => !!x));
+export function buildReport(raw: unknown, observed: Observed): ResearchReport {
+  const read = urlSet(observed.read);
+  const listed = urlSet(observed.listed);
   const findings: ResearchFinding[] = arr(own(raw, 'findings')).slice(0, 30).map((f) => {
-    const sources: ResearchSource[] = arr(own(f, 'sources')).slice(0, 8).flatMap((s) => {
-      const n = normalizeUrl(own(s, 'url'));
-      if (!n) return []; // not http(s), has credentials, or unparseable: dropped
-      return [{ url: n, title: line(own(s, 'title'), 200), quote: block(own(s, 'quote'), 400), state: (read.has(n) ? 'opened' : listed.has(n) ? 'listed' : 'unverified') as SourceState }];
-    });
+    const sources: ResearchSource[] = classifySources(own(f, 'sources'), read, listed);
     const status = sources.some((x) => x.state === 'opened') ? 'opened' : sources.some((x) => x.state === 'listed') ? 'listed' : 'unverified';
     return { claim: block(own(f, 'claim'), 1000), status, sources };
   });

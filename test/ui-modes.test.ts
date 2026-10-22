@@ -14,7 +14,9 @@ type Origin = { model: boolean; part: number; parts: number; after: string[]; wa
 type RCard = { id: string; title: string; lane: string; status: string; deep: boolean; repo: string | null; createdAt: number; updatedAt: number; counts: { opened: number; listed: number; unverified: number }; convertedTo: string | null; error: string | null };
 type Extras = { cards: Record<string, Origin>; research: { planning: RCard[]; ready: RCard[]; needs_human: RCard[] } };
 interface Modes {
-  detectMode(t: string): 'ask' | 'research' | 'work';
+  detectMode(t: string, scope?: string): 'ask' | 'research' | 'work';
+  modesFor(scope?: string): string[];
+  scopeOf(s: unknown): 'code' | 'online';
   NONE: string;
   matchRepo(text: string, names: string[]): string | null;
   resolveRepo(o: { text?: string; chosen?: string; lastUsed?: string; names: string[]; allowNone?: boolean }): { name: string | null; how: string };
@@ -96,14 +98,39 @@ test('detectMode follows the design table', () => {
     ['the login flow is broken?', 'ask'],
     ['find the code that sends emails', 'ask'],
     ['Explain the retry schedule', 'ask'],
-    ['Compare job-queue options for webhook retries', 'research'],
-    ['postgres vs mysql for this', 'research'],
-    ['What is the safest way to roll out feature flags?', 'research'],
-    ['How do I compare options?', 'research'],
+    // research-sounding text never starts code research from Auto (it costs 3 asks): it asks instead; the Research chip is explicit
+    ['Compare job-queue options for webhook retries', 'ask'],
+    ['postgres vs mysql for this', 'ask'],
+    ['What is the safest way to roll out feature flags?', 'ask'],
+    ['How do I compare options?', 'ask'],
     ['  HOW does pagination work  ', 'ask'],
     ['Fix the crash when the list is empty', 'work'],
   ];
   for (const [t, want] of cases) assert.equal(M.detectMode(t), want, t);
+});
+
+test('detectMode with scope: online never returns work; code (or omitted) is unchanged', () => {
+  const texts = ['', '   ', 'Add a dark mode toggle to the settings page', 'Fix the crash when the list is empty', 'Where are rate limits enforced?', 'Compare job-queue options', 'postgres vs mysql', 'refactor the parser'];
+  for (const t of texts) {
+    assert.notEqual(M.detectMode(t, 'online'), 'work', t);
+    assert.equal(M.detectMode(t, 'code'), M.detectMode(t), t);
+    assert.equal(M.detectMode(t, undefined), M.detectMode(t), t);
+  }
+  assert.equal(M.detectMode('', 'online'), 'ask');
+  assert.equal(M.detectMode('Add a dark mode toggle', 'online'), 'ask');
+  assert.equal(M.detectMode('Compare job-queue options', 'online'), 'research', 'online: the reviewed web brief flow');
+  assert.equal(M.detectMode('Compare job-queue options', 'code'), 'ask', 'code: Auto never starts code research');
+  assert.equal(M.detectMode('Where is it?', 'online'), 'ask');
+  assert.equal(M.detectMode('', 'code'), 'work');
+});
+
+test('modesFor: Build exists only for code; scopeOf defaults to code', () => {
+  assert.deepEqual(Array.from(M.modesFor('code')), ['auto', 'ask', 'work', 'research']);
+  assert.deepEqual(Array.from(M.modesFor()), ['auto', 'ask', 'work', 'research']);
+  assert.deepEqual(Array.from(M.modesFor('online')), ['auto', 'ask', 'research']);
+  assert.deepEqual(Array.from(M.modesFor('bogus')), ['auto', 'ask', 'work', 'research']);
+  assert.equal(M.scopeOf('online'), 'online');
+  for (const v of [undefined, null, '', 'x', 5]) assert.equal(M.scopeOf(v), 'code');
 });
 
 test('matchRepo: whole words, case-insensitive, unique only', () => {

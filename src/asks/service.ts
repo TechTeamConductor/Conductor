@@ -26,14 +26,15 @@ import { errMsg, truncate } from '../util.ts';
 import { cleanCommand } from '../context/facts.ts';
 import { logger } from '../log.ts';
 import { ASK_ID_RE, ASK_LIMITS, HISTORY_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
-import { RESEARCH_SCHEMA, buildReport } from './research.ts';
+import { RESEARCH_SCHEMA, WEB_ASK_SCHEMA, buildReport, buildWebAnswer } from './research.ts';
+import { CODE_RESEARCH_SCHEMA, buildCodeReport } from './evidence.ts';
 import { renderResearchBrief, shapeResearchBrief } from '../briefs/schemas.ts';
 import type { ResearchBrief, ResearchCardView } from '../briefs/types.ts';
 import { sanitizeLine } from '../pipeline/graph.ts';
 
 /** S6a: the research-brief fence, from the stored shaped record only (exported so a test can compare it byte for byte). */
 export const researchBriefFence = (b: ResearchBrief): string => fence('research-brief', renderResearchBrief(b), 12_000);
-import { buildSnapshot, removeSnapshot, SnapshotTooLarge } from './snapshot.ts';
+import { buildSnapshot, removeSnapshot, SnapshotTooLarge, type Snapshot } from './snapshot.ts';
 
 const log = logger('asks');
 export class AskError extends Error {
@@ -49,6 +50,8 @@ export class AskError extends Error {
   }
 }
 const MAX_CONCURRENT = 2;
+/** Code research costs this many of the hourly Ask budget. */
+const CODE_RESEARCH_COST = 3;
 
 export interface AskDeps {
   getConfig: () => Config;
@@ -84,14 +87,14 @@ export class AskService {
     this.d = deps;
   }
   /** The earlier answered quick asks this one may continue, newest first: walks the `follow` chain with a visited set and a depth limit and stops at the first unusable record. */
-  private historyPairs(follow: string | undefined, repoName: string | undefined): { question: string; answer: string; basis: string }[] {
+  private historyPairs(follow: string | undefined, repoName: string | undefined, mode: 'quick' | 'web-ask' = 'quick'): { question: string; answer: string; basis: string }[] {
     const pairs: { question: string; answer: string; basis: string }[] = [];
     const seen = new Set<string>();
     let id = follow;
     while (id && pairs.length < HISTORY_LIMITS.pairs && !seen.has(id) && ASK_ID_RE.test(id)) {
       seen.add(id);
       const r = loadAsk(id);
-      if (!r || r.mode !== 'quick' || r.status !== 'done' || !r.result || r.dismissedAt !== undefined || r.repo !== repoName) break;
+      if (!r || r.mode !== mode || r.status !== 'done' || !r.result || r.dismissedAt !== undefined || r.repo !== repoName) break; // the chain never crosses modes
       pairs.push({ question: r.question, answer: r.result.answer, basis: r.basis ?? '' });
       id = r.follow;
     }
@@ -99,12 +102,12 @@ export class AskService {
   }
 
   /** The fenced history block: one JSON object per line (so no earlier text can fake a turn), capped per item and in total, redacted, assembled once. */
-  private historyBlock(pairs: { question: string; answer: string; basis: string }[], secrets: readonly string[]): string {
+  private historyBlock(pairs: { question: string; answer: string; basis: string }[], secrets: readonly string[], origin?: 'web'): string {
     const kept: string[] = [];
     let total = 0;
     for (const p of pairs) {
       // redact each field BEFORE it is JSON-escaped (a secret containing a quote, backslash or newline would not match its escaped form)
-      const item = { question: redact(truncate(p.question, HISTORY_LIMITS.question), secrets), answer: redact(truncate(p.answer, HISTORY_LIMITS.answer), secrets), basis: redact(truncate(p.basis, HISTORY_LIMITS.basis), secrets) };
+      const item: { question: string; answer: string; basis: string; origin?: string } = { question: redact(truncate(p.question, HISTORY_LIMITS.question), secrets), answer: redact(truncate(p.answer, HISTORY_LIMITS.answer), secrets), basis: redact(truncate(p.basis, HISTORY_LIMITS.basis), secrets), ...(origin ? { origin } : {}) }; // origin 'web' marks answers derived from web pages
       let line = JSON.stringify(item);
       // even the newest pair stays inside the total budget (JSON escaping can inflate it): shrink its answer until it fits
       for (let guard = 0; line.length > HISTORY_LIMITS.total && guard < 10; guard++) {
@@ -150,6 +153,71 @@ export class AskService {
     const t = takeKeyed('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now() });
     if (!t.ok) throw new AskError('limit', `You reached the limit of ${cfg.pipeline.asksPerHour} questions per hour.`, 429);
     const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'quick', repo: repo?.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: input.follow !== undefined && input.follow !== '' && !follow ? ['Earlier context was not available, so this question was answered on its own.'] : [], ...(follow ? { follow, historyCount } : {}), allowChange: input.allowChange === true, takenKey: t.key };
+    this.save(rec);
+    const ac = new AbortController();
+    const promise = this.run(rec.id, repo, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
+    this.running.set(rec.id, { ac, promise });
+    return rec;
+  }
+
+  /** Shared validation of the question text. */
+  private questionText(input: { question: unknown }): string {
+    const q = typeof input.question === 'string' ? input.question.trim() : '';
+    if (!q) throw new AskError('bad_request', '"question" is required.');
+    if (q.length > ASK_LIMITS.question) throw new AskError('bad_request', `"question" is too long (max ${ASK_LIMITS.question} characters).`);
+    return q;
+  }
+
+  /**
+   * Online Ask: a short web-searched answer. Web tools only, empty scratch directory, NO repository text (a repository is never accepted or
+   * defaulted). Shares the hourly Ask limit and the Ask pause/refund path; routed like research (Claude only).
+   */
+  async startWebAsk(input: { question: unknown; follow?: unknown }): Promise<AskRecord> {
+    const q = this.questionText(input);
+    const cfg = this.d.getConfig();
+    let follow: string | undefined;
+    let historyCount = 0;
+    if (input.follow !== undefined && input.follow !== '') {
+      if (typeof input.follow !== 'string' || !ASK_ID_RE.test(input.follow)) throw new AskError('bad_request', '"follow" must be the id of an earlier question.');
+      const pairs = this.historyPairs(input.follow, undefined, 'web-ask');
+      if (pairs.length) { follow = input.follow; historyCount = pairs.length; }
+    }
+    if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', "Online Ask needs Claude's safe-mode isolation.", 409);
+    if ((await this.d.networkState?.()) === 'offline') throw new AskError('offline', 'Online Ask needs the internet, and there is no network right now. Ask about your code and your board still work offline.', 409);
+    if (this.running.size >= MAX_CONCURRENT) throw new AskError('busy', 'Two questions are already being answered — try again in a moment.', 429);
+    this.gate('research');
+    const t = takeKeyed('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now() });
+    if (!t.ok) throw new AskError('limit', `You reached the limit of ${cfg.pipeline.asksPerHour} questions per hour.`, 429);
+    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'web-ask', question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', basis: 'web (no repository access)', takenKey: t.key,
+      events: input.follow !== undefined && input.follow !== '' && !follow ? ['Earlier context was not available, so this question was answered on its own.'] : [], ...(follow ? { follow, historyCount } : {}) };
+    this.save(rec);
+    const ac = new AbortController();
+    const promise = this.runResearch(rec.id, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
+    this.running.set(rec.id, { ac, promise });
+    return rec;
+  }
+
+  /**
+   * Code Research: a deeper investigation of the repository's read-only snapshot with a cited report; every cited file/lines/quote is verified
+   * by Conductor against the snapshot. Costs 3 of the hourly Ask budget, one at a time, never accepts `follow`.
+   */
+  startCodeResearch(input: { question: unknown; repo?: unknown }): AskRecord {
+    const q = this.questionText(input);
+    const cfg = this.d.getConfig();
+    let repo: RepoConfig | undefined;
+    if (input.repo !== undefined && input.repo !== '') {
+      if (typeof input.repo !== 'string') throw new AskError('bad_request', '"repo" must be a registered repository name.');
+      repo = cfg.repos.find((r) => r.name === input.repo);
+      if (!repo) throw new AskError('bad_request', 'Unknown repository.');
+    } else if (cfg.repos.length === 1) repo = cfg.repos[0];
+    if (!repo) throw new AskError('bad_request', 'Choose a repository: code research reads one repository.');
+    if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', "Code research needs Claude's safe-mode isolation (project settings and hooks would be loaded from the snapshot otherwise).", 409);
+    if (this.running.size >= MAX_CONCURRENT) throw new AskError('busy', 'Two questions are already being answered — try again in a moment.', 429);
+    if ([...this.running.keys()].some((id) => loadAsk(id)?.mode === 'code-research')) throw new AskError('busy', 'A code research run is already in progress.', 429);
+    this.gate('context');
+    const t = takeKeyed('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now(), n: CODE_RESEARCH_COST });
+    if (!t.ok) throw new AskError('limit', `Code research counts as ${CODE_RESEARCH_COST} of your ${cfg.pipeline.asksPerHour} questions per hour, and there is not enough left.`, 429);
+    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'code-research', repo: repo.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], takenKey: t.key };
     this.save(rec);
     const ac = new AbortController();
     const promise = this.run(rec.id, repo, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
@@ -272,20 +340,24 @@ export class AskService {
   private async runResearch(id: string, ac: AbortController): Promise<void> {
     const secrets = this.d.secrets?.() ?? [];
     const scratch = mkdtempSync(join(tmpdir(), 'conductor-research-'));
-    const n = loadAsk(id)?.depth === 'deep' ? 2 : 1;
+    // Online Ask (web-ask) runs through this same routed, account-switching path; only the prompt, schema, depth, budget and result differ
+    const web = loadAsk(id)?.mode === 'web-ask';
+    const counter: CounterId = web ? 'asksPerHour' : 'researchPerDay';
+    const schema = web ? WEB_ASK_SCHEMA : RESEARCH_SCHEMA;
+    const n = web ? 1 : loadAsk(id)?.depth === 'deep' ? 2 : 1;
     try {
       const rec = loadAsk(id)!;
       const claude = this.d.agents.provider('claude');
       if (!claude.runResearch) throw new Error('Claude is not available for research.');
       await this.d.freshHealth();
-      const events: string[] = [];
+      const events: string[] = [...rec.events];
       const push = (t: string) => { if (events.length < ASK_LIMITS.events) events.push(redact(t, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars)); };
       // M8-3 (B2): research is ROUTED — only Claude passes the research gate, so the candidates are Claude accounts in order. A route that is
       // ineligible (e.g. research left out of the roles) keeps today's behaviour: Claude's main sign-in, exactly as before.
       const cfg = this.d.getConfig();
       const rt = route({ role: 'research', roles: cfg.roles, states: this.d.routeStates('research'), now: this.now(), label: providerLabel, rule: this.limitRule() });
       if (!rt.ok && rt.kind === 'paused') {
-        this.failLimited(id, 'researchPerDay', n, `${truncate(rt.reason, 300)} — try again after the limit resets.`, rt.pauseUntil, secrets, events);
+        this.failLimited(id, counter, n, `${truncate(rt.reason, 300)} — try again after the limit resets.`, rt.pauseUntil, secrets, events);
         return;
       }
       const today = [{ account: DEFAULT_ACCOUNT, crossOnLimit: true }];
@@ -293,7 +365,12 @@ export class AskService {
       const cands: { account: string; crossOnLimit: boolean }[] = routed.length ? routed : today;
       // S6a: the brief block is built ONLY from the stored, shaped record; Standard without a brief renders byte-identical to before M8-6
       const depth = rec.depth === 'deep' ? 'deep' : 'standard';
-      const basePrompt = render(loadTemplate('research'), { preamble: preamble('plan'), question: fence('user-question', rec.question, ASK_LIMITS.question + 100), brief: rec.brief ? researchBriefFence(rec.brief) : '', deep: depth === 'deep' ? 'yes' : '' });
+      const pairs = web && rec.follow ? this.historyPairs(rec.follow, undefined, 'web-ask') : [];
+      if (web && rec.follow && (rec.historyCount ?? 0) !== pairs.length) this.patch(id, (r) => void (r.historyCount = pairs.length));
+      const history = pairs.length ? this.historyBlock(pairs, secrets, 'web') : '';
+      const basePrompt = web
+        ? render(loadTemplate('web-ask'), { preamble: preamble('plan'), history, question: fence('user-question', rec.question, ASK_LIMITS.question + 100) })
+        : render(loadTemplate('research'), { preamble: preamble('plan'), question: fence('user-question', rec.question, ASK_LIMITS.question + 100), brief: rec.brief ? researchBriefFence(rec.brief) : '', deep: depth === 'deep' ? 'yes' : '' });
       let res: AgentResult = { ok: false, text: '', exitCode: null, errorKind: 'spawn', error: 'Research did not start.' };
       let errs: string[] = [];
       let modelBasis = '';
@@ -312,15 +389,15 @@ export class AskService {
         modelBasis = sel.fallback ? `; model: tool default (${sel.fallback.replace(/-/g, ' ')})` : '';
         const acct = c.account !== DEFAULT_ACCOUNT ? { account: ref } : {};
         let prompt = basePrompt;
-        res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...acct, ...(depth === 'deep' ? { depth } : {}), onEvent: (ev) => { if (ev.text && ev.kind !== 'thinking') push(`${ev.agent}: ${ev.text}`); } });
+        res = await claude.runResearch({ cwd: scratch, prompt, schema, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...acct, ...(web ? { depth: 'quick' as const } : depth === 'deep' ? { depth } : {}), onEvent: (ev) => { if (ev.text && ev.kind !== 'thinking') push(`${ev.agent}: ${ev.text}`); } });
         this.d.agents.noteRunResult('claude', sel, res, c.account);
-        errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
+        errs = res.ok ? validateSchema(schema, res.json) : [];
         if (res.ok && errs.length) {
           // the corrective re-ask stays on the account that answered
           prompt += `\n\n## Your previous reply was rejected\n${errs.slice(0, 6).map((e) => `- ${e}`).join('\n')}\nReturn a corrected JSON object.`;
-          res = await claude.runResearch({ cwd: scratch, prompt, schema: RESEARCH_SCHEMA, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...acct, ...(depth === 'deep' ? { depth } : {}), onEvent: () => undefined });
+          res = await claude.runResearch({ cwd: scratch, prompt, schema, name: `conductor research ${id}`, secrets, signal: ac.signal, sel, ...acct, ...(web ? { depth: 'quick' as const } : depth === 'deep' ? { depth } : {}), onEvent: () => undefined });
           this.d.agents.noteRunResult('claude', sel, res, c.account);
-          errs = res.ok ? validateSchema(RESEARCH_SCHEMA, res.json) : [];
+          errs = res.ok ? validateSchema(schema, res.json) : [];
         }
         ranOn = who;
         if (!res.ok && res.errorKind === 'limit') this.pauseFromLimit(ref, res);
@@ -334,17 +411,24 @@ export class AskService {
         push(`conductor: ${who} ${res.errorKind === 'limit' ? 'reached its usage limit' : res.errorKind === 'auth' ? 'is not signed in' : 'could not start'} — continuing on ${nextWho}.`);
       }
       if (limitHops && !(res.errorKind === 'limit')) this.d.notify?.('Usage limit reached', `${firstLimited} — research continued on ${ranOn}`);
-      if (res.ok && !errs.length) {
+      if (res.ok && !errs.length && web) {
+        const wa = buildWebAnswer(res.json, res.observed ?? { read: [], listed: [], queries: [] });
+        // a URL carrying a secret is dropped (redacting it would only produce a different, wrong address)
+        wa.sources = wa.sources.filter((x) => redact(x.url, secrets) === x.url);
+        for (const x of wa.sources) { x.title = redact(x.title, secrets); x.quote = redact(x.quote, secrets); }
+        const answer = redact(wa.answer, secrets);
+        this.patch(id, (r) => { r.status = 'done'; r.provider = 'claude'; r.result = { kind: 'answer', answer, citations: [] }; r.sources = wa.sources; r.events = events; if (modelBasis) r.basis = `${r.basis ?? ''}${modelBasis}`; });
+      } else if (res.ok && !errs.length) {
         const report = buildReport(res.json, res.observed ?? { read: [], listed: [], queries: [] });
         for (const f of report.findings) f.claim = redact(f.claim, secrets);
         report.summary = redact(report.summary, secrets);
         report.recommendation = redact(report.recommendation, secrets);
         this.patch(id, (r) => { r.status = 'done'; r.provider = 'claude'; r.report = report; r.events = events; if (modelBasis) r.basis = `${r.basis ?? ''}${modelBasis}`; });
       } else if (res.errorKind === 'aborted') {
-        if (this.endRemoved(id, 'researchPerDay', n, events)) return;
+        if (this.endRemoved(id, counter, n, events)) return;
         if (loadAsk(id)?.status === 'running') this.patch(id, (x) => { x.status = 'canceled'; });
       } else if (res.errorKind === 'limit') {
-        this.failLimited(id, 'researchPerDay', n, 'Claude is at its usage limit — try again later.', this.retryAt('research', res.limit?.resetsAt ?? null), secrets, events);
+        this.failLimited(id, counter, n, 'Claude is at its usage limit — try again later.', this.retryAt('research', res.limit?.resetsAt ?? null), secrets, events);
       } else {
         const why = res.errorKind === 'network' ? 'There is no network right now — try again when it is back.' : res.ok ? `The report did not match the required format: ${errs[0]}` : res.error ?? 'Research failed.';
         this.patch(id, (r) => { r.status = 'failed'; r.error = truncate(redact(why, secrets), 500); r.events = events; });
@@ -377,10 +461,13 @@ export class AskService {
 
   private async run(id: string, repo: RepoConfig | undefined, ac: AbortController): Promise<void> {
     let snapshotCleanup: (() => void) | null = null;
+    let snapshotRef: Snapshot | null = null;
     let scratch: string | null = null;
     const secrets = this.d.secrets?.() ?? [];
     try {
       const rec = loadAsk(id)!;
+      const code = rec.mode === 'code-research';
+      const cost = code ? CODE_RESEARCH_COST : 1;
       let cwd: string;
       let basis = 'no repository';
       let projectFacts = '';
@@ -389,6 +476,7 @@ export class AskService {
         const { commit } = await git.resolveBranch(repo.baseBranch);
         const snap = await buildSnapshot(git, commit);
         snapshotCleanup = () => removeSnapshot(snap);
+        snapshotRef = snap;
         cwd = snap.dir;
         basis = `${repo.baseBranch} @ ${commit.slice(0, 7)}`;
         try {
@@ -408,7 +496,7 @@ export class AskService {
       const history = pairs.length ? this.historyBlock(pairs, secrets) : '';
       const shown = Math.min(pairs.length, HISTORY_LIMITS.pairs);
       if (rec.follow && (rec.historyCount ?? 0) !== shown) this.patch(id, (r) => void (r.historyCount = shown));
-      const prompt = render(loadTemplate('ask'), { preamble: preamble('plan'), basis, projectFacts, history, question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
+      const prompt = render(loadTemplate(code ? 'code-research' : 'ask'), { preamble: preamble('plan'), basis, projectFacts, history, question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
       await this.d.freshHealth();
       const events: string[] = [...rec.events]; // keeps the "earlier context was not available" note
       const out = await callAgent({
@@ -419,9 +507,15 @@ export class AskService {
         onCandidate: (ref) => { const e = this.running.get(id); if (e) e.account = accountKey(ref); },
         onLimit: (l) => { if (l.account) this.pauseFromLimit({ provider: l.provider, id: l.account }, { ok: false, text: '', exitCode: null, errorKind: 'limit', limit: l }); },
         prompt,
-        schema: ASK_SCHEMA,
+        schema: code ? CODE_RESEARCH_SCHEMA : ASK_SCHEMA,
         cwd,
+        ...(code ? { baseTurnsFactor: 3, timeoutFactor: 3 } : {}),
         validate: (j) => {
+          if (code) {
+            const e = validateSchema(CODE_RESEARCH_SCHEMA, j);
+            if (!e.length && !String((j as { summary?: string }).summary ?? '').trim()) e.push('$.summary: required');
+            return e;
+          }
           const errs = validateSchema(ASK_SCHEMA, j);
           const o = j as { kind?: string; answer?: string; change?: unknown };
           if (!errs.length && o.kind === 'answer' && !String(o.answer ?? '').trim()) errs.push('$.answer: required when kind is "answer"');
@@ -430,7 +524,7 @@ export class AskService {
         },
         secrets,
         signal: ac.signal,
-        name: `conductor ask ${id}`,
+        name: `conductor ${code ? 'code research' : 'ask'} ${id}`,
         onEvent: (ev) => {
           if (ev.text && ev.kind !== 'thinking' && events.length < ASK_LIMITS.events) events.push(redact(`${ev.agent}: ${ev.text}`, secrets).replace(/\s+/g, ' ').slice(0, ASK_LIMITS.eventChars));
         },
@@ -438,6 +532,18 @@ export class AskService {
       if (out.kind === 'ok') {
         const tier = this.d.routeStates()[out.agent as 'claude']?.tier;
         const tierNote = tier === 'partial' ? `Answered by ${providerLabel(out.agent as 'claude')} in ask mode — weaker isolation than Claude's tool lock-down.` : tier === 'unverified' ? `Answered by ${providerLabel(out.agent as 'claude')} — its isolation has not been verified on this machine.` : undefined;
+        if (code) {
+          // verify every citation against the snapshot the model worked on, BEFORE it is removed (the finally below)
+          const report = buildCodeReport(out.json, snapshotRef ?? { dir: cwd, index: new Map() });
+          report.summary = redact(report.summary, secrets);
+          report.recommendation = redact(report.recommendation, secrets);
+          report.limitations = redact(report.limitations, secrets);
+          report.risks = report.risks.map((x) => redact(x, secrets));
+          report.steps = report.steps.map((x) => redact(x, secrets));
+          for (const f of report.findings) { f.claim = redact(f.claim, secrets); for (const e of f.evidence) e.quote = redact(e.quote, secrets); }
+          this.patch(id, (r) => { r.status = 'done'; r.provider = out.agent; r.tierNote = tierNote; r.codeReport = report; r.events = events; });
+          return;
+        }
         const shaped = validateAsk({ ...loadAsk(id)!, result: out.json, status: 'done' }, id);
         const result = shaped?.result;
         if (result) {
@@ -455,13 +561,13 @@ export class AskService {
           }
         }
       } else if (out.kind === 'aborted') {
-        if (this.endRemoved(id, 'asksPerHour', 1, events)) return;
+        if (this.endRemoved(id, 'asksPerHour', cost, events)) return;
         const r = loadAsk(id);
         if (r && r.status === 'running') this.patch(id, (x) => { x.status = 'canceled'; x.events = events; });
       } else if (out.kind === 'paused') {
         // M8-3: mid-call exhaustion ⇒ failed + limited + retryAt, the counter refunded (no automatic retry — Home never queues)
         if (out.limit.account) this.pauseFromLimit({ provider: out.limit.provider, id: out.limit.account }, { ok: false, text: '', exitCode: null, errorKind: 'limit', limit: out.limit });
-        this.failLimited(id, 'asksPerHour', 1, `${providerLabel(out.limit.provider)} is at its usage limit — try again later.`, this.retryAt('context', out.limit.resetsAt ?? null), secrets, events);
+        this.failLimited(id, 'asksPerHour', cost, `${providerLabel(out.limit.provider)} is at its usage limit — try again later.`, this.retryAt('context', out.limit.resetsAt ?? null), secrets, events);
       } else {
         const why = out.kind === 'offline' ? 'There is no network right now — try again when it is back.' : out.reason;
         this.patch(id, (r) => { r.status = 'failed'; r.error = truncate(redact(why, secrets), 500); r.events = events; });
@@ -479,6 +585,7 @@ export class AskService {
   convert(id: string): { key: string } {
     const r = loadAsk(id);
     if (!r) throw new AskError('not_found', 'Unknown question.', 404);
+    if (r.mode === 'web-ask' || r.mode === 'code-research') throw new AskError('bad_state', 'Online answers and code research reports cannot be turned into a task.', 409);
     if (r.status !== 'done' || (!r.result && !r.report)) throw new AskError('bad_state', 'Only an answered question can be turned into work.', 409);
     if (r.convertedTo) return { key: r.convertedTo };
     if (!this.d.cards || !r.repo) throw new AskError('bad_state', 'Pick a repository for this question first — it was asked without one.', 409);

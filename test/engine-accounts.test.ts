@@ -384,6 +384,31 @@ test('removal during a running ask ⇒ the ask ends failed "the account was remo
   }
 });
 
+test('removal during a running CODE RESEARCH ⇒ failed "the account was removed", and exactly its 3 asks are refunded, once', async () => {
+  const h = await makeHarness({ repoFiles: { 'src/a.ts': 'export const a = 1;\n' } });
+  try {
+    accounts(h, [W]);
+    h.cfg.accounts.claude = [h.cfg.accounts.claude[1]!, h.cfg.accounts.claude[0]!];
+    h.cfg.roles.context = { providers: ['claude'] };
+    h.scenario({ accounts: { [W]: { claude: { '*': { code: [{ delayMs: 4000 }] } } } } });
+    const a = new AskService({ getConfig: () => h.cfg, agents: h.agents, routeStates: (role) => h.engine.routeStates(role), freshHealth: () => h.engine.freshHealth(), accountsGate: (r) => h.engine.accountsGate(r), limitRule: () => effectiveLimitRule(h.cfg) });
+    const svc = new AccountService({ getConfig: () => h.cfg, saveConfig: (c) => void Object.assign(h.cfg, c), engine: h.engine, extraEnv: { FAKE_DIR: h.fakeDir }, abortCalls: (ref) => a.abortAccount(ref) });
+    const before = used('asksPerHour');
+    const r = a.startCodeResearch({ question: 'long investigation' });
+    assert.equal(used('asksPerHour'), before + 3, 'code research is charged 3');
+    for (let i = 0; i < 60 && !h.calls().some((c) => c.acct === W); i++) await new Promise((res) => setTimeout(res, 50));
+    await svc.remove(W, { keepSignin: true });
+    const rec = a.get(r.id)!;
+    assert.equal(rec.status, 'failed');
+    assert.match(rec.error!, /was removed/);
+    assert.equal(rec.refunded, true);
+    assert.equal(used('asksPerHour'), before, 'exactly the 3 it took were refunded (not 1, not twice)');
+    assert.equal(rec.codeReport, undefined);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test('S24: a named Codex account in config is inert — never routed, never spawned', async () => {
   const h = await makeHarness({ config: (c) => void (c.roles.review = { providers: ['codex', 'claude'] }) });
   try {

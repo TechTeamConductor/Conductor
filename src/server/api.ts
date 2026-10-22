@@ -542,7 +542,17 @@ export class Api {
     }
     if (method === 'POST' && path === '/api/ask') {
       const allowed = new Set(['question', 'repo', 'allowChange', 'mode', 'follow']);
-      if (body.mode !== undefined && body.mode !== 'quick' && body.mode !== 'research') throw new ApiFail(400, 'bad_request', '"mode" must be quick or research.');
+      if (body.mode !== undefined && body.mode !== 'quick' && body.mode !== 'research' && body.mode !== 'web-ask' && body.mode !== 'code-research') throw new ApiFail(400, 'bad_request', '"mode" must be quick, research, web-ask or code-research.');
+      if (body.mode === 'web-ask') {
+        // Online Ask: web only. No repository, no allowChange, no brief or depth — every other field is refused.
+        for (const k of Object.keys(body)) if (!['question', 'mode', 'follow'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+        return { status: 202, json: await this.asksSvc().startWebAsk({ question: body.question, follow: body.follow }) };
+      }
+      if (body.mode === 'code-research') {
+        // deep research against the code: a repository, never a follow-up, never a fast-path change
+        for (const k of Object.keys(body)) if (!['question', 'repo', 'mode'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+        return { status: 202, json: this.asksSvc().startCodeResearch({ question: body.question, repo: body.repo }) };
+      }
       if (body.mode === 'research') {
         for (const k of Object.keys(body)) if (!['question', 'repo', 'mode'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
         return { status: 202, json: await this.asksSvc().startResearch({ question: body.question, repo: body.repo }) };

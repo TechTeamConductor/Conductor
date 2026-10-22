@@ -32,6 +32,8 @@ export interface ReadOnlyRunReq {
   secrets?: string[];
   /** Multiplies the turn cap (retry after error_max_turns). */
   maxTurnsFactor?: number;
+  /** Multiplies the wall-clock limit (code research gets a longer one; absent = 1). */
+  timeoutFactor?: number;
   /** M8-2: the resolved model/effort for this tool (data only). Absent ⇒ the tool-default resolution. */
   sel?: ResolvedSel;
   /** M8-3: the account this run uses (absent/'default' ⇒ today's env, byte-identical). Never a path, never a secret. */
@@ -50,7 +52,7 @@ export interface ResearchRunReq {
   /** M8-2: the research row's resolved selection (Claude). */
   sel?: ResolvedSel;
   /** M8-6: Standard (default — today's exact argv) or Deep. Only `--max-turns` and the wall clock differ (RESEARCH_DEPTH). */
-  depth?: 'standard' | 'deep';
+  depth?: 'standard' | 'deep' | 'quick';
   /** M8-3 (B2): the Claude account research runs on. */
   account?: AccountRef;
 }

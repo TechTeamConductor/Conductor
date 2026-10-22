@@ -64,6 +64,7 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 | | Feature | What it does |
 | --- | --- | --- |
 | 💬 | **Home composer** | One box for everything. **Auto** picks Ask, Build or Research from your line, or you choose. Answers appear as a thread, with the branch and commit they were based on. |
+| 🌐 | **Code \| Online** | A toggle next to the mode chips picks where a request looks. **Online Ask** is a quick web-searched answer with its sources; **Code Research** is a deeper investigation of your repository whose every cited file, line and quote is checked against a read-only copy (Verified / Unverified). Build is not offered when Online. |
 | ❓ | **Quick Ask** | Questions about your code, answered from a read-only snapshot with file citations. No task, no worktree. "Turn into a task" when you want a change. |
 | 🧭 | **Design the work** | One line → repo check → detailed brief → up to **8 ordered parts with dependencies** → untick what you don't want → **Send N tasks** as linked cards. Always waits for your approval. |
 | 🔎 | **Deep Research** | Web-only research in an empty folder: a short brief you review, Standard or Deep depth, and a report where every source is marked **Opened**, **Listed** or **Unverified**. |

@@ -12,6 +12,9 @@ import { assertClaudeConfigDirSafe, ClaudeSettingsError } from '../claude-settin
 const minutes = (n: number) => n * 60_000;
 /** M5 ceiling for any research session's `--max-turns` (Security S14: asserted below). */
 export const RESEARCH_MAX_TURNS_CEILING = 60;
+/** Absolute ceilings for the read-only paths (Quick Ask, plan, code research), whatever factor a caller asks for. */
+export const READONLY_MAX_TURNS_CEILING = 150;
+export const READONLY_HARD_MINUTES_CEILING = 60;
 /**
  * Deep Research depth (M8-6, user decision Q-C): code constants, never config. Standard = today's exact argv (30 turns / 20 min). Deep
  * differs ONLY in `--max-turns` and the wall clock. Worst case with the one schema re-run is 2 × (turns, minutes) — stated in the docs.
@@ -20,6 +23,9 @@ export const RESEARCH_DEPTH = Object.freeze({
   standard: Object.freeze({ maxTurns: 30, hardMin: 20 }),
   deep: Object.freeze({ maxTurns: 50, hardMin: 35 }),
 });
+/** Online Ask (`depth: 'quick'`): a short web-searched answer, not a report. Kept out of RESEARCH_DEPTH, which is pinned to Standard and Deep. */
+export const WEB_ASK_DEPTH = Object.freeze({ maxTurns: 12, hardMin: 6 });
+if (WEB_ASK_DEPTH.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('web ask --max-turns above the ceiling');
 for (const d of Object.values(RESEARCH_DEPTH)) if (d.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('research --max-turns above the ceiling');
 
 export function claudeProvider(d: ProviderDeps): Provider {
@@ -71,7 +77,7 @@ export function claudeProvider(d: ProviderDeps): Provider {
       // web tools need the isolated profile: the fallback that loads project/local settings (hooks) is refused for research
       if (cfg.agents.claude.isolation !== 'safe-mode') return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: "Deep Research needs Claude's safe-mode isolation." };
       const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
-      const depth = req.depth === 'deep' ? RESEARCH_DEPTH.deep : RESEARCH_DEPTH.standard;
+      const depth = req.depth === 'deep' ? RESEARCH_DEPTH.deep : req.depth === 'quick' ? WEB_ASK_DEPTH : RESEARCH_DEPTH.standard;
       if (depth.maxTurns > RESEARCH_MAX_TURNS_CEILING) throw new Error('research --max-turns above the ceiling');
       // M8-3: the account's env (default ⇒ claudeEnv(d.extraEnv), byte-identical); pre-flight + assertion fail closed with zero spawn
       const ce = childEnv('claude', req.account, d.extraEnv);
@@ -93,7 +99,8 @@ export function claudeProvider(d: ProviderDeps): Provider {
       if (!bin) return { ok: false, text: '', exitCode: null, errorKind: 'spawn' as const, error: `Claude CLI "${cfg.agents.claude.bin}" not found. Install Claude Code or set agents.claude.bin.` };
       const key = req.stage === 'plan' ? 'plan' : req.stage === 'plan_review' ? 'review' : 'verify';
       const baseTurns = cfg.agents.claude.maxTurns[key];
-      const maxTurns = Math.round(baseTurns * (req.maxTurnsFactor ?? 1));
+      const maxTurns = Math.min(Math.round(baseTurns * (req.maxTurnsFactor ?? 1)), READONLY_MAX_TURNS_CEILING);
+      const hardMin = Math.min(cfg.pipeline.timeoutsMin[key] * Math.max(1, req.timeoutFactor ?? 1), READONLY_HARD_MINUTES_CEILING);
       const sel = req.sel && req.sel.tool === 'claude' ? req.sel : toolDefaultResolved(cfg, 'claude'); // a selection for another tool is never applied here (CR-N2)
       const ce = childEnv('claude', req.account, d.extraEnv);
       if (!ce.ok) return { ok: false, text: '', exitCode: null, errorKind: 'isolation' as const, error: ce.error };
@@ -101,7 +108,7 @@ export function claudeProvider(d: ProviderDeps): Provider {
         return await runClaude({
           bin, cwd: req.cwd, prompt: req.prompt, stage: req.stage, name: req.name, schema: req.schema,
           maxTurns, isolation: cfg.agents.claude.isolation, model: sel.modelArg, effort: sel.effortArg,
-          env: ce.env, idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(cfg.pipeline.timeoutsMin[key]),
+          env: ce.env, idleMs: minutes(cfg.pipeline.timeoutsMin.idle), hardMs: minutes(hardMin),
           signal: req.signal, onEvent: req.onEvent, secrets: req.secrets, clock: d.clock,
         });
       } finally {
