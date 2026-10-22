@@ -1,10 +1,10 @@
-# Conductor (v2 preview)
+# Conductor — the full guide
 
 **One dashboard for Claude Code and Cursor, with its own board.** Create a task → **Claude plans it** → **Cursor builds it** → **Claude independently verifies it** → bugs go back to Cursor, automatically, until it passes (or asks you).
 
 You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer, in separate git worktrees. **It never pushes, opens PRs, or merges.** There is no external tracker: the board is built in and stored locally.
 
-> **Status.** This is the v2 line (see `.techteam/plans/workspace-v2*.md` for the roadmap). Done so far: the native board (Linear removed), versioned data with backups, side-by-side import of v1 data, **roles and providers** (Claude, Cursor and an opt-in, read-only, *unverified* Codex — see below). Planned next: Codex as an implementer (needs its own isolation proof), task decomposition, a project-context engine, Quick Ask / Deep Research modes, onboarding for three CLIs, desktop installers (Windows `.exe`, Linux `.deb`). Nothing in that second list exists yet.
+> **Status.** This is the v2 line. Built: the native board (no Linear), versioned data with backups, side-by-side import of v1 data, roles and providers, model and effort per job, model discovery, task graphs, a project-context engine, Quick Ask / Deep Research, approval policies, several accounts per tool, run mode, "Design the work", and a macOS `.dmg`. Not built: Windows `.exe` / Linux `.deb`, Codex as a builder, sign-in for extra accounts. See the [README](../README.md) for the overview and `.techteam/plans/` for the roadmap.
 
 ```
 Task card (To do)
@@ -55,7 +55,7 @@ Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still
 
 ## Providers and roles
 
-Every job has a **role** (planning, review, verification, implementation, debugging, documentation, requirements, context, architecture, research) and each role has an **ordered list of providers**. The defaults are exactly what v1 did: Claude plans, reviews and verifies (Cursor takes over those read-only stages if Claude is at its usage limit, or not installed / signed in), Cursor builds. The Settings panel still shows the simple choices; behind it `GET/PUT /api/roles` (see `docs/API.md`) assign providers per role.
+Every job has a **role** (planning, review, verification, implementation, debugging, documentation, requirements, context, architecture, research) and each role has an **ordered list of providers**. The defaults are exactly what v1 did: Claude plans, reviews and verifies (Cursor takes over those read-only stages if Claude is at its usage limit, or not installed / signed in), Cursor builds. The Settings panel still shows the simple choices; behind it `GET/PUT /api/roles` (see [`API.md`](API.md)) assign providers per role.
 
 - **Who may hold which role is decided by code, not by a setting.** A role that writes code (implementation, debugging, documentation) accepts only a provider whose no-push isolation has been *proven* — today only Cursor (proven by the live adversarial suite). Everything else is refused with the reason.
 - **Codex is optional and read-only.** It is in no default chain. It runs in Conductor's **own private Codex home** (`~/.conductor-v2/providers/codex-home`), never your `~/.codex` — so your hooks, MCP servers and rules are not in play. Sign in yourself, once: `CODEX_HOME=~/.conductor-v2/providers/codex-home codex login` (Conductor never runs a login or an install for you). It is labelled **unverified**; assigning it needs an explicit acknowledgement. `conductor doctor --isolation codex --yes` can mark it **blocked** for every role when it sees a violation — but even a *pass* does not lift the label yet: the check's matchers were written from documentation and have never seen a real Codex transcript, so a pass is recorded and shown ("not yet trusted") without changing the tier. *This machine's Codex install is broken (its native binary is missing), so the Codex check has never run against a real binary — everything above is tested against a scripted stand-in.*
@@ -77,14 +77,14 @@ Every job has a **role** (planning, review, verification, implementation, debugg
 - **Claude stages are locked down:** read-only (`Read`, `Grep`, `Glob`), no MCP servers, no skills/plugins, your global Claude rules are not loaded, credential files are denied. Conductor checks this on every run and refuses to continue if the session is not what it asked for.
 - **Cursor builds with `--force`** inside a dedicated git worktree in a **v2-only namespace** (`conductor-v2/<key>` branches, `refs/conductor-v2/…`, `.conductor-v2-worktrees`), so v1 and v2 can never touch each other's checkouts. It cannot push (deny rule + environment), but — like any coding agent — it can run commands as you. Only register repos you trust.
 - **The builder cannot leave things behind:** git hooks/config are snapshotted and restored around every build; the whole branch (including commits the agent made itself) is scanned for secrets and for changes to protected files (`.claude/`, `.cursor/`, `AGENTS.md`, CI config, …), which are held for you.
-- **Briefs are model text.** A "Design the work" brief and its parts are labelled as written by a model; cards made from them always wait for your plan approval (see `docs/ARCHITECTURE.md` for the residual risks). After the first use the board is stored as schema 3: an older Conductor refuses it, and the way back is the `pre-board-v3` backup in `~/.conductor-backups` (cards made since are lost).
+- **Briefs are model text.** A "Design the work" brief and its parts are labelled as written by a model; cards made from them always wait for your plan approval (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the residual risks). After the first use the board is stored as schema 3: an older Conductor refuses it, and the way back is the `pre-board-v3` backup in `~/.conductor-backups` (cards made since are lost).
 - **Your data is versioned and backed up:** every data file carries a version; files from a newer Conductor are refused (never downgraded); an older file is backed up to `~/.conductor-backups` before it is upgraded.
 - **Usage limits are handled:** when Claude says "weekly limit", **Cursor takes over the read-only stages automatically** (setting `onClaudeLimit`); repeated limits back off (15 min → 6 h).
 - **Which Claude?** Conductor calls the `claude` command-line tool, which is signed in separately from the Claude desktop app. `npm run doctor` shows which account and plan it uses.
 
 ## Several accounts per tool (M8-3)
 
-Settings → "Accounts and limits", or `conductor accounts list | add <claude|cursor> --name "Work" | check [<id>] | move <id> up|down | remove <id> [--keep-signin]`. Your own sign-in is the `default` account and nothing changes for it. At a usage limit, Conductor moves to the next account, then to the next tool, but only to a tool that is in that job's list. You can change this to "same tool only" or "wait". Signing extra accounts in (`conductor accounts login <id>`) is not enabled yet: it waits for a live check. Read "Accounts per tool" in `docs/ARCHITECTURE.md` before you add one.
+Settings → "Accounts and limits", or `conductor accounts list | add <claude|cursor> --name "Work" | check [<id>] | move <id> up|down | remove <id> [--keep-signin]`. Your own sign-in is the `default` account and nothing changes for it. At a usage limit, Conductor moves to the next account, then to the next tool, but only to a tool that is in that job's list. You can change this to "same tool only" or "wait". Signing extra accounts in (`conductor accounts login <id>`) is not enabled yet: it waits for a live check. Read "Accounts per tool" in [`ARCHITECTURE.md`](ARCHITECTURE.md) before you add one.
 
 ## Commands
 
@@ -102,4 +102,4 @@ npm test                   unit + end-to-end tests (fake agents)
 npm run test:live          LIVE=1 tests against the real Cursor CLI (uses a little quota)
 ```
 
-More: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) · [`docs/API.md`](docs/API.md)
+More: [[`ARCHITECTURE.md`](ARCHITECTURE.md)](docs/ARCHITECTURE.md) · [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) · [[`API.md`](API.md)](API.md)

@@ -86,7 +86,7 @@ test('M8-3 seams: envFor(provider, account), per-account cache file, accountIds 
   const envCalls: string[] = [];
   const { svc, spawns } = buildService(h, {
     spawnImpl: stubSpawn([okLine]),
-    envFor: (p, a) => (envCalls.push(`${p}:${a}`), { PATH: process.env.PATH ?? '' }),
+    envFor: (p, a) => (envCalls.push(`${p}:${a}`), { PATH: process.env.PATH ?? '', CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? '' }),
     accountIds: () => ['default', 'work'],
   });
   await svc.startup({ claude: { found: true, state: 'ok', version: '2.1.304' } });

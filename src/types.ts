@@ -716,6 +716,11 @@ export interface ApiState {
   cards: ApiCard[];
   /** M8-3: every account of every tool, in order (the field M8-U feature-detects). */
   accounts?: AccountView[];
+  /**
+   * M8-5: plans in `awaiting_approval` right now. `eligible` is exactly what "Approve waiting plans" may send
+   * (titles redacted). Also on SSE `state` merges.
+   */
+  waiting?: { total: number; bulkApprovable: number; eligible: { key: string; rev: number; title: string }[] };
   /** M8-6 C1 (additive): Home composer features — "Design the work" and the research brief — and the counters it shows. */
   home?: { design: true; researchBrief: boolean; limits: { designPerHour: number; designUsed: number; researchPerDay: number; researchUsed: number } };
 }

@@ -349,6 +349,14 @@ function normalizeState(d) {
   d.settings.stages = Object.assign({ plan: 'claude', review: 'claude', verify: 'claude' }, d.settings.stages || {});
   // M8-3: feature-detected — an older server has no `accounts`
   d.accounts = Array.isArray(d.accounts) ? d.accounts.filter((a) => a && typeof a.id === 'string' && typeof a.provider === 'string') : null;
+  // M8-5: plans waiting for approval (eligible = Approve waiting plans list)
+  if (d.waiting && typeof d.waiting === 'object') {
+    d.waiting = {
+      total: Number(d.waiting.total) || 0,
+      bulkApprovable: Number(d.waiting.bulkApprovable) || 0,
+      eligible: Array.isArray(d.waiting.eligible) ? d.waiting.eligible.filter((e) => e && typeof e.key === 'string' && typeof e.rev === 'number') : [],
+    };
+  } else d.waiting = null;
   return d;
 }
 function normalizeDetail(d) {
@@ -488,6 +496,13 @@ function onStateEvent(d) {
   if (d.engine) { S.state.engine = Object.assign({}, S.state.engine, d.engine); S.state.engine.providerPause = S.state.engine.providerPause || {}; }
   if (d.quota) S.state.quota = d.quota;
   if (Array.isArray(d.accounts)) S.state.accounts = d.accounts;
+  if (d.waiting && typeof d.waiting === 'object') {
+    S.state.waiting = {
+      total: Number(d.waiting.total) || 0,
+      bulkApprovable: Number(d.waiting.bulkApprovable) || 0,
+      eligible: Array.isArray(d.waiting.eligible) ? d.waiting.eligible.filter((e) => e && typeof e.key === 'string' && typeof e.rev === 'number') : [],
+    };
+  }
   if (d.now) S.offset = d.now - Date.now();
   renderLive();
   if (S.view === 'board') boardPoke(false);
@@ -568,6 +583,124 @@ function updateAcctButton(wizard) {
   toggleHidden(HDR.acctN, !lim);
   setText(HDR.acctN, lim || '');
   HDR.acctBtn.title = lim ? (lim === 1 ? '1 account is at its usage limit' : lim + ' accounts are at their usage limit') : 'Accounts';
+}
+
+/* ───────────────────────── M8-5 run mode + approve waiting ───────────────────────── */
+const runModeOn = () => !!(S.state && S.state.settings && typeof S.state.settings.runMode === 'string');
+const currentRunMode = () => (S.state && ((S.state.engine && S.state.engine.runMode) || (S.state.settings && S.state.settings.runMode))) || 'per-settings';
+const waitingOf = () => (S.state && S.state.waiting) || { total: 0, bulkApprovable: 0, eligible: [] };
+
+/** Segmented Per settings | Complete auto. Writes via PUT /api/run-mode only (never Settings Save). */
+function runModeSeg(opts) {
+  const o = opts || {};
+  const name = uid('rm');
+  const mk = (val, label) => {
+    const id = uid('rmi');
+    const inp = h('input', { type: 'radio', name, id, value: val });
+    inp.checked = currentRunMode() === val;
+    inp.addEventListener('change', () => { if (inp.checked) setRunMode(val); });
+    return h('label', { for: id }, inp, h('span', null, label));
+  };
+  const el = h('fieldset', { class: 'seg run-mode-seg', 'aria-label': 'Run mode' },
+    h('legend', { class: 'sr-only' }, 'Run mode'),
+    mk('per-settings', 'Per settings'),
+    mk('complete-auto', 'Complete auto'));
+  const sync = () => {
+    const mode = currentRunMode();
+    for (const inp of el.querySelectorAll('input')) inp.checked = inp.value === mode;
+  };
+  if (o.hint) el.append(h('span', { class: 'sr-only' }, o.hint));
+  return { el, sync };
+}
+
+async function setRunMode(runMode) {
+  if (!runModeOn()) return;
+  const from = currentRunMode();
+  if (from === runMode) return;
+  if (runMode === 'complete-auto') {
+    const text = String(M.COMPLETE_AUTO_CONFIRM || '').replace(/\s*Send "confirm": true\.\s*$/, '');
+    if (!window.confirm(text)) { syncRunModeUi(); return; }
+  }
+  try {
+    const body = runMode === 'complete-auto' ? { runMode, confirm: true } : { runMode };
+    const r = await api('PUT', '/api/run-mode', body);
+    if (r.settings) S.state.settings = Object.assign({}, S.state.settings, r.settings);
+    if (r.waiting) S.state.waiting = r.waiting;
+    if (S.state.engine) S.state.engine.runMode = r.runMode;
+    syncRunModeUi();
+    if (typeof S._syncSettingsRunMode === 'function') S._syncSettingsRunMode();
+    renderLive();
+    const w = waitingOf();
+    if (r.changed) {
+      let msg = r.runMode === 'complete-auto' ? 'Complete auto is on.' : 'Back to Per settings.';
+      if (w.total > 0) msg += ' ' + w.total + (w.total === 1 ? ' plan is' : ' plans are') + ' still waiting.';
+      toast('good', msg);
+    }
+  } catch (e) {
+    if (e instanceof ApiFail && e.code === 'confirm_required') {
+      if (window.confirm(e.message.replace(/\s*Send "confirm": true\.\s*$/, ''))) {
+        try {
+          const r = await api('PUT', '/api/run-mode', { runMode: 'complete-auto', confirm: true });
+          if (r.settings) S.state.settings = Object.assign({}, S.state.settings, r.settings);
+          if (r.waiting) S.state.waiting = r.waiting;
+          if (S.state.engine) S.state.engine.runMode = r.runMode;
+          syncRunModeUi();
+          if (typeof S._syncSettingsRunMode === 'function') S._syncSettingsRunMode();
+          renderLive();
+          toast('good', 'Complete auto is on.');
+          return;
+        } catch (e2) { toast('error', e2.message); }
+      }
+    } else toast('error', e.message);
+    syncRunModeUi();
+  }
+}
+
+function syncRunModeUi() {
+  if (B.runMode) B.runMode.sync();
+  if (B.approveBtn) {
+    const n = waitingOf().bulkApprovable;
+    toggleHidden(B.approveBtn, !runModeOn() || n < 1);
+    setText(B.approveLbl, n === 1 ? 'Approve 1 waiting plan' : 'Approve ' + n + ' waiting plans');
+  }
+}
+
+async function openApproveWaiting() {
+  try { await loadState(); } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); return; }
+  const snap = waitingOf();
+  const eligible = (snap.eligible || []).slice();
+  if (!eligible.length) { toast('info', 'No plans are ready to approve from the waiting list.'); syncRunModeUi(); return; }
+  const list = h('ul', { class: 'approve-wait-list' }, eligible.map((e) =>
+    h('li', null, h('code', null, e.key), h('span', null, e.title || '(no title)'))));
+  const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
+  const go = h('button', { type: 'button', class: 'btn btn-primary' }, 'Approve ' + eligible.length + (eligible.length === 1 ? ' plan' : ' plans'));
+  const cancel = h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel');
+  go.addEventListener('click', async () => {
+    err.hidden = true;
+    setBusy(go, true);
+    try {
+      const body = M.approveWaitingBody(eligible);
+      if (!body.runs.length) { showErr('Nothing to approve.'); setBusy(go, false); return; }
+      const r = await api('POST', '/api/runs/approve-waiting', body);
+      $('#dlg').close();
+      const approved = Array.isArray(r.approved) ? r.approved : [];
+      const skipped = Array.isArray(r.skipped) ? r.skipped : [];
+      let msg = approved.length + (approved.length === 1 ? ' plan approved.' : ' plans approved.');
+      if (skipped.length) msg += ' ' + skipped.length + ' skipped.';
+      toast(approved.length ? 'good' : 'warn', msg);
+      for (const s of skipped.slice(0, 8)) toast('warn', s.key + ': ' + M.skipReasonLabel(s.reason));
+      loadState().catch(() => {});
+    } catch (e) {
+      if (e instanceof ApiFail && e.status === 401) return;
+      setText(err, e.message); err.hidden = false; setBusy(go, false);
+    }
+  });
+  const showErr = (m) => { setText(err, m); err.hidden = false; };
+  const dlg = dlgShell('Approve waiting plans', [
+    h('p', { class: 'muted' }, 'These plans are waiting and are not held for a safety reason. Approving starts the build for each one.'),
+    list, err,
+  ], [cancel, go]);
+  dlg.showModal();
 }
 function engineView(eng) {
   const pp = eng.providerPause || {};
@@ -1810,7 +1943,13 @@ function buildBoardView() {
   boardPoke(true);
   B.items = h('div', { class: 'summary-items' });
   B.polled = h('span', { class: 'sum-quiet' });
-  B.summary = h('div', { class: 'summary' }, h('h1', null, 'Board'), B.items, h('span', { class: 'summary-spacer' }), B.polled);
+  B.runMode = runModeOn() ? runModeSeg() : null;
+  B.approveLbl = h('span', null, 'Approve waiting plans');
+  B.approveBtn = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => openApproveWaiting() }, icon('tick'), B.approveLbl);
+  B.summary = h('div', { class: 'summary' },
+    h('h1', null, 'Board'), B.items,
+    ...(B.runMode ? [h('div', { class: 'run-mode-wrap' }, B.runMode.el, B.approveBtn)] : []),
+    h('span', { class: 'summary-spacer' }), B.polled);
   B.board = h('div', { class: 'board', role: 'group', 'aria-label': 'Runs by stage', tabindex: '0' });
   for (const c of COLUMNS) {
     const headId = uid('colh');
@@ -2018,6 +2157,7 @@ function updateBoard() {
   for (const r of open) (byCol.get(r.column) || byCol.get('queued')).push(r);
 
   updateBoardWording();
+  syncRunModeUi();
   toggleHidden(B.empty, open.length > 0 || idle > 0);
   toggleHidden(B.board, open.length === 0 && idle === 0);
   setText(B.pollEl, st.engine.pollSeconds || 5);
@@ -3450,11 +3590,34 @@ function openSettings(focus) {
   };
   const ruleHint = h('p', { class: 'muted', role: 'status' });
   const syncRuleHint = () => {
-    const eff = s.limitRuleEffective && s.limitRuleEffective !== c.limitRule.value && c.limitRule.value === s.limitRule ? s.limitRuleEffective : c.limitRule.value;
-    setText(ruleHint, (M.LIMIT_RULE_HINT[c.limitRule.value] || '') + (eff !== c.limitRule.value ? ' The run mode currently applies "' + M.LIMIT_RULE_LABEL[eff] + '".' : ''));
+    const cur = S.state.settings;
+    const eff = cur.limitRuleEffective && cur.limitRuleEffective !== c.limitRule.value && c.limitRule.value === cur.limitRule ? cur.limitRuleEffective : c.limitRule.value;
+    const ov = M.runModeOverridden(cur.overriddenByRunMode, 'limitRule');
+    setText(ruleHint, (M.LIMIT_RULE_HINT[c.limitRule.value] || '') + (ov && eff !== c.limitRule.value ? ' Complete auto currently applies "' + (M.LIMIT_RULE_LABEL[eff] || eff) + '".' : ''));
   };
   c.limitRule.addEventListener('change', syncRuleHint);
   syncRuleHint();
+  const applyOverrides = () => {
+    const ov = (S.state.settings && S.state.settings.overriddenByRunMode) || [];
+    const paOff = M.runModeOverridden(ov, 'planApproval');
+    const lrOff = M.runModeOverridden(ov, 'limitRule');
+    c.planApproval.disabled = paOff;
+    c.limitRule.disabled = lrOff;
+    syncRuleHint();
+  };
+  applyOverrides();
+  const setRm = runModeOn() ? runModeSeg() : null;
+  const rmHint = h('p', { class: 'muted', role: 'status' },
+    'Complete auto approves and builds ordinary plans without asking, and at a usage limit moves to the next account then the next tool in the job\'s list. Large changes, protected files and unverified cards still wait.');
+  const rmApprove = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => { $('#dlg').close(); openApproveWaiting(); } }, 'Approve waiting plans');
+  const syncRmApprove = () => {
+    const n = waitingOf().bulkApprovable;
+    toggleHidden(rmApprove, !runModeOn() || n < 1);
+    setText(rmApprove, n === 1 ? 'Approve 1 waiting plan' : 'Approve ' + n + ' waiting plans');
+    if (setRm) setRm.sync();
+    applyOverrides();
+  };
+  syncRmApprove();
   const accts = accountsPanel();
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
   const showErr = (m) => { setText(err, m); err.hidden = false; };
@@ -3562,8 +3725,14 @@ function openSettings(focus) {
     $('#dlg').close(); showExpired();
   } }, icon('logout'), h('span', null, 'Sign out'));
   const dlg = dlgShell('Settings', [
+    ...(setRm ? [group('Run mode',
+      h('div', { class: 'run-mode-wrap' }, setRm.el, rmApprove),
+      rmHint,
+      h('p', { class: 'muted' }, 'This switch saves at once. It is not part of Save changes below.'))] : []),
     group('Planning',
-      fld('Plan approval', c.planApproval, 'Automatic starts building as soon as the plan is written. Large plans always ask.'),
+      fld('Plan approval', c.planApproval, M.runModeOverridden((S.state.settings && S.state.settings.overriddenByRunMode) || [], 'planApproval')
+        ? 'Complete auto is on: ordinary plans approve themselves. Large changes, protected files and unverified cards still wait.'
+        : 'Automatic starts building as soon as the plan is written. Large plans always ask.'),
       fld('Plan review', c.planReview, 'A second pass checks the plan before anything is built.')),
     group('Who does what',
       h('p', { class: 'who-intro' }, 'Pick the tool, the model and how hard it should think for each job. Each tool names its models and levels differently, so the choices change with the tool. Some tools cannot take some jobs yet; the reason is shown when you pick one. These are global settings: they apply to every request and every card.'),
@@ -3578,6 +3747,8 @@ function openSettings(focus) {
     err,
   ], [signOut, h('button', { type: 'button', class: 'btn', onclick: () => { $('#dlg').close(); navigate('#/setup'); } }, icon('folder'), h('span', null, 'Repositories and setup')),
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
+  S._syncSettingsRunMode = syncRmApprove;
+  dlg.addEventListener('close', () => { if (S._syncSettingsRunMode === syncRmApprove) delete S._syncSettingsRunMode; }, { once: true });
   fillWho();
   dlg.showModal();
   if (focus === 'accounts') { const g = dlg.querySelector('#set-accounts'); if (g) g.scrollIntoView({ block: 'start' }); }

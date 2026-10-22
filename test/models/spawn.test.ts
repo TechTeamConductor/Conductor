@@ -92,10 +92,12 @@ test('S4 Cursor: a 5 MB flood with no newline ⇒ unavailable too large', async 
 test('R2-5: a valid reply that arrived before the overflow is discarded', async () => {
   const fx = readJson(join(REAL, 'claude-initialize-2.1.304.json'));
   const line = JSON.stringify({ type: 'control_response', response: { ...fx.response, request_id: 'r1' } });
-  const r = await discoverClaude({ bin: 'x', cwd: '/', env: {}, timeoutMs: 1000, signal: new AbortController().signal, spawn: stubSpawn([{ line }], { overflow: true }) });
+  // F1-C: empty env would resolve to the developer ~/.claude — use the suite throw-away config dir
+  const env = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR! };
+  const r = await discoverClaude({ bin: 'x', cwd: '/', env, timeoutMs: 1000, signal: new AbortController().signal, spawn: stubSpawn([{ line }], { overflow: true }) });
   assert.equal(r.ok, false);
   assert.equal(!r.ok && r.kind, 'too-large');
-  const ok = await discoverClaude({ bin: 'x', cwd: '/', env: {}, timeoutMs: 1000, signal: new AbortController().signal, spawn: stubSpawn([{ line }]) });
+  const ok = await discoverClaude({ bin: 'x', cwd: '/', env, timeoutMs: 1000, signal: new AbortController().signal, spawn: stubSpawn([{ line }]) });
   assert.equal(ok.ok, true);
 });
 

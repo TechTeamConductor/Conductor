@@ -7,10 +7,10 @@ import { createProviders } from './agents/providers/registry.ts';
 import { legacyModelNotices, resolveBin } from './config.ts';
 import { toolDefaultResolved } from './models/select.ts';
 import { claudeEnv, cursorEnv } from './agents/env.ts';
-import { buildClaudeArgs, checkClaudeInit } from './agents/claude.ts';
-import { runClaude } from './agents/claude.ts';
+import { buildClaudeArgs, checkClaudeInit, runClaude } from './agents/claude.ts';
 import { runCursor } from './agents/cursor.ts';
 import { runProcess } from './agents/spawn.ts';
+import { assertClaudeConfigDirSafe, ClaudeSettingsError, withProjectSettingsNeutralized } from './agents/claude-settings.ts';
 import { scanAncestors } from './git/worktree.ts';
 import { KeychainStore } from './secrets.ts';
 import { errMsg, systemClock, truncate } from './util.ts';
@@ -130,27 +130,38 @@ export async function isolationProbe(cfg: Config): Promise<IsolationReport> {
     const initEvents: any[] = [];
     let sid = '';
     let limited: string | undefined;
-    const r = await runProcess({
-      bin,
-      args: buildClaudeArgs({ maxTurns: 3, isolation: cfg.agents.claude.isolation, name: 'conductor isolation probe', schema: undefined, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg }),
-      cwd: repo,
-      env: claudeEnv(),
-      stdin: 'Reply with the single word OK.',
-      idleMs: 60_000,
-      hardMs: 90_000,
-      onLine: (line, stream) => {
-        if (stream !== 'stdout') return;
-        try {
-          const o = JSON.parse(line);
-          if (o.type === 'system' && o.subtype === 'init') initEvents.push(o);
-          if (typeof o.session_id === 'string') sid = o.session_id;
-          if (o.type === 'result' && o.is_error && /limit/i.test(String(o.result))) limited = String(o.result);
-        } catch {
-          /* ignore */
-        }
-      },
-    });
-    void r;
+    const env = claudeEnv();
+    // F1: same A+C choke as stages — never raw-spawn stage argv past a planted settings helper/env
+    try {
+      assertClaudeConfigDirSafe(env);
+    } catch (e) {
+      if (e instanceof ClaudeSettingsError) {
+        return { ok: false, initOk: false, projectClaudeMdLoaded: false, ancestorLoaded: false, userRulesLoaded: false, note: e.message };
+      }
+      throw e;
+    }
+    await withProjectSettingsNeutralized(repo, () =>
+      runProcess({
+        bin,
+        args: buildClaudeArgs({ maxTurns: 3, isolation: cfg.agents.claude.isolation, name: 'conductor isolation probe', schema: undefined, model: toolDefaultResolved(cfg, 'claude').modelArg, effort: toolDefaultResolved(cfg, 'claude').effortArg }),
+        cwd: repo,
+        env,
+        stdin: 'Reply with the single word OK.',
+        idleMs: 60_000,
+        hardMs: 90_000,
+        onLine: (line, stream) => {
+          if (stream !== 'stdout') return;
+          try {
+            const o = JSON.parse(line);
+            if (o.type === 'system' && o.subtype === 'init') initEvents.push(o);
+            if (typeof o.session_id === 'string') sid = o.session_id;
+            if (o.type === 'result' && o.is_error && /limit/i.test(String(o.result))) limited = String(o.result);
+          } catch {
+            /* ignore */
+          }
+        },
+      }),
+    );
     const init = initEvents[0];
     const chk = checkClaudeInit(init);
     let transcript = '';

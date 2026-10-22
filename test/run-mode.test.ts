@@ -263,7 +263,7 @@ test('T4 run-mode API: strict body, confirm to turn on, idempotent same-mode, PU
     await bad({ runMode: 'complete-auto' }, 'confirm_required');
     await bad({ runMode: 'complete-auto', confirm: false }, 'confirm_required');
     await bad({ runMode: 'complete-auto', confirm: 'true' });
-    await assert.rejects(put({ runMode: 'complete-auto' }), (e: any) => /Large changes, protected files, plans with more than 8 tasks and cards from unverified sources/.test(e.message), 'N8: the confirm text names every forced hold');
+    await assert.rejects(put({ runMode: 'complete-auto' }), (e: any) => /Large changes, protected files, plans with more than 8 tasks and cards from unverified sources/.test(e.message) && /next tool in the job's list/.test(e.message), 'N8 + M8-5 B2: confirm text names every forced hold and is chain-only');
     assert.equal(saves, 0, 'nothing written by any refused call');
     // same mode: idempotent, nothing written
     let r = (await put({ runMode: 'per-settings' })).json;
@@ -280,6 +280,7 @@ test('T4 run-mode API: strict body, confirm to turn on, idempotent same-mode, PU
     assert.equal(before.pipeline.runMode, 'per-settings', 'the old live object was never mutated');
     assert.equal(typeof cur.pipeline.runModeChangedAt, 'number');
     assert.equal(api.live().engine.runMode, 'complete-auto');
+    assert.equal(api.live().waiting.total, 1, 'M8-5: waiting is on live()');
     assert.equal(h.run(waitingKey).status, 'awaiting_approval', 'turning it on approves nothing');
     // same mode again ⇒ no write
     assert.equal((await put({ runMode: 'complete-auto', confirm: true })).json.changed, false);
@@ -360,6 +361,8 @@ test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; 
     assert.deepEqual(state.settings.overriddenByRunMode, []);
     assert.deepEqual([state.settings.limitRule, state.settings.limitRuleEffective], ['wait', 'wait']);
     assert.equal(state.engine.runMode, 'per-settings');
+    assert.ok(state.waiting && typeof state.waiting.total === 'number', 'M8-5: waiting on GET /api/state');
+    assert.deepEqual([state.waiting.total, state.waiting.bulkApprovable, state.waiting.eligible], [0, 0, []]);
     const mut = { cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' };
     const on = { runMode: 'complete-auto', confirm: true };
     assert.equal((await req('/api/run-mode', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: on })).status, 401);

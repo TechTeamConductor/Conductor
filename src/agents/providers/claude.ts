@@ -7,6 +7,7 @@ import { cheapSelfTest, cliOut, detectFromVersion } from './probe.ts';
 import type { Config } from '../../types.ts';
 import { toolDefaultResolved } from '../../models/select.ts';
 import { childEnv } from '../../accounts/env.ts';
+import { assertClaudeConfigDirSafe, ClaudeSettingsError } from '../claude-settings.ts';
 
 const minutes = (n: number) => n * 60_000;
 /** M5 ceiling for any research session's `--max-turns` (Security S14: asserted below). */
@@ -33,7 +34,15 @@ export function claudeProvider(d: ProviderDeps): Provider {
     async auth(cfg: Config): Promise<AuthResult> {
       const bin = resolveBin(cfg.agents.claude.bin);
       if (!bin) return { state: 'unknown' };
-      const a = await cliOut(bin, ['auth', 'status'], claudeEnv(d.extraEnv));
+      const env = claudeEnv(d.extraEnv);
+      // F1-C: auth status honours settings.json (L3b) — refuse before spawn; --version (detect) stays exempt
+      try {
+        assertClaudeConfigDirSafe(env);
+      } catch (e) {
+        if (e instanceof ClaudeSettingsError) return { state: 'unknown', detail: e.message };
+        throw e;
+      }
+      const a = await cliOut(bin, ['auth', 'status'], env);
       if (a.spawnError) return { state: 'unknown', detail: a.spawnError };
       try {
         const j = JSON.parse(a.out.slice(a.out.indexOf('{')));

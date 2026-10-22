@@ -99,9 +99,18 @@ test('ui/style.css: no @import and no external url()', () => {
 
 test('no code for controls whose backend is not built yet (M8-U §2.0; each slice removes its own entry)', () => {
   const app = code(read('app.js'));
-  for (const id of ['runMode', '/api/run-mode', '/api/models']) { // M8-3 removed '/api/accounts' (its backend landed)
+  // M8-5 lifted runMode / /api/run-mode. Keep /api/models — catalogs arrive via /api/roles (Reviewer B3).
+  for (const id of ['/api/models']) {
     assert.ok(!app.includes(id), `ui/app.js mentions ${id}`);
   }
+});
+
+test('M8-5: approve-waiting body is built only from waiting.eligible (Security UI contract)', () => {
+  const app = code(read('app.js'));
+  assert.ok(app.includes("'/api/runs/approve-waiting'"), 'approve-waiting call present');
+  assert.ok(app.includes('approveWaitingBody'), 'uses the pure helper for the body');
+  assert.ok(app.includes("'/api/run-mode'"), 'run-mode PUT present');
+  assert.ok(!/innerHTML/.test(app));
 });
 
 /** M8-U2 (S15): an id that goes into an /api/asks/ or /api/items/ path is always encodeURIComponent-ed (`enc(`) right after the prefix. */

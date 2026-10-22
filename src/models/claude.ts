@@ -5,6 +5,7 @@
 import type { SpawnOpts, SpawnResult } from '../agents/spawn.ts';
 import type { DiscoveryOutcome, ModelEntry } from './types.ts';
 import { MAX_MODELS, LABEL_MAX, cleanEfforts, cleanId, cleanPlan, cleanText, cleanVersion, isObj, own, scrubIdentity } from './sanitize.ts';
+import { assertClaudeConfigDirSafe, ClaudeSettingsError } from '../agents/claude-settings.ts';
 
 /** The constant discovery argv (B5a pins it exactly). `--no-session-persistence` is mandatory (S6); `--safe-mode` always (N4). */
 export const CLAUDE_DISCOVERY_ARGS: readonly string[] = Object.freeze([
@@ -130,6 +131,13 @@ export async function discoverClaude(ctx: DiscoveryRunCtx): Promise<DiscoveryOut
   let stderrBytes = 0;
   let result: SpawnResult;
   try {
+    // F1-C: discovery uses an empty cwd (A N/A) but still reads the config dir
+    try {
+      assertClaudeConfigDirSafe(ctx.env);
+    } catch (e) {
+      if (e instanceof ClaudeSettingsError) return { ok: false, kind: 'refused', reason: e.message, identity: [] };
+      throw e;
+    }
     result = await ctx.spawn({
       bin: ctx.bin,
       args: [...CLAUDE_DISCOVERY_ARGS],

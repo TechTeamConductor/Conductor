@@ -97,7 +97,7 @@ const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 const log = logger('api');
 /** M8-4 §2.3/N8: the static confirmation text for turning Complete auto on (names every forced hold). */
 const COMPLETE_AUTO_CONFIRM =
-  'Complete auto approves and builds plans without asking you and moves work to the next account or tool at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
+  'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
 // L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -186,7 +186,7 @@ export class Api {
     return { total: waiting.length, bulkApprovable: eligible.length, eligible };
   }
 
-  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota']; cards: ApiState['cards']; accounts?: ApiState['accounts'] } {
+  live(): { now: number; runs: ApiState['runs']; engine: ApiState['engine']; quota: ApiState['quota']; cards: ApiState['cards']; accounts?: ApiState['accounts']; waiting: NonNullable<ApiState['waiting']> } {
     const cfg = this.d.getConfig();
     const now = Date.now();
     const st = this.d.engine.status();
@@ -218,6 +218,7 @@ export class Api {
       },
       quota: st.quota,
       cards: this.cards(st.ignored),
+      waiting: this.waiting(),
       ...(this.d.accounts ? { accounts: this.d.accounts.list() } : {}),
     };
   }
@@ -253,6 +254,7 @@ export class Api {
       repos: cfg.repos.map((r) => this.repoView(r, persist)),
       runs: live.runs,
       cards: live.cards,
+      waiting: live.waiting,
       ...(live.accounts ? { accounts: live.accounts } : {}),
       ...(this.d.briefs ? { home: this.homeState(cfg) } : {}),
     };

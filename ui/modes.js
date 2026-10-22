@@ -326,13 +326,37 @@
     return n('opened') + ' opened · ' + n('listed') + ' listed · ' + n('unverified') + ' unverified';
   }
 
-  /** M8-3: the limit rule, in the words the Settings panel and the accounts popover use (N7: "only if it is in that job's list"). */
-  const LIMIT_RULE_LABEL = { switch: 'Next account, then another tool', same: 'Next account of the same tool', wait: 'Wait for the first account' };
+  /** M8-3 / M8-5: the limit rule; switch label names the job's list (M8-4 Reviewer N3). */
+  const LIMIT_RULE_LABEL = { switch: 'Next account, then the next tool in the job\'s list', same: 'Next account of the same tool', wait: 'Wait for the first account' };
   const LIMIT_RULE_HINT = {
     switch: 'At a usage limit, work moves to the next account of the same tool, then to another tool only if it is in that job\'s list.',
     same: 'At a usage limit, work moves to the next account of the same tool. It never moves to another tool.',
     wait: 'At a usage limit, work waits for the first account of the tool to reset.',
   };
+  /** Must match `COMPLETE_AUTO_CONFIRM` in `src/server/api.ts` (M8-5 B2). */
+  const COMPLETE_AUTO_CONFIRM =
+    'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
+  const SKIP_REASON_LABEL = Object.freeze({
+    forced: 'Held for a safety reason',
+    risky: 'Needs a per-card risk confirmation',
+    stale: 'Plan was replaced — refresh and try again',
+    not_waiting: 'No longer waiting for approval',
+    missing: 'Card not found',
+  });
+  const isCompleteAuto = (runMode) => runMode === 'complete-auto';
+  const runModeOverridden = (overridden, key) => Array.isArray(overridden) && overridden.includes(key);
+  /** Body for POST /api/runs/approve-waiting — only the server's eligible list (Security). */
+  function approveWaitingBody(eligible) {
+    const runs = [];
+    if (!Array.isArray(eligible)) return { runs, confirm: true };
+    for (const e of eligible) {
+      if (!e || typeof e !== 'object') continue;
+      if (typeof e.key !== 'string' || typeof e.rev !== 'number') continue;
+      runs.push({ key: e.key, rev: e.rev });
+    }
+    return { runs, confirm: true };
+  }
+  const skipReasonLabel = (reason) => SKIP_REASON_LABEL[reason] || 'Skipped';
   /** N5: a chip says "Switched" only for a limit move; any other move (signed out, missing, removed) says what it was. */
   function movedChip(m) {
     if (!m || typeof m !== 'object') return null;
@@ -348,5 +372,6 @@
     selFields, selOf, sameSel, withSel, moreNote,
     RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
     LIMIT_RULE_LABEL, LIMIT_RULE_HINT, movedChip,
+    COMPLETE_AUTO_CONFIRM, isCompleteAuto, runModeOverridden, approveWaitingBody, skipReasonLabel,
   });
 })();

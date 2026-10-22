@@ -43,6 +43,12 @@ interface Modes {
   toolJobs(roles: Roles, provider: string): string;
   colHints(roles: Roles, labelOf: (id: string) => string): { planning: string | null; building: string | null; verifying: string | null };
   flowText(roles: Roles, planApproval: string, labelOf: (id: string) => string): { steps: { t: string; d: string }[]; howTail: string };
+  LIMIT_RULE_LABEL: Record<string, string>;
+  COMPLETE_AUTO_CONFIRM: string;
+  isCompleteAuto(runMode: unknown): boolean;
+  runModeOverridden(overridden: unknown, key: string): boolean;
+  approveWaitingBody(eligible: unknown): { runs: { key: string; rev: number }[]; confirm: true };
+  skipReasonLabel(reason: unknown): string;
 }
 
 const src = readFileSync(join(import.meta.dirname, '..', 'ui', 'modes.js'), 'utf8');
@@ -386,6 +392,21 @@ test('M8-U2 boardExtras never throws on bad input', () => {
     const x = j(M.boardExtras(bad));
     assert.deepEqual(x, { cards: {}, research: { planning: [], ready: [], needs_human: [] } }, JSON.stringify(bad));
   }
+});
+
+test('M8-5 run-mode helpers + chain-only wording', () => {
+  assert.equal(M.isCompleteAuto('complete-auto'), true);
+  assert.equal(M.isCompleteAuto('per-settings'), false);
+  assert.equal(M.isCompleteAuto(null), false);
+  assert.equal(M.runModeOverridden(['planApproval', 'limitRule'], 'planApproval'), true);
+  assert.equal(M.runModeOverridden(['planApproval'], 'limitRule'), false);
+  assert.equal(M.runModeOverridden(null, 'planApproval'), false);
+  assert.match(M.LIMIT_RULE_LABEL.switch, /job's list/);
+  assert.match(M.COMPLETE_AUTO_CONFIRM, /next tool in the job's list/);
+  assert.deepEqual(j(M.approveWaitingBody([{ key: 'A-1', rev: 2, title: 'x' }, { key: 'bad' }, null])), { runs: [{ key: 'A-1', rev: 2 }], confirm: true });
+  assert.deepEqual(j(M.approveWaitingBody(null)), { runs: [], confirm: true });
+  assert.equal(M.skipReasonLabel('forced'), 'Held for a safety reason');
+  assert.equal(M.skipReasonLabel('nope'), 'Skipped');
 });
 
 test('M8-U2 partTip / waitNote / researchCounts / isAskId wording', () => {

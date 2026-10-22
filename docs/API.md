@@ -14,7 +14,7 @@ The v2 contract (board-native; no Linear). Types live in [`src/types.ts`](../src
 ## Read endpoints
 
 ### `GET /api/state` → `ApiState`
-Everything the dashboard needs in one call (see `ApiState`): `setup` (wizard steps `agents`, `repo`; `complete:false` ⇒ show the setup wizard), `health` (claude/cursor + warnings), `quota.claude`, `engine` (incl. `storageProblem`, `ignored`), `settings`, `repos`, `runs` (`ApiRunSummary[]`, newest first, includes closed runs), **`cards`** (cards that have no run yet — Backlog / To do — each `{key,title,lane,kind,note?}`), `csrf`.
+Everything the dashboard needs in one call (see `ApiState`): `setup` (wizard steps `agents`, `repo`; `complete:false` ⇒ show the setup wizard), `health` (claude/cursor + warnings), `quota.claude`, `engine` (incl. `storageProblem`, `ignored`, `runMode`, `runModeChangedAt`), `settings` (incl. `runMode`, `overriddenByRunMode`, `limitRule`, `limitRuleEffective`), `repos`, `runs` (`ApiRunSummary[]`, newest first, includes closed runs), **`cards`** (cards that have no run yet — Backlog / To do — each `{key,title,lane,kind,note?}`), **`waiting`** `{ total, bulkApprovable, eligible: [{ key, rev, title }] }` (plans in `awaiting_approval`; `eligible` is exactly what "Approve waiting plans" may send — titles redacted), optional `accounts`, optional `home`, `csrf`.
 
 ### `GET /api/providers` → `{ providers: ApiProvider[] }`
 Every registry provider (`claude`, `cursor`, later `codex`): `state` (`ok | missing | broken-install | not-logged-in | unknown`), `version`/`detail` (what the CLI said — redacted and truncated; render with `textContent`), a **static** `hint` (never CLI text; Conductor shows it and never runs it), `capabilities {readOnly, build, buildIsolationVerified}` — **derived from code, never from config** — the read-only `tier` (`verified | partial | unverified | blocked`), `inUse` (appears in a role chain), `pausedUntil`, `buildVerification` / `isolationCheck` (display only; `isolationCheck.trusted:false` = the check passed but its matchers are not yet validated against a real Codex, so the tier is unchanged). The same list is `ApiState.providers`.
@@ -60,7 +60,7 @@ Backlog for the live log. `after` default 0, `limit` default 500 (max 2000). `ne
 
 | event | data | when |
 | --- | --- | --- |
-| `state` | `{ now, runs: ApiRunSummary[], cards: ApiCard[], engine: ApiEngine, quota: ApiQuota }` | any run/engine change (debounced ≤ 1/s) — **merge into local state** |
+| `state` | `{ now, runs, cards, engine, quota, waiting?, accounts? }` | any run/engine change (debounced ≤ 1/s) — **merge into local state** (`waiting` / `accounts` when present) |
 | `log` | `{ key: string, event: LogEvent }` | each normalised agent event (both Claude and Cursor) |
 | `toast` | `{ level: 'info'\|'warn'\|'error', text: string }` | notable moments (needs human, limit pause, ready) |
 | `ping` | `{ now }` | every 20 s (keep-alive; use to detect a dead stream) |

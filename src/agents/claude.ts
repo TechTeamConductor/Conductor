@@ -5,6 +5,7 @@ import { extractJson, type Schema } from './json.ts';
 import { runProcess } from './spawn.ts';
 import { BROKEN_RE, NETWORK_RE } from './providers/probe.ts';
 import { claudeModelArgs } from './model-args.ts';
+import { assertClaudeConfigDirSafe, ClaudeSettingsError, withProjectSettingsNeutralized } from './claude-settings.ts';
 /** A --model element was actually sent (the helper's own rule). */
 const modelIdOkForFlag = (m: string | undefined): boolean => claudeModelArgs({ model: m }).length > 0;
 export { claudeModelArgs };
@@ -180,6 +181,27 @@ export function foldRateLimit(state: ClaudeStreamState, obj: any): void {
 }
 
 export async function runClaude(call: ClaudeCall): Promise<AgentResult> {
+  // F1-C: refuse before any spawn when the config dir carries a key helper or settings env block
+  try {
+    assertClaudeConfigDirSafe(call.env);
+  } catch (e) {
+    if (e instanceof ClaudeSettingsError) {
+      return { ok: false, text: '', exitCode: null, errorKind: 'isolation', error: e.message };
+    }
+    throw e;
+  }
+  // F1-A: quarantine project settings for the duration of the child, then restore
+  try {
+    return await withProjectSettingsNeutralized(call.cwd, () => runClaudeBody(call));
+  } catch (e) {
+    if (e instanceof ClaudeSettingsError) {
+      return { ok: false, text: '', exitCode: null, errorKind: 'isolation', error: e.message };
+    }
+    throw e;
+  }
+}
+
+async function runClaudeBody(call: ClaudeCall): Promise<AgentResult> {
   const state: ClaudeStreamState = { init: null, result: null, limit: null, quota: null };
   const observed = { read: new Set<string>(), listed: new Set<string>(), queries: [] as string[] };
   const toolNames = new Map<string, string>();
