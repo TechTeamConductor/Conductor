@@ -31,7 +31,7 @@
     "check:workflows": "node scripts/check-workflows.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.6.5",
     "typescript": "^5.9.0"
   }
 }
