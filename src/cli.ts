@@ -41,7 +41,7 @@ Usage: conductor <command>
   open               open a fresh signed-in dashboard tab (when it is already running)
   demo               try everything with scripted agents — no keys, no quota
   doctor             check your setup   [--isolation [claude|codex]] [--probe] [--verify-build cursor] [--clear-block codex] [--yes]
-  service install    keep Conductor running in the background (launchd)   [--dry-run]
+  service install    keep Conductor running in the background (macOS launchd only)   [--dry-run]
   service uninstall  remove the background service
   service status
   models             show the models each tool offers   [--refresh] [--json]
@@ -55,8 +55,19 @@ Flags for start: --no-open (do not open a browser tab), --port <n>
 
 function openBrowser(url: string): void {
   if (process.platform === 'darwin') execFile('/usr/bin/open', [url], () => undefined);
-  else console.log(`Open this link: ${url}`);
+  else if (process.platform === 'win32') {
+    // explorer.exe hands the file to the default browser (it exits non-zero even on success, so the exit code is ignored)
+    execFile(join(process.env.SystemRoot ?? 'C:\\Windows', 'explorer.exe'), [url], () => undefined);
+    console.log(`If no browser opened, open this link: ${url}`);
+  } else if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
+    execFile('xdg-open', [url], () => undefined);
+    console.log(`If no browser opened, open this link: ${url}`);
+  } else console.log(`Open this link: ${url}`);
 }
+
+/** Shown on every start under Windows: the installer and dashboard work, the rest of the product is not ported yet. */
+const WINDOWS_NOTICE = `Windows support is EXPERIMENTAL. The dashboard runs, but registering repositories, running gates and launching the claude / agent CLIs are not ported yet.
+For the full product use WSL2 (install and run Conductor inside it) or a Mac.\n`;
 
 function controlRequest(path: string, method: string): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -135,7 +146,7 @@ async function migrateCmd(): Promise<void> {
     }
     if (r.backupDir) console.log(`\nBackup copy of what was read: ${r.backupDir}`);
     if (r.dryRun) console.log('\nLooks right? Run the same command with --apply to create the v2 folder.');
-    else if (r.published) console.log(`\nDone. Start v2 with:  CONDUCTOR_HOME=${to} npm start   (or just  npm start  when ${to} is the default).\nYour v1 folder is untouched and keeps working. Nothing was written to Linear; the old Linear API key is still in your macOS Keychain (service "techteam-conductor", account "linear-api-key") — v2 never reads it; delete it yourself when you are sure you no longer need v1.`);
+    else if (r.published) console.log(`\nDone. Start v2 with:  CONDUCTOR_HOME=${to} conductor start   (or just  conductor start  when ${to} is the default).\nYour v1 folder is untouched and keeps working. Nothing was written to Linear; the old Linear API key is still in your macOS Keychain (service "techteam-conductor", account "linear-api-key") — v2 never reads it; delete it yourself when you are sure you no longer need v1.`);
   } catch (e) {
     if (e instanceof MigrateError) {
       console.error(`migrate: ${e.message}`);
@@ -153,7 +164,7 @@ async function start(): Promise<void> {
     lock = acquireLock(paths.lock());
   } catch (e) {
     if (e instanceof LockHeldError) {
-      console.log(`${e.message}\nOpen the dashboard with:  npm run open   (or: conductor open)`);
+      console.log(`${e.message}\nOpen the dashboard with:  conductor open`);
       process.exit(0);
     }
     throw e;
@@ -186,7 +197,8 @@ async function start(): Promise<void> {
   rt.warmUp(); // R2-N1: one background zero-quota health read, so a headless start discovers models too
   const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
   const url = `http://127.0.0.1:${port}`;
-  console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C. Reopen the dashboard any time with:  npm run open\n`);
+  console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C. Reopen the dashboard any time with:  conductor open\n`);
+  if (process.platform === 'win32') console.log(WINDOWS_NOTICE);
   if (!flag('--no-open') && cfg.ui.openBrowser) openBrowser(loginTarget);
   const shutdown = async (sig: string) => {
     log.info(`${sig}: shutting down`);
@@ -272,7 +284,7 @@ async function accountsCmd(): Promise<void> {
 async function openCmd(): Promise<void> {
   const info = readLock();
   if (!info || !existsSync(paths.control())) {
-    console.error('Conductor is not running. Start it with:  npm start');
+    console.error('Conductor is not running. Start it with:  conductor start');
     process.exit(1);
   }
   try {
@@ -372,12 +384,16 @@ async function doctor(): Promise<void> {
 
 async function service(): Promise<void> {
   const sub = argv[1];
+  if (process.platform !== 'darwin') {
+    console.error('The background service is only available on macOS (launchd). On this system run `conductor start` in a terminal, or use your own service manager.');
+    process.exit(1);
+  }
   const cfg = loadConfig();
   if (sub === 'install') {
     const r = await installService(cfg, { dryRun: flag('--dry-run') });
     if (flag('--dry-run')) {
       console.log(`# Would write ${r.path}\n${r.plist}`);
-    } else console.log(`Installed ${r.path}. Conductor now starts at login and restarts if it stops.\nDashboard: npm run open`);
+    } else console.log(`Installed ${r.path}. Conductor now starts at login and restarts if it stops.\nDashboard: conductor open`);
     for (const n of r.notes) console.log(` ! ${n}`);
     return;
   }
@@ -399,8 +415,10 @@ async function uninstall(): Promise<void> {
     console.error(`Refusing to delete ${paths.home()}: it is not a Conductor v2 data folder (no home.json marker).`);
     process.exit(2);
   }
-  await uninstallService();
-  console.log('Removed the background service.');
+  if (process.platform === 'darwin') {
+    await uninstallService();
+    console.log('Removed the background service.');
+  } else console.log('There is no background service on this system (it is macOS only), nothing to remove there.');
   if (flag('--purge')) {
     if (!existsSync(join(paths.home(), 'home.json'))) {
       console.error(`Refusing to delete ${paths.home()}: it is not a Conductor v2 data folder (no home.json marker).`);

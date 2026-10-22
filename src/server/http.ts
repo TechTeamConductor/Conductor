@@ -56,7 +56,7 @@ const STATIC: Record<string, { file: string; type: string; public: boolean }> = 
   '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml', public: true },
 };
 
-const LOGIN_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conductor — sign in</title><link rel="stylesheet" href="/style.css"><link rel="icon" href="/favicon.svg"></head><body><main><h1>Conductor</h1><p>This dashboard is private to your Mac. To open it, run this in a terminal:</p><pre><code>npm run open</code></pre><p>(or <code>conductor open</code>). It opens a fresh signed-in tab — the link works once.</p></main></body></html>`;
+const LOGIN_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conductor — sign in</title><link rel="stylesheet" href="/style.css"><link rel="icon" href="/favicon.svg"></head><body><main><h1>Conductor</h1><p>This dashboard is private to your Mac. To open it, run this in a terminal:</p><pre><code>conductor open</code></pre><p>It opens a fresh signed-in tab — the link works once.</p></main></body></html>`;
 
 export interface ServerDeps {
   api: Api;
@@ -353,7 +353,7 @@ export class DashboardServer {
 
       // ── everything else needs a session
       if (!authed) {
-        if (path.startsWith('/api/')) return this.fail(res, 401, 'unauthorized', 'Session expired — run "conductor open" (npm run open) in a terminal.');
+        if (path.startsWith('/api/')) return this.fail(res, 401, 'unauthorized', 'Session expired — run "conductor open" in a terminal.');
         if (method === 'GET' && st) return this.send(res, 302, '', 'text/plain', { Location: '/login' });
         return this.fail(res, 401, 'unauthorized', 'Sign in first.');
       }

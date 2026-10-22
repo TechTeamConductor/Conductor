@@ -38,3 +38,11 @@ jobs:
       - run: npm test
         env:
           CI: '1'
+
+  package:
+    name: Package and install check
+    # pull requests only: the release workflow runs the same package workflow itself with the real version
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package.yml

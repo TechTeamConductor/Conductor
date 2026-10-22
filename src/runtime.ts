@@ -25,7 +25,8 @@ import { effectiveLimitRule } from './accounts/limit-rule.ts';
 import { DEFAULT_ACCOUNT } from './accounts/types.ts';
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-export const VERSION = '0.2.0-dev';
+export { VERSION } from './version.ts';
+import { VERSION } from './version.ts';
 
 export interface RuntimeOptions {
   /** Do not read/write <home>/config.json (demo, tests). */

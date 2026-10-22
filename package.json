@@ -1,6 +1,6 @@
 {
   "name": "conductor",
-  "version": "0.1.0",
+  "version": "0.0.0-dev",
   "private": true,
   "description": "Local dashboard and board that runs your AI coding CLIs as a team: Claude plans, Cursor builds, Claude verifies \u2014 with bug loops, in isolated git worktrees.",
   "repository": {
@@ -19,6 +19,14 @@
   "bin": {
     "conductor": "bin/conductor.mjs"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "ui/",
+    "prompts/",
+    "fixtures/fake-claude.mjs",
+    "fixtures/fake-agent.mjs"
+  ],
   "scripts": {
     "start": "node bin/conductor.mjs start",
     "demo": "node bin/conductor.mjs demo",

@@ -1,0 +1,95 @@
+# PARKED (phase 2): manual builds of the desktop apps (macOS .dmg, Windows .exe). They are NOT part of releases: users install the
+# CLI with install/install.sh or install/install.ps1 (see README). Run by hand: Actions -> Desktop builds -> Run workflow.
+# The apps are unsigned (macOS ad-hoc), so macOS Gatekeeper blocks the .dmg until it is signed and notarized; this workflow gets no
+# secrets and is not maintained until phase 2 starts, so it can drift out of date.
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp (X.Y.Z)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check the version
+        id: check
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then echo "::error::version must look like 1.2.3"; exit 1; fi
+          echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+
+  build-mac:
+    name: Build macOS .dmg
+    needs: validate
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CONDUCTOR_VERSION: ${{ needs.validate.outputs.version }}
+      CONDUCTOR_REQUIRE_VERSION: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci
+      - run: npm ci
+        working-directory: desktop
+      - name: Build the .dmg
+        working-directory: desktop
+        run: npm run dist:mac -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
+      - name: Check the artifact carries the version
+        run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-arm64.dmg"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: conductor-mac
+          path: desktop/dist/Conductor-*-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  build-win:
+    name: Build Windows .exe
+    needs: validate
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CONDUCTOR_VERSION: ${{ needs.validate.outputs.version }}
+      CONDUCTOR_REQUIRE_VERSION: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci
+      - run: npm ci
+        working-directory: desktop
+      - name: Build the .exe installer
+        working-directory: desktop
+        run: npm run dist:win -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
+      - name: Check the artifact carries the version
+        run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-x64-setup.exe"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: conductor-win
+          path: desktop/dist/Conductor-*-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 7

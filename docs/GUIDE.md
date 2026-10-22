@@ -4,7 +4,7 @@
 
 You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer, in separate git worktrees. **It never pushes, opens PRs, or merges.** There is no external tracker: the board is built in and stored locally.
 
-> **Status.** Built: the native board (no Linear), versioned data with backups, side-by-side import of v1 data, roles and providers, model and effort per job, model discovery, task graphs, a project-context engine, Quick Ask / Deep Research, approval policies, several accounts per tool, run mode, "Design the work", a macOS `.dmg` and an experimental Windows installer. Not built: a Linux package, Codex as a builder, sign-in for extra accounts. See the [README](../README.md) for the overview.
+> **Status.** Built: the native board (no Linear), versioned data with backups, side-by-side import of v1 data, roles and providers, model and effort per job, model discovery, task graphs, a project-context engine, Quick Ask / Deep Research, approval policies, several accounts per tool, run mode, "Design the work", one-command installers for macOS (supported) and Windows / Linux (experimental). Not built: signed desktop apps, Codex as a builder, sign-in for extra accounts. See the [README](../README.md) for the overview.
 
 ```
 Task card (To do)
@@ -20,20 +20,25 @@ Task card (To do)
 
 ## Quick start (about 5 minutes, once)
 
-1. **Install the two CLIs and sign in** (you probably already have them): Claude Code (`claude`) and the Cursor CLI (`agent login`).
-2. **Try it without any keys:** `npm run demo` — a dashboard with scripted agents so you can click around.
-3. **Start for real:** `npm start` — the dashboard opens and walks you through two steps: check Claude + Cursor are signed in, then add a repo folder (tests/lint are auto-detected).
-4. **Press New task.** That's it. Cards live on the board (Backlog · To do · the working stages · Needs you · Ready for review).
+1. **Install Conductor** (needs Node.js 22.18 or newer). macOS, in Terminal: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh | bash`. Windows (experimental), in PowerShell: `irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 | iex`. Run the same command again to update. Details, uninstall and pinning a version: the [README](../README.md#install) and [`DESKTOP.md`](DESKTOP.md).
+2. **Install the two CLIs and sign in** (you probably already have them): Claude Code (`claude`) and the Cursor CLI (`agent login`).
+3. **Try it without any keys:** `conductor demo` — a dashboard with scripted agents so you can click around.
+4. **Start for real:** `conductor start` — the dashboard opens in your browser and walks you through two steps: check Claude + Cursor are signed in, then add a repo folder (tests/lint are auto-detected). Open it again any time with `conductor open`.
+5. **Press New task.** That's it. Cards live on the board (Backlog · To do · the working stages · Needs you · Ready for review).
 
-No `npm install` is needed to run it (zero runtime dependencies; Node 22.18+). Data lives in `~/.conductor-v2` (override with `CONDUCTOR_HOME`); the default port is 4327.
+Zero runtime dependencies, nothing else to install. Data lives in `~/.conductor-v2` (override with `CONDUCTOR_HOME`); the default port is 4327.
+
+> **Windows is experimental.** The installer and the dashboard are checked in CI for each release (the release notes say whether that check passed), but registering repositories, running gates and launching the `claude` / `agent` CLIs are not ported to native Windows yet. Use WSL2 (run the macOS command inside Ubuntu) or a Mac for the full product. Linux uses the macOS command and is experimental.
+
+Working from a clone instead (contributors)? `npm start`, `npm run open` and `npm run demo` do the same as `conductor start` / `open` / `demo`.
 
 ### Coming from Conductor v1 (Linear)?
 
 v1 and v2 run **side by side**: v2 never writes to the v1 folder (`~/.conductor`); `migrate` refuses a `--to` that is inside it (or the reverse).
 
 ```
-node bin/conductor.mjs migrate            # dry run: shows exactly what would be imported, writes nothing
-node bin/conductor.mjs migrate --apply    # creates ~/.conductor-v2 (built aside, then one rename) and a backup copy in ~/.conductor-backups (kept until YOU delete it; it holds your v1 run records and plan/verdict files)
+conductor migrate            # dry run: shows exactly what would be imported, writes nothing
+conductor migrate --apply    # creates ~/.conductor-v2 (built aside, then one rename) and a backup copy in ~/.conductor-backups (kept until YOU delete it; it holds your v1 run records and plan/verdict files)
 ```
 
 Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still active in v1 shows up as **Needs you** — v2 never starts the same work twice; press Retry to run it in v2. **Every imported card is treated as unverified text**: v1's approval is dropped, and when you press Retry (or move it to To do) it starts again at the **plan**, which waits for your approval before anything is built. The dry run also lists exactly what the imported settings will *run* on your machine (gate and setup commands, agent binaries, environment variables, copied files) — only migrate a folder you created. Files over 50 MB, symlinks and non-regular files in the v1 folder are skipped with a warning, never read. Nothing is ever written to Linear, and your old Linear key stays in the macOS Keychain until you delete it yourself.
@@ -73,7 +78,7 @@ Every job has a **role** (planning, review, verification, implementation, debugg
 
 ## Safety model (read this once)
 
-- **Local only.** The dashboard listens on `127.0.0.1` only and needs a one-time sign-in link (`npm run open`). The sign-in code never appears on a command line.
+- **Local only.** The dashboard listens on `127.0.0.1` only and needs a one-time sign-in link (`conductor open`). The sign-in code never appears on a command line.
 - **Claude stages are locked down:** read-only (`Read`, `Grep`, `Glob`), no MCP servers, no skills/plugins, your global Claude rules are not loaded, credential files are denied. Conductor checks this on every run and refuses to continue if the session is not what it asked for.
 - **Cursor builds with `--force`** inside a dedicated git worktree in a **v2-only namespace** (`conductor-v2/<key>` branches, `refs/conductor-v2/…`, `.conductor-v2-worktrees`), so v1 and v2 can never touch each other's checkouts. It cannot push (deny rule + environment), but — like any coding agent — it can run commands as you. Only register repos you trust.
 - **The builder cannot leave things behind:** git hooks/config are snapshotted and restored around every build; the whole branch (including commits the agent made itself) is scanned for secrets and for changes to protected files (`.claude/`, `.cursor/`, `AGENTS.md`, CI config, …), which are held for you.
@@ -89,15 +94,21 @@ Settings → "Accounts and limits", or `conductor accounts list | add <claude|cu
 ## Commands
 
 ```
-npm start                  run + open the dashboard
-npm run open               open a fresh signed-in tab while it's running
-npm run demo               scripted demo (no keys / quota)
-npm run doctor             check the setup   (--isolation proves Claude is locked down, --probe)
-node bin/conductor.mjs doctor --isolation codex --yes     the Codex isolation check (uses quota; marks Codex partial or blocked)
-node bin/conductor.mjs doctor --verify-build cursor --yes re-run the live no-push suite on the installed Cursor and record it (uses quota)
-node bin/conductor.mjs migrate [--from <dir>] [--to <dir>] [--apply]   import a v1 folder side by side
-node bin/conductor.mjs service install|uninstall|status                keep it running in the background (v2's own launchd label)
-node bin/conductor.mjs uninstall [--purge]                             remove the service (--purge also deletes a v2 data folder)
+conductor start            run + open the dashboard   (--no-open, --port <n>)
+conductor open             open a fresh signed-in tab while it's running
+conductor demo             scripted demo (no keys / quota)
+conductor doctor           check the setup   (--isolation proves Claude is locked down, --probe)
+conductor doctor --isolation codex --yes      the Codex isolation check (uses quota; marks Codex partial or blocked)
+conductor doctor --verify-build cursor --yes  re-run the live no-push suite on the installed Cursor and record it (uses quota)
+conductor migrate [--from <dir>] [--to <dir>] [--apply]   import a v1 folder side by side
+conductor service install|uninstall|status    keep it running in the background (macOS only; v2's own launchd label)
+conductor uninstall [--purge]                 remove the service (--purge also deletes a v2 data folder)
+conductor version
+```
+
+The installer's own uninstall (removes the app, never your data) is described in the [README](../README.md#install). Contributors working from a clone also have:
+
+```
 npm test                   unit + end-to-end tests (fake agents)
 npm run test:live          LIVE=1 tests against the real Cursor CLI (uses a little quota)
 ```

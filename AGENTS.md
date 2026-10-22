@@ -17,4 +17,4 @@ Conductor runs AI coding CLIs as a team on a local board. These are the rules fo
 - **Git identity:** commits, tags and pushes are authored as `TechTeamConductor <support@bargainn.io>`, never as Claude, Cursor or another tool. Do not add `Co-Authored-By`, `Generated with` or any tool/agent attribution to commits, PR descriptions or release notes.
 
 ## Where things are
-`src/` server and engine · `ui/` dashboard · `prompts/` agent prompts · `test/` and `fixtures/` tests with fake agents · `desktop/` Electron shell · `scripts/` release tooling · `docs/` guide, architecture, API.
+`src/` server and engine · `ui/` dashboard · `prompts/` agent prompts · `test/` and `fixtures/` tests with fake agents · `install/` the one-line installers (`install.sh`, `install.ps1`) · `desktop/` Electron shell (parked) · `scripts/` release tooling · `.github/workflows/` CI, packaging, release · `docs/` guide, architecture, API.

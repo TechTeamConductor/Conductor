@@ -248,7 +248,7 @@ Closing the drawer goes back in history if it was opened in the app. Otherwise i
 
 - Claude headless sessions are not listed by the Claude app's Code tab; use "Open in Claude app" (`claude --desktop --resume`) or the resume command.
 - Cursor's app does not list headless CLI chats (unverified for the Agents window); Cursor Cloud Agents / My Machines would — planned.
-- macOS is the supported platform. A Windows installer is built but **experimental and unverified** (Keychain secret storage, launchd service, notifications, process groups and `sh -c` gates are macOS-only); Linux has no package.
+- macOS is the supported platform. Windows and Linux can install (one-command installers) and start the dashboard, but are **experimental**: Keychain secret storage (a 0600 file is used elsewhere), the launchd service and notifications are macOS-only, and on native Windows repo paths must start with `/`, gates run through `sh -c`, process groups use `kill(-pid)`, the control socket is a unix socket and the `claude` / `agent` `.cmd` shims cannot be launched. Use WSL2 on Windows. Desktop apps (`.dmg`, `.exe`) are parked.
 - Only Claude and Cursor build (Codex is read-only). Per-task parallel builds (each task in its own worktree) are planned.
 - `run.json` and the verdict/plan artifacts contain agent text unredacted at rest, and `GET /api/runs/:key` returns it as stored (board comments, bug cards, logs and live events are redacted). Redact-on-read for the detail API is planned; until then treat the dashboard as local-only (it already is: loopback + session cookie).
 - A `--force` builder is not a sandbox; only register repos you trust.

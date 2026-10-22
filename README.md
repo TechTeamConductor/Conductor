@@ -10,10 +10,10 @@
 ![Local only](https://img.shields.io/badge/runs-100%25%20local-6f72ff)
 ![Never pushes](https://img.shields.io/badge/git-never%20pushes%20or%20merges-e5484d)
 ![Platform](https://img.shields.io/badge/macOS-supported-black?logo=apple)
-![Status](https://img.shields.io/badge/status-v2%20preview-f5a524)
+![Status](https://img.shields.io/badge/status-preview-f5a524)
 
 <!-- Live repo metrics: every badge below is fetched from GitHub/shields.io on page load, nothing is hard-coded. -->
-<a href="https://github.com/TechTeamConductor/Conductor/releases"><img src="https://img.shields.io/github/v/release/TechTeamConductor/Conductor?include_prereleases&style=flat&label=release" alt="Latest release"></a>
+<a href="https://github.com/TechTeamConductor/Conductor/releases"><img src="https://img.shields.io/github/v/release/TechTeamConductor/Conductor?style=flat&label=release" alt="Latest release"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/actions/workflows/release.yml"><img src="https://github.com/TechTeamConductor/Conductor/actions/workflows/release.yml/badge.svg" alt="Release workflow"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/stargazers"><img src="https://img.shields.io/github/stars/TechTeamConductor/Conductor?style=flat&logo=github&label=stars" alt="GitHub stars"></a>
 <a href="https://github.com/TechTeamConductor/Conductor/forks"><img src="https://img.shields.io/github/forks/TechTeamConductor/Conductor?style=flat&logo=github&label=forks" alt="GitHub forks"></a>
@@ -75,13 +75,41 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 | 🧠 | **Project context** | A local, incremental index of your repo so agents don't rescan it every time. Works offline. |
 | 🛡️ | **Approval policies** | `full-auto` · `approve-plan` · `approve-risky` · `manual-stages`, per project, with forced holds no setting can remove. |
 
-## Download
+## Install
 
-Grab the latest build from [**Releases**](https://github.com/TechTeamConductor/Conductor/releases): a macOS `.dmg` (Apple Silicon) and an experimental Windows `.exe`. Every release comes with a `SHA256SUMS.txt`. Releases are cut automatically from the commit history, and while the version is below 1.0.0 they are marked *pre-release* on purpose. Neither app is code-signed yet, so macOS asks you to right-click → Open the first time and Windows SmartScreen will warn.
+You need **Node.js 22.18 or newer** ([nodejs.org](https://nodejs.org)) and the CLIs you already use (Claude Code and Cursor). Then one command installs Conductor, and one command starts it.
+
+**macOS** (Terminal):
+
+```bash
+curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh | bash
+```
+
+**Windows** (PowerShell, **experimental**, see below):
+
+```powershell
+irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 | iex
+```
+
+**Start it** (opens the dashboard UI in your browser):
+
+```bash
+conductor start
+```
+
+That's it. Try it without any keys first with `conductor demo`, and check your setup with `conductor doctor`.
+
+| | |
+| --- | --- |
+| **Update** | Run the install command again. |
+| **Uninstall** | macOS: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh \| bash -s -- --uninstall`. Windows: `$env:CONDUCTOR_UNINSTALL='1'; irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 \| iex; Remove-Item Env:CONDUCTOR_UNINSTALL`. Your data (`~/.conductor-v2`) is never deleted by it. |
+| **Where it goes** | The app is unpacked into `~/.conductor-app` (Windows: `%LOCALAPPDATA%\Conductor\app`) and a `conductor` launcher into `~/.local/bin` (Windows: `%LOCALAPPDATA%\Conductor\bin`, added to your user PATH). If `~/.local/bin` is not on your PATH, the installer prints the one line to add. |
+| **Safe by design** | HTTPS only, the download is checked against `SHA256SUMS.txt` before anything is unpacked (this catches corrupted downloads; what you trust is HTTPS plus this GitHub repository), no `sudo`, no edits to your shell profile on macOS. Prefer to read first? Download `install.sh` from the release page, read it, and run `bash install.sh`. |
+| **Pin a version** | macOS: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh \| CONDUCTOR_INSTALL_VERSION=1.2.3 bash` (the variable goes in front of `bash`, not `curl`). Windows: `$env:CONDUCTOR_INSTALL_VERSION='1.2.3'; irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 \| iex`. |
+
+> **Windows is experimental.** The installer and the dashboard are checked in CI for each release (the release notes say whether that check passed), but registering repositories, running gates and launching the `claude` / `agent` CLIs are not ported to native Windows yet. For the full product use **WSL2** (open Ubuntu and run the macOS command inside it) or a Mac. **Linux** uses the macOS command and is experimental too.
 
 ## Quick start
-
-> About five minutes, once. Node **22.18+**, plus the CLIs you already use.
 
 ```bash
 # 1. Sign in to your tools (you probably already have)
@@ -89,11 +117,10 @@ claude            # Claude Code: run once and sign in
 agent login       # Cursor CLI
 
 # 2. Try it with scripted agents. No keys, no quota
-git clone <this-repo> conductor && cd conductor
-npm run demo
+conductor demo
 
 # 3. Start for real
-npm start         # opens the dashboard and walks you through setup
+conductor start   # opens the dashboard and walks you through setup
 ```
 
 The dashboard checks that Claude and Cursor are signed in, asks you to add a repository folder (tests and lint are auto-detected), and you're ready. Press **Home**, write one line, and go.
@@ -101,9 +128,11 @@ The dashboard checks that Claude and Cursor are signed in, asks you to add a rep
 | Where | What |
 | --- | --- |
 | Data | `~/.conductor-v2` (override with `CONDUCTOR_HOME`) |
-| Port | `4327` (loopback only) |
-| Desktop app | Download the `.dmg` (macOS) or the experimental `.exe` (Windows) from [**Releases**](https://github.com/TechTeamConductor/Conductor/releases). Build it yourself with the steps in [`docs/DESKTOP.md`](docs/DESKTOP.md) |
-| Coming from v1? | `node bin/conductor.mjs migrate` (dry run first). v1 and v2 run side by side and v2 never writes to v1's folder |
+| Port | `4327` (loopback only, `conductor start --port <n>` to change) |
+| Reopen the dashboard | `conductor open` (a fresh signed-in tab while it is running) |
+| Coming from v1? | `conductor migrate` (dry run first). v1 and v2 run side by side and v2 never writes to v1's folder |
+| Running from a clone | Contributors: `git clone`, then `npm start` / `npm run demo` / `npm run open` do the same as `conductor start` / `demo` / `open` |
+| Desktop apps | Parked for a later phase (a macOS `.dmg` and Windows `.exe` can be built by hand, see [`docs/DESKTOP.md`](docs/DESKTOP.md)) |
 
 ## Screens
 
@@ -182,9 +211,10 @@ Read the safety section of the [full guide](docs/GUIDE.md#safety-model-read-this
 | Model and effort per job, model discovery | ✅ Done |
 | Several accounts, limit rules, run mode | ✅ Done, but **signing in extra accounts is switched off** until its live checks pass |
 | New UI (Home, Board, Settings) | ✅ Done and browser-checked on the demo |
-| macOS app | ✅ `.dmg` (Apple Silicon), built automatically for every release. Ad-hoc signed, not notarized |
-| Windows app | 🟡 Experimental `.exe` installer: unsigned and **unverified**; secret storage, notifications and the background service are macOS-only |
-| Linux package | ⬜ Not built |
+| macOS | ✅ One-command install (`install.sh`), then `conductor start` |
+| Windows | 🟡 **Experimental**: one-command install (`install.ps1`) and the dashboard work; registering repos, gates and launching the `claude` / `agent` CLIs are not ported yet (use WSL2 or a Mac) |
+| Linux | 🟡 **Experimental**: the same installer as macOS; only install and dashboard start are checked in CI |
+| Desktop apps (`.dmg`, `.exe`) | ⬜ Parked for a later phase (signing and notarization first) |
 | Codex as a builder · Cursor/Codex research | ⬜ Locked on purpose, one pairing at a time |
 | Codex on a real install | ⚠️ Not yet exercised against a real Codex binary |
 
@@ -193,18 +223,21 @@ Tested with scripted fake agents and real git: **1,000+ tests, no network, no qu
 ## Commands
 
 ```bash
-npm start                      # run + open the dashboard
-npm run open                   # open a fresh signed-in tab while it's running
-npm run demo                   # scripted agents, no keys, no quota
-npm run doctor                 # check the setup  (--isolation proves Claude is locked down)
-npm test                       # unit + end-to-end tests (fake agents)
-npm run check                  # type check
-
-node bin/conductor.mjs models [--refresh]                       # what each CLI says it offers
-node bin/conductor.mjs accounts list | add | check | move | remove
-node bin/conductor.mjs migrate [--apply]                        # import a v1 folder side by side
-node bin/conductor.mjs service install | uninstall | status     # keep it running (launchd)
+conductor start                # run + open the dashboard (--no-open, --port <n>)
+conductor open                 # open a fresh signed-in tab while it's running
+conductor demo                 # scripted agents, no keys, no quota
+conductor doctor               # check the setup  (--isolation proves Claude is locked down)
+conductor models [--refresh]   # what each CLI says it offers
+conductor accounts list | add | check | move | remove
+conductor migrate [--apply]    # import a v1 folder side by side
+conductor service install | uninstall | status   # keep it running (macOS launchd only)
+conductor uninstall [--purge]  # remove the background service (--purge also deletes your data folder)
+conductor version
 ```
+
+`conductor uninstall` removes the background service (and, with `--purge`, your data). To remove the app itself use the installer's uninstall (see [Install](#install)).
+
+Contributors running from a clone: `npm start`, `npm run open`, `npm run demo`, `npm run doctor`, `npm test` (unit + end-to-end tests with fake agents) and `npm run check` (type check).
 
 ## Documentation
 
@@ -213,7 +246,7 @@ node bin/conductor.mjs service install | uninstall | status     # keep it runnin
 | [**Full guide**](docs/GUIDE.md) | Everyday use, roles and providers, accounts, every command, the whole safety model |
 | [Architecture](docs/ARCHITECTURE.md) | Modules, data on disk, the router, known limits |
 | [API](docs/API.md) | Every endpoint, the transport and security rules the UI follows |
-| [Desktop app](docs/DESKTOP.md) | The Electron shell, the `.dmg` / `.exe` builds and how releases are versioned |
+| [Releases and installers](docs/DESKTOP.md) | How versions and releases are made, how the installers work, and the parked desktop apps |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | When something looks wrong |
 
 ## Star history
