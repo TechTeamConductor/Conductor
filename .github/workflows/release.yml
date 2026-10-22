@@ -93,7 +93,7 @@ jobs:
         run: npm run dist:mac -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
       - name: Check the artifact carries the release version
         run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-arm64.dmg"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conductor-mac
           path: desktop/dist/Conductor-*-arm64.dmg
@@ -129,7 +129,7 @@ jobs:
         run: npm run dist:win -- "-c.extraMetadata.version=$CONDUCTOR_VERSION"
       - name: Check the artifact carries the release version
         run: test -f "desktop/dist/Conductor-${CONDUCTOR_VERSION}-x64-setup.exe"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conductor-win
           path: desktop/dist/Conductor-*-x64-setup.exe
