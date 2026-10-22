@@ -181,22 +181,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          lines="$(gh api "repos/$GH_REPO/releases" --paginate --jq '.[] | select(.tag_name == env.TAG and .draft == true) | .id')"
-          test "$(printf '%s\n' "$lines" | grep -c .)" = "1"
-          id="$lines"
-          printf '%s' "$id" | grep -qE '^[0-9]+$'
-          mkdir verify
-          # download every asset of the DRAFT by id and verify all three files against SHA256SUMS.txt before it becomes public
-          gh api "repos/$GH_REPO/releases/$id" --jq '.assets[] | "\(.id) \(.name)"' > assets.txt
-          test "$(cut -d' ' -f2 assets.txt | sort | tr '\n' ' ')" = "SHA256SUMS.txt conductor.tgz install.ps1 install.sh "
+          # No `set -e`: every check below is explicit and says what it saw. Only read-only lookups and downloads are retried, never the publish.
+          set -uo pipefail
+          export LC_ALL=C
+          fail() { echo "::error::$*"; exit 1; }
+          want="SHA256SUMS.txt conductor.tgz install.ps1 install.sh "
+          id=""; n=0; names=""; assets=""
+          # GitHub's release list lags a moment behind creating the draft: wait (about 30 s at most) until exactly ONE draft of this tag exists
+          # and it lists exactly the four expected files, all uploaded and non-empty.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if ! lines="$(gh api "repos/$GH_REPO/releases" --paginate --jq '.[] | select(.tag_name == env.TAG and .draft == true) | .id')"; then
+              echo "attempt $attempt: could not list the releases"; lines=""
+            fi
+            n="$(printf '%s\n' "$lines" | grep -c . || true)"
+            if [ "$n" = "1" ] && printf '%s' "$lines" | grep -qE '^[0-9]+$'; then
+              if assets="$(gh api "repos/$GH_REPO/releases/$lines" --jq '.assets[] | select(.state == "uploaded" and .size > 0) | "\(.id) \(.name)"')"; then
+                names="$(printf '%s\n' "$assets" | cut -d' ' -f2 | sort | tr '\n' ' ')"
+                if [ "$names" = "$want" ]; then id="$lines"; break; fi
+                echo "attempt $attempt: draft $lines lists: ${names:-nothing}"
+              else
+                echo "attempt $attempt: could not read draft $lines"
+              fi
+            else
+              echo "attempt $attempt: found $n draft(s) of $TAG"
+            fi
+            sleep 3
+          done
+          [ -n "$id" ] || fail "no consistent draft of $TAG after 10 attempts (last seen: $n draft(s); files: ${names:-none})"
+          echo "draft id: $id"
+          printf '%s\n' "$assets"
+          mkdir -p verify
+          # download every file of THIS draft by id (each download retried), then verify before anything becomes public
           while read -r aid name; do
-            printf '%s' "$aid" | grep -qE '^[0-9]+$'
-            gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$aid" > "verify/$name"
-          done < assets.txt
-          (cd verify && test "$(wc -l < SHA256SUMS.txt | tr -d ' ')" = "3" && sha256sum -c SHA256SUMS.txt)
-          cmp verify/install.sh release-assets/install.sh
-          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=true --jq '.html_url'
+            printf '%s' "$aid" | grep -qE '^[0-9]+$' || fail "unexpected asset id"
+            ok=0
+            for try in 1 2 3 4 5; do
+              if gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$aid" > "verify/$name" </dev/null && [ -s "verify/$name" ]; then ok=1; break; fi
+              echo "download of $name failed (try $try)"; sleep 3
+            done
+            [ "$ok" = "1" ] || fail "could not download $name from the draft"
+          done < <(printf '%s\n' "$assets")
+          lc="$(wc -l < verify/SHA256SUMS.txt | tr -d ' ')"
+          [ "$lc" = "3" ] || fail "SHA256SUMS.txt has $lc lines, expected 3"
+          (cd verify && sha256sum -c SHA256SUMS.txt) || fail "checksum verification of the draft's files failed"
+          for f in conductor.tgz install.sh install.ps1 SHA256SUMS.txt; do
+            cmp "verify/$f" "release-assets/$f" || fail "the draft's $f differs from the tested artifact"
+          done
+          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=true --jq '.html_url' || fail "could not publish draft $id"
       - name: Check the public install link (warning only)
         continue-on-error: true
         run: |
