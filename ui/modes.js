@@ -365,6 +365,53 @@
     return { label: 'Moved', title: String(m.note || '') };
   }
 
+  /* ───────── conversation context and copy (pure; tested in test/ui-conversation.test.ts) ───────── */
+  /**
+   * The earlier ask a new Ask question continues: ONLY the last turn, and only when it is a finished Ask in the same repository and the
+   * user did not start a new topic. Anything else (Build, Research, still running, failed, another repository) starts fresh.
+   */
+  function followTarget(turns, repo, newTopic) {
+    if (newTopic || !Array.isArray(turns) || !turns.length) return null;
+    const t = turns[turns.length - 1];
+    if (!t || t.mode !== 'ask' || t.phase !== 'done' || !isAskId(t.askId)) return null;
+    return String(t.repo || '') === String(repo || '') ? t.askId : null;
+  }
+
+  const lines = (a) => (Array.isArray(a) ? a.map((x) => String(x == null ? '' : x)).filter(Boolean) : []);
+  /** An Ask answer as plain text for the clipboard: the answer, a suggested change if it is one, and the files it relied on. */
+  function answerToText(res) {
+    if (!res || typeof res !== 'object') return '';
+    const parts = [];
+    if (res.answer) parts.push(String(res.answer).trim());
+    const ch = res.kind === 'change' && res.change && typeof res.change === 'object' ? res.change : null;
+    if (ch) parts.push(['Suggested change: ' + String(ch.title || '') + (ch.complexity ? ' (size ' + ch.complexity + ')' : ''), String(ch.description || ''), lines(ch.files).length ? 'Files: ' + lines(ch.files).join(', ') : ''].filter(Boolean).join('\n'));
+    const cites = (Array.isArray(res.citations) ? res.citations : []).map((c) => (c && c.file ? String(c.file) + (c.lines ? ':' + String(c.lines) : '') : '')).filter(Boolean);
+    if (cites.length) parts.push('Sources: ' + cites.join(', '));
+    return parts.join('\n\n');
+  }
+
+  const STATE_TEXT = Object.freeze({ opened: 'opened', listed: 'listed, not opened', unverified: 'unverified' });
+  /** A research report as plain text for the clipboard (the structured data, in reading order). */
+  function reportToText(rp) {
+    if (!rp || typeof rp !== 'object') return '';
+    const out = [];
+    if (rp.summary) out.push('Summary\n' + String(rp.summary));
+    const findings = Array.isArray(rp.findings) ? rp.findings : [];
+    if (findings.length) {
+      out.push('Findings\n' + findings.map((f, i) => {
+        const srcs = (Array.isArray(f && f.sources) ? f.sources : []).map((s) => '   - ' + String((s && (s.title || s.url)) || 'source') + (s && s.url && s.title ? ' (' + String(s.url) + ')' : '') + ' [' + (STATE_TEXT[s && s.state] || 'unverified') + ']');
+        return (i + 1) + '. [' + (STATE_TEXT[f && f.status] || 'unverified') + '] ' + String((f && f.claim) || '') + (srcs.length ? '\n' + srcs.join('\n') : '');
+      }).join('\n'));
+    }
+    const alts = Array.isArray(rp.alternatives) ? rp.alternatives : [];
+    if (alts.length) out.push('Alternatives\n' + alts.map((a) => '- ' + String((a && a.name) || '') + (lines(a && a.pros).length ? '\n  For: ' + lines(a.pros).join('; ') : '') + (lines(a && a.cons).length ? '\n  Against: ' + lines(a.cons).join('; ') : '')).join('\n'));
+    if (rp.recommendation) out.push('Recommendation\n' + String(rp.recommendation));
+    const steps = lines(rp.steps);
+    if (steps.length) out.push('Suggested next steps\n' + steps.map((s, i) => (i + 1) + '. ' + s).join('\n'));
+    out.push('Limits of this report\n' + (rp.limitations ? String(rp.limitations) : 'None stated.'));
+    return out.join('\n\n');
+  }
+
   const deepFreeze = (o) => { if (o && typeof o === 'object' && !Object.isFrozen(o)) { Object.freeze(o); for (const k of Object.keys(o)) deepFreeze(o[k]); } return o; };
   globalThis.ConductorModes = deepFreeze({
     detectMode, MODE_META, NONE, noneAllowed, matchRepo, resolveRepo, taskFromText, TITLE_MAX,
@@ -373,5 +420,6 @@
     RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
     LIMIT_RULE_LABEL, LIMIT_RULE_HINT, movedChip,
     COMPLETE_AUTO_CONFIRM, isCompleteAuto, runModeOverridden, approveWaitingBody, skipReasonLabel,
+    followTarget, answerToText, reportToText,
   });
 })();

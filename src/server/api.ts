@@ -541,7 +541,7 @@ export class Api {
       return { json: { ok: true, context: projects[key]!.context, notice: projects[key]!.context!.summaries ? 'Directory summaries spend model quota (a small number of calls per day, see pipeline.contextRunsPerDay).' : undefined } };
     }
     if (method === 'POST' && path === '/api/ask') {
-      const allowed = new Set(['question', 'repo', 'allowChange', 'mode']);
+      const allowed = new Set(['question', 'repo', 'allowChange', 'mode', 'follow']);
       if (body.mode !== undefined && body.mode !== 'quick' && body.mode !== 'research') throw new ApiFail(400, 'bad_request', '"mode" must be quick or research.');
       if (body.mode === 'research') {
         for (const k of Object.keys(body)) if (!['question', 'repo', 'mode'].includes(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
@@ -549,7 +549,7 @@ export class Api {
       }
       for (const k of Object.keys(body)) if (!allowed.has(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
       if (body.allowChange !== undefined && typeof body.allowChange !== 'boolean') throw new ApiFail(400, 'bad_request', '"allowChange" must be true or false.');
-      return { status: 202, json: this.asksSvc().start({ question: body.question, repo: body.repo, allowChange: body.allowChange }) };
+      return { status: 202, json: this.asksSvc().start({ question: body.question, repo: body.repo, allowChange: body.allowChange, follow: body.follow }) };
     }
     // ── M8-6: "Design the work" / research briefs (strict bodies, ids by regex before any path; CSRF/Host/Sec-Fetch in http.ts) ──
     if (method === 'POST' && path === '/api/briefs') {

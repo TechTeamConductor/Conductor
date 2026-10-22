@@ -25,7 +25,7 @@ import { fence, loadTemplate, preamble, render } from '../pipeline/prompts.ts';
 import { errMsg, truncate } from '../util.ts';
 import { cleanCommand } from '../context/facts.ts';
 import { logger } from '../log.ts';
-import { ASK_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
+import { ASK_ID_RE, ASK_LIMITS, HISTORY_LIMITS, deleteAsk, loadAsk, listAsks, newAskId, saveAsk, validateAsk, type AskRecord } from './store.ts';
 import { RESEARCH_SCHEMA, buildReport } from './research.ts';
 import { renderResearchBrief, shapeResearchBrief } from '../briefs/schemas.ts';
 import type { ResearchBrief, ResearchCardView } from '../briefs/types.ts';
@@ -83,12 +83,48 @@ export class AskService {
   constructor(deps: AskDeps) {
     this.d = deps;
   }
+  /** The earlier answered quick asks this one may continue, newest first: walks the `follow` chain with a visited set and a depth limit and stops at the first unusable record. */
+  private historyPairs(follow: string | undefined, repoName: string | undefined): { question: string; answer: string; basis: string }[] {
+    const pairs: { question: string; answer: string; basis: string }[] = [];
+    const seen = new Set<string>();
+    let id = follow;
+    while (id && pairs.length < HISTORY_LIMITS.pairs && !seen.has(id) && ASK_ID_RE.test(id)) {
+      seen.add(id);
+      const r = loadAsk(id);
+      if (!r || r.mode !== 'quick' || r.status !== 'done' || !r.result || r.dismissedAt !== undefined || r.repo !== repoName) break;
+      pairs.push({ question: r.question, answer: r.result.answer, basis: r.basis ?? '' });
+      id = r.follow;
+    }
+    return pairs;
+  }
+
+  /** The fenced history block: one JSON object per line (so no earlier text can fake a turn), capped per item and in total, redacted, assembled once. */
+  private historyBlock(pairs: { question: string; answer: string; basis: string }[], secrets: readonly string[]): string {
+    const kept: string[] = [];
+    let total = 0;
+    for (const p of pairs) {
+      // redact each field BEFORE it is JSON-escaped (a secret containing a quote, backslash or newline would not match its escaped form)
+      const item = { question: redact(truncate(p.question, HISTORY_LIMITS.question), secrets), answer: redact(truncate(p.answer, HISTORY_LIMITS.answer), secrets), basis: redact(truncate(p.basis, HISTORY_LIMITS.basis), secrets) };
+      let line = JSON.stringify(item);
+      // even the newest pair stays inside the total budget (JSON escaping can inflate it): shrink its answer until it fits
+      for (let guard = 0; line.length > HISTORY_LIMITS.total && guard < 10; guard++) {
+        item.answer = truncate(item.answer, Math.max(100, item.answer.length - (line.length - HISTORY_LIMITS.total) - 20));
+        line = JSON.stringify(item);
+      }
+      if (kept.length && total + line.length > HISTORY_LIMITS.total) break;
+      kept.push(line);
+      total += line.length;
+    }
+    const chronological = kept.reverse().map((line, i) => `{"turn":${i + 1},${line.slice(1)}`);
+    return fence('earlier-conversation', redact(chronological.join('\n'), secrets), HISTORY_LIMITS.total + 400);
+  }
+
   private now(): number {
     return (this.d.now ?? Date.now)();
   }
 
   /** Validate, count, record, and start. Returns the new record at once; the answer arrives later. */
-  start(input: { question: unknown; repo?: unknown; allowChange?: unknown }): AskRecord {
+  start(input: { question: unknown; repo?: unknown; allowChange?: unknown; follow?: unknown }): AskRecord {
     const q = typeof input.question === 'string' ? input.question.trim() : '';
     if (!q) throw new AskError('bad_request', '"question" is required.');
     if (q.length > ASK_LIMITS.question) throw new AskError('bad_request', `"question" is too long (max ${ASK_LIMITS.question} characters).`);
@@ -99,12 +135,21 @@ export class AskService {
       repo = cfg.repos.find((r) => r.name === input.repo);
       if (!repo) throw new AskError('bad_request', 'Unknown repository.');
     } else if (cfg.repos.length === 1) repo = cfg.repos[0];
+    // A follow-up: validate the id first, then look the earlier asks up in OUR store (never trust client-supplied history text).
+    // An unusable `follow` (missing, deleted, another repository, not an answered quick ask) never fails the ask: it just has no history.
+    let follow: string | undefined;
+    let historyCount = 0;
+    if (input.follow !== undefined && input.follow !== '') {
+      if (typeof input.follow !== 'string' || !ASK_ID_RE.test(input.follow)) throw new AskError('bad_request', '"follow" must be the id of an earlier question.');
+      const pairs = this.historyPairs(input.follow, repo?.name);
+      if (pairs.length) { follow = input.follow; historyCount = pairs.length; }
+    }
     if (cfg.agents.claude.isolation !== 'safe-mode') throw new AskError('isolation', 'Quick Ask needs Claude\'s safe-mode isolation (project settings and hooks would be loaded from the snapshot otherwise).', 409);
     if (this.running.size >= MAX_CONCURRENT) throw new AskError('busy', 'Two questions are already being answered — try again in a moment.', 429);
     this.gate('context'); // M8-3: BEFORE the counter (no record, no counter on 409 limited)
     const t = takeKeyed('asksPerHour', cfg.pipeline.asksPerHour, { now: this.now() });
     if (!t.ok) throw new AskError('limit', `You reached the limit of ${cfg.pipeline.asksPerHour} questions per hour.`, 429);
-    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'quick', repo: repo?.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: [], allowChange: input.allowChange === true, takenKey: t.key };
+    const rec: AskRecord = { schemaVersion: 1, id: newAskId(), mode: 'quick', repo: repo?.name, question: q, createdAt: this.now(), updatedAt: this.now(), status: 'running', events: input.follow !== undefined && input.follow !== '' && !follow ? ['Earlier context was not available, so this question was answered on its own.'] : [], ...(follow ? { follow, historyCount } : {}), allowChange: input.allowChange === true, takenKey: t.key };
     this.save(rec);
     const ac = new AbortController();
     const promise = this.run(rec.id, repo, ac).catch((e) => log.warn(`${rec.id}: ${errMsg(e)}`)).finally(() => void this.running.delete(rec.id));
@@ -359,9 +404,13 @@ export class AskService {
         cwd = scratch;
       }
       this.patch(id, (r) => void (r.basis = basis));
-      const prompt = render(loadTemplate('ask'), { preamble: preamble('plan'), basis, projectFacts, question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
+      const pairs = rec.follow ? this.historyPairs(rec.follow, repo?.name) : [];
+      const history = pairs.length ? this.historyBlock(pairs, secrets) : '';
+      const shown = Math.min(pairs.length, HISTORY_LIMITS.pairs);
+      if (rec.follow && (rec.historyCount ?? 0) !== shown) this.patch(id, (r) => void (r.historyCount = shown));
+      const prompt = render(loadTemplate('ask'), { preamble: preamble('plan'), basis, projectFacts, history, question: fence('user-question', rec.question, ASK_LIMITS.question + 100) });
       await this.d.freshHealth();
-      const events: string[] = [];
+      const events: string[] = [...rec.events]; // keeps the "earlier context was not available" note
       const out = await callAgent({
         agents: this.d.agents,
         role: 'context',

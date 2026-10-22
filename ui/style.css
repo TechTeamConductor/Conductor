@@ -1083,3 +1083,9 @@ dialog::backdrop { background: var(--scrim); }
 .acct-disclose { font-size: 12px; margin: 8px 0 0; padding-left: 18px; }
 .st.st-sm { font-size: 11px; padding: 1px 6px; }
 #topbar { position: relative; }
+
+/* Conversation context hint and the copy button on answers and reports (Home thread, report dialog). */
+.cmp-ctx { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.doc-tools { display: flex; justify-content: flex-end; padding: 2px 4px 0; }
+.copy-answer { opacity: .75; }
+.copy-answer:hover, .copy-answer:focus-visible { opacity: 1; }

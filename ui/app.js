@@ -1249,7 +1249,7 @@ const DISCLOSE = {
 };
 const MAX_TURNS = 20;
 const ASK_POLL_MS = 1500;
-S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null };
+S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
 const HM = { root: null };
 
 const homeRepoNames = () => ((S.state && S.state.repos) || []).map((r) => r.name);
@@ -1296,6 +1296,9 @@ function buildHomeView() {
   HM.sendIcon = h('span', { class: 'send-ic' });
   HM.send = h('button', { type: 'button', class: 'send', onclick: () => (S.home.turns.some(stoppable) ? stopRunningTurn() : homeSubmit()) }, HM.sendIcon);
   HM.note = h('p', { class: 'cmp-note' });
+  HM.ctxText = h('span');
+  HM.ctxBtn = h('button', { type: 'button', class: 'link-btn', onclick: () => { S.home.newTopic = !S.home.newTopic; updateHome(); } });
+  HM.ctx = h('p', { class: 'cmp-note cmp-ctx', hidden: true }, HM.ctxText, HM.ctxBtn);
   HM.allowBox = h('input', { type: 'checkbox', onchange: () => { S.home.allowChange = HM.allowBox.checked; } });
   HM.allowLbl = h('span');
   HM.opt = h('div', { class: 'cmp-opt', hidden: true },
@@ -1307,7 +1310,7 @@ function buildHomeView() {
   const dock = h('div', { class: 'dock' },
     h('div', { class: 'composer' }, HM.input,
       h('div', { class: 'cmp-bar' }, HM.modes.el, h('span', { class: 'cmp-spacer' }), HM.repoWrap, HM.whoWrap, HM.send)),
-    HM.note, HM.opt, HM.err, HM.suggest);
+    HM.note, HM.ctx, HM.opt, HM.err, HM.suggest);
   HM.cardWho = {};
   HM.cards = h('div', { class: 'cards3' }, MODE_CARDS.map((c) => {
     HM.cardWho[c.id] = h('span', { class: 'mcard-who' });
@@ -1381,6 +1384,15 @@ function updateHome() {
   const showNote = hm.mode !== 'auto' || !!hm.text.trim();
   setText(HM.note, showNote ? DISCLOSE[mode] : '');
   toggleHidden(HM.note, !showNote);
+  // conversation context: does the next Ask continue the last answer?
+  const continues = mode === 'ask' && !!M.followTarget(hm.turns, res.name, false);
+  const ctxShown = continues || (mode === 'ask' && hm.newTopic);
+  if (!continues && hm.newTopic && mode !== 'ask') hm.newTopic = false;
+  toggleHidden(HM.ctx, !ctxShown);
+  if (ctxShown) {
+    setText(HM.ctxText, hm.newTopic ? 'New topic: your next question will not use the earlier answers. ' : 'Your next question continues this conversation: the earlier answers are kept as context. ');
+    setText(HM.ctxBtn, hm.newTopic ? 'Keep the context' : 'New topic');
+  }
   const allow = mode === 'ask' && !!res.name;
   const allowKey = mode + '|' + (res.name || '');
   if (HM.allowKey !== allowKey) { HM.allowKey = allowKey; hm.allowChange = false; }
@@ -1555,13 +1567,14 @@ function clearThread() {
   if (homeBusy()) return;
   for (const t of S.home.turns) clearTimeout(t.timer);
   S.home.turns = [];
+  S.home.newTopic = false;
   updateHome();
   if (HM.input) HM.input.focus();
 }
 /** Sign-out / expired session: nothing of the conversation stays on the page (Security U5). */
 function dropHome() {
   for (const t of S.home.turns) { clearTimeout(t.timer); t.timer = 0; }
-  S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null };
+  S.home = { text: '', mode: 'auto', repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
   HM.root = null; HM.turnEls = null;
 }
 const askPhase = (r) => (r.status === 'running' || r.status === 'paused' ? 'running' : r.status === 'done' ? 'done' : r.status === 'canceled' ? 'canceled' : 'failed');
@@ -1578,6 +1591,8 @@ async function homeSubmit() {
     if (!names.length) { hm.err = 'Add a repository first (Settings, then Repositories and setup).'; updateHome(); return; }
     if (!res.name) { hm.err = 'Choose which repository this task belongs to.'; updateHome(); toggleHomeMenu('repo'); return; }
   }
+  const follow = mode === 'ask' ? M.followTarget(hm.turns, res.name, hm.newTopic) : null; // before pushTurn: the new turn must not be its own parent
+  hm.newTopic = false;
   const t = { id: uid('turn'), mode, text, repo: res.name, phase: 'sending', askId: null, rec: null, error: '', created: null, timer: 0, allowChange: mode === 'ask' && !!res.name && hm.allowChange,
     briefId: null, brief: null, unticked: new Set(), depth: 'standard', sendBusy: false, sendErr: '' };
   pushTurn(t);
@@ -1604,6 +1619,7 @@ async function homeSubmit() {
       if (mode === 'research') body.mode = 'research';
       if (t.repo) body.repo = t.repo;
       if (t.allowChange) body.allowChange = true;
+      if (follow && mode === 'ask') body.follow = follow;
       const r = await api('POST', '/api/ask', body);
       t.askId = r.id; t.rec = r; t.phase = askPhase(r);
       if (t.phase === 'running') pollTurn(t);
@@ -1725,6 +1741,11 @@ function turnSteps(t) {
     { label: t.phase === 'done' ? 'Answered by ' + provLabel(r.provider) : 'Writing the answer', state: t.phase === 'done' ? 'done' : ended ? 'stopped' : read ? 'running' : 'pending' },
   ];
 }
+/** A small copy button for an answer or a report (text comes from the pure serializers in modes.js). */
+function copyAnswerBtn(getText, label) {
+  return h('button', { type: 'button', class: 'btn btn-ghost btn-icon btn-sm copy-answer', 'aria-label': 'Copy ' + label, title: 'Copy ' + label, data: { fid: 'copy:' + label },
+    onclick: async () => { const ok = await copyText(getText()); toast(ok ? 'good' : 'warn', ok ? 'Copied the ' + label + '.' : "Couldn't copy the " + label + '.'); } }, icon('copy'));
+}
 function turnNodes(t) {
   const meta = M.MODE_META[t.mode];
   const row = modeRow(t.mode);
@@ -1742,7 +1763,7 @@ function turnNodes(t) {
   }
   if (t.phase === 'done' && r && r.result && t.mode === 'ask') {
     const res = r.result;
-    const doc = h('div', { class: 'doc' });
+    const doc = h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.answerToText(res), 'answer')));
     if (res.answer) doc.appendChild(h('div', { class: 'doc-sec is-bare' }, renderMarkdown(res.answer)));
     if (res.kind === 'change' && res.change) doc.appendChild(h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'This looks like a request for a change: ' + res.change.title + ' (size ' + res.change.complexity + '). Nothing was changed.')));
     out.push(doc);
@@ -1751,7 +1772,7 @@ function turnNodes(t) {
     out.push(...convertNodes(t, 'Turn into a task', 'Started as task ', 'Nothing was added to the board. Turning it into a task always waits for your approval.', 'Choose a repository before asking if you want to turn this into a task.'));
   }
   if (t.phase === 'done' && r && r.report && t.mode === 'research') {
-    out.push(h('div', { class: 'doc' }, h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
+    out.push(h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.reportToText(r.report), 'report')), h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
       h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, 'Written by a model from web sources — sources marked Opened were really fetched in this session; Listed only appeared in search results; Unverified could not be confirmed.'))));
     out.push(...convertNodes(t, 'Turn into an engineering plan', 'Turned into task ', '', 'Choose a repository before asking if you want to turn the findings into an engineering plan.', true));
   }
@@ -1761,6 +1782,7 @@ function turnNodes(t) {
       h('div', { class: 'ai-head' },
         h('span', { class: 'ai-mark' }, icon('baton')), h('span', { class: 'ai-name' }, 'Conductor'),
         h('span', { class: 'ai-tag' }, icon(meta.icon, 'icon-sm'), meta.label),
+        t.mode === 'ask' && r && r.historyCount > 0 ? h('span', { class: 'ai-tag', title: 'This answer was also shown the earlier questions and answers of this conversation' }, 'Follow-up · ' + r.historyCount + (r.historyCount === 1 ? ' earlier question' : ' earlier questions')) : null,
         by ? h('span', { class: 'ai-who', title: row.label + ' · ' + provLabel(by) }, provLabel(by)) : null),
       stepNodes(turnSteps(t)), out),
   ];
@@ -3419,7 +3441,7 @@ function openResearchReport(id, opener) {
     else {
       kids.push(h('p', { class: 'rr-q' }, h('span', { class: 'muted' }, 'Question: '), r.question || ''));
       if (r.report) {
-        kids.push(h('div', { class: 'doc' }, h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
+        kids.push(h('div', { class: 'doc' }, h('div', { class: 'doc-tools' }, copyAnswerBtn(() => M.reportToText(r.report), 'report')), h('div', { class: 'doc-sec is-bare' }, renderReport(r.report)),
           h('div', { class: 'doc-sec' }, h('p', { class: 'muted' }, badge('warn', MODEL_LABEL, 'warn'), ' ', RESEARCH_DISCLAIMER))));
       } else kids.push(h('p', { class: 'muted' }, r.error || 'There is no report for this research.'));
       if (r.convertedTo) kids.push(h('p', null, 'Turned into task ', h('b', null, r.convertedTo), '.'));
