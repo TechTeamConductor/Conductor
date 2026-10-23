@@ -111,10 +111,10 @@ test('window (e) + level-triggered projection: a run that says finished/ready/pa
   try {
     const key = h.issue('drift');
     await h.settle();
-    assert.equal(laneOf(h, key), 'review');
+    assert.equal(laneOf(h, key), 'done');
     h.board.setLane(key, 'active', 'conductor', { stage: 'building' }); // drift
     await h.engine.tick();
-    assert.equal(laneOf(h, key), 'review');
+    assert.equal(laneOf(h, key), 'done');
     h.store.update(key, (r) => void (r.status = 'finished')); // the run moved on, the card did not
     await h.engine.tick();
     assert.equal(laneOf(h, key), 'done');
@@ -152,6 +152,20 @@ test('K4: a card sitting in a Conductor-owned lane without a run is flagged, nev
     const ig = h.engine.status().ignored;
     assert.ok(ig.some((i) => i.key === orphan.key && /no run for it/.test(i.reason)));
     assert.ok(ig.some((i) => i.key === ask.key && /not supported yet/.test(i.reason)));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a verified card is done, so the card that depends on it is claimed', async () => {
+  const h = await makeHarness();
+  try {
+    const first = h.issue('first');
+    const second = h.board.user.createItem({ projectId: h.projectId, title: 'second', dependsOn: [h.board.item(first)!.id] });
+    await h.settle();
+    assert.equal(h.run(first).status, 'ready');
+    assert.equal(laneOf(h, first), 'done');
+    assert.equal(h.run(second.key).status, 'ready');
   } finally {
     await h.cleanup();
   }

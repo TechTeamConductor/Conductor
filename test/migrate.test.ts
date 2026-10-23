@@ -91,7 +91,7 @@ test('apply: a complete v2 folder appears with one rename; v1 is untouched (even
   assert.equal(eng7.autoStart, false, 'imported cards are never auto-claimed');
   assert.deepEqual(eng7.external, { system: 'linear', key: 'ENG-7', url: 'https://linear.app/example/issue/ENG-7' });
   assert.ok(board.comments('ENG-7').some((c) => /Imported from Conductor v1/.test(c.body)));
-  assert.equal(board.item('ENG-8')!.lane, 'review');
+  assert.equal(board.item('ENG-8')!.lane, 'done');
   assert.equal(board.item('ENG-10')!.lane, 'backlog');
   assert.equal(board.item('ENG-11')!.lane, 'done');
   assert.equal(board.item('ENG-9')!.lane, 'needs_you');

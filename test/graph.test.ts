@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ItemRun, Plan, PlanItem } from '../src/types.ts';
-import { GRAPH_MAX_ITEMS, HARD_ITERATIONS, HARD_RUNS, buildGraph, graphBudgets, isGraphPlan, isReady, itemMarker, newNonce, parseItemMarker, projectItemLane, propagateBlocked, readySet, sanitizeLine, topoOrder, validateTaskGraph } from '../src/pipeline/graph.ts';
+import { GRAPH_MAX_ITEMS, HARD_ITERATIONS, HARD_RUNS, buildGraph, depsWithoutParallelPeers, graphBudgets, isGraphPlan, isReady, itemMarker, newNonce, parseItemMarker, projectItemLane, propagateBlocked, readySet, sanitizeLine, topoOrder, validateTaskGraph } from '../src/pipeline/graph.ts';
 import { planToMarkdown } from '../src/pipeline/prompts.ts';
 import { PLAN_SCHEMA } from '../src/pipeline/schemas.ts';
 import { validateSchema } from '../src/agents/json.ts';
@@ -148,4 +148,19 @@ test('the approval screen shows the graph: planToMarkdown renders items, depende
   const hostile = good();
   hostile.taskGraph!.items[0]!.title = 'a|b\u202E';
   assert.ok(!planToMarkdown(hostile).includes('\u202E'));
+});
+
+test('parallelGroup drops edges between peers and keeps deps outside the group; builds stay one ready item', () => {
+  const items = [
+    item('T1', { criteria: ['AC1'], parallelGroup: 'api' }),
+    item('T2', { criteria: ['AC2'], dependsOn: ['T1'], parallelGroup: 'api' }),
+    item('T3', { dependsOn: ['T2'], parallelGroup: 'later' }),
+  ];
+  const dropped = depsWithoutParallelPeers(items);
+  assert.deepEqual(dropped.get('T1'), []);
+  assert.deepEqual(dropped.get('T2'), [], 'same group does not wait');
+  assert.deepEqual(dropped.get('T3'), ['T2'], 'a different group keeps the declared dep');
+  const g = buildGraph(plan(items), 1, 0, 3);
+  assert.deepEqual(g.items.map((i) => i.dependsOn), [[], [], ['T2']]);
+  assert.deepEqual(readySet(g.items).map((i) => i.id), ['T1', 'T2'], 'peers are both ready');
 });

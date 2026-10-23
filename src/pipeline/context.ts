@@ -45,6 +45,11 @@ export interface PipelineCtx {
    * Resolves with a release function, or null when `signal` aborts while waiting.
    */
   analysisSlot(signal?: AbortSignal): Promise<(() => void) | null>;
+  /**
+   * One slot of `pipeline.maxParallel` for a build, shared by every run (task-graph items and whole-card builds).
+   * Resolves with a release function, or null when `signal` aborts while waiting.
+   */
+  buildSlot(signal?: AbortSignal): Promise<(() => void) | null>;
   /** The connectivity probe's verdict (cached ~20 s; `unknown` when it cannot tell). */
   networkState(): Promise<'online' | 'offline' | 'unknown'>;
   /** The project context engine (M4): packs for prompts, refresh, outcome digests. Best-effort — it never fails or blocks a run. */

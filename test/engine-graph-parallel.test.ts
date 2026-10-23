@@ -1,8 +1,11 @@
-// M3 commit 4 — analysis items run concurrently (read-only, bounded by ONE engine-owned cap shared by every run); build items are strictly
-// exclusive within their run; when concurrent calls raise a hold the run settles them all and makes ONE transition.
+// M3 commit 4 — analysis items run concurrently (read-only, bounded by ONE engine-owned cap shared by every run). File-disjoint build
+// items run together up to maxParallel; items that list the same file do not. When concurrent calls raise a hold the run settles them
+// all and makes ONE transition.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeHarness, type Harness } from './helpers/harness.ts';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { git, makeHarness, type Harness } from './helpers/harness.ts';
 import { graphPlan, item, manual, writes } from './helpers/graphs.ts';
 import { Semaphore } from '../src/pipeline/semaphore.ts';
 
@@ -34,6 +37,24 @@ function watchAnalysis(h: Harness): { max: () => number; calls: () => number } {
     }
   };
   return { max: () => max, calls: () => calls };
+}
+/** How many Cursor builds are in flight at once. */
+function watchBuilds(h: Harness): { max: () => number } {
+  let active = 0;
+  let max = 0;
+  h.agents._testMutate('cursor', (draft) => {
+    const run = draft.build!.run.bind(draft.build);
+    draft.build!.run = async (req, prep) => {
+      active++;
+      max = Math.max(max, active);
+      try {
+        return await run(req, prep);
+      } finally {
+        active--;
+      }
+    };
+  });
+  return { max: () => max };
 }
 async function approveAll(h: Harness, keys: string[]): Promise<void> {
   h.engine.setPaused(true);
@@ -72,7 +93,7 @@ test('M3-AC6 / M3-6: ONE cap is shared by every run — two runs × two analysis
     const h = await makeHarness({ config: (c) => { manual(c); c.pipeline.readOnlyParallel = cap; c.pipeline.maxParallel = 2; } });
     try {
       const watch = watchAnalysis(h);
-      h.scenario({ claude: { '*': { plan: [{ json: plan() }], analysis: [slow, slow] } }, cursor: { '*': { build: [writes('t3.mjs')] } } });
+      h.scenario({ claude: { '*': { plan: [{ json: plan() }], analysis: [slow, slow] } }, cursor: { '*': { build: [{ delayMs: 30 }] } } });
       const k1 = h.issue('First run');
       await h.settle();
       const k2 = h.issue('Second run');
@@ -85,6 +106,81 @@ test('M3-AC6 / M3-6: ONE cap is shared by every run — two runs × two analysis
     } finally {
       await h.cleanup();
     }
+  }
+});
+
+test('file-disjoint build items run together, and their commits land on the current branch', async () => {
+  const h = await makeHarness({ config: (c) => { manual(c); c.pipeline.maxParallel = 2; } });
+  try {
+    const watch = watchBuilds(h);
+    const plan = graphPlan([
+      item('T1', { files: ['t1.mjs'], criteria: ['AC1'] }),
+      item('T2', { files: ['t2.mjs'], criteria: ['AC2'] }),
+    ]);
+    h.scenario({
+      claude: { '*': { plan: [{ json: plan }] } },
+      cursor: { 'ENG-1': { build: [{ ...writes('t1.mjs'), delayMs: 400 }, { ...writes('t2.mjs'), delayMs: 400 }] } },
+    });
+    const key = h.issue('Two builds');
+    await h.settle();
+    await approveAll(h, [key]);
+    const run = h.run(key);
+    assert.equal(run.status, 'ready', run.needsHuman?.reason ?? run.history.map((x) => x.text).join('\n'));
+    assert.equal(watch.max(), 2, 'both builds were in flight together');
+    assert.equal(run.branch, 'main');
+    assert.equal(git(h.repoDir, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
+    assert.equal(git(h.repoDir, 'branch', '--format=%(refname:short)').split('\n').filter(Boolean).sort().join('\n'), 'main');
+    assert.ok(existsSync(join(h.repoDir, 't1.mjs')));
+    assert.ok(existsSync(join(h.repoDir, 't2.mjs')));
+    assert.equal(git(h.repoDir, 'merge-base', '--is-ancestor', run.graph!.items[0]!.commitSha!, 'HEAD'), '');
+    assert.equal(git(h.repoDir, 'merge-base', '--is-ancestor', run.graph!.items[1]!.commitSha!, 'HEAD'), '');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('build items that list the same file do not run together', async () => {
+  const h = await makeHarness({ config: (c) => { manual(c); c.pipeline.maxParallel = 2; } });
+  try {
+    const watch = watchBuilds(h);
+    const plan = graphPlan([
+      item('T1', { files: ['same.mjs'], criteria: ['AC1'] }),
+      item('T2', { files: ['same.mjs'], criteria: ['AC2'] }),
+    ]);
+    h.scenario({
+      claude: { '*': { plan: [{ json: plan }] } },
+      cursor: { 'ENG-1': { build: [{ ...writes('same.mjs', 'export const v = 1;\n'), delayMs: 400 }, { ...writes('same.mjs', 'export const v = 2;\n'), delayMs: 400 }] } },
+    });
+    const key = h.issue('Same file');
+    await h.settle();
+    await approveAll(h, [key]);
+    const run = h.run(key);
+    assert.equal(run.status, 'ready', run.needsHuman?.reason ?? run.history.map((x) => x.text).join('\n'));
+    assert.equal(watch.max(), 1, 'the two builds that share a file stayed one at a time');
+    assert.equal(run.graph!.items.every((i) => i.state === 'done'), true);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('two independent cards both reach running when maxParallel is 2', async () => {
+  const h = await makeHarness({ config: (c) => { c.pipeline.maxParallel = 2; } });
+  try {
+    const watch = watchBuilds(h);
+    h.scenario({ cursor: { '*': { build: [{ delayMs: 500 }] } } });
+    const k1 = h.issue('First card');
+    const k2 = h.issue('Second card');
+    await h.settle();
+    assert.equal(h.run(k1).status, 'ready', h.run(k1).needsHuman?.reason);
+    assert.equal(h.run(k2).status, 'ready', h.run(k2).needsHuman?.reason);
+    assert.equal(watch.max(), 2, 'both cards built at the same time');
+    assert.equal(h.run(k1).branch, 'main');
+    assert.equal(h.run(k2).branch, 'main');
+    assert.equal(git(h.repoDir, 'branch', '--format=%(refname:short)').split('\n').filter(Boolean).sort().join('\n'), 'main');
+    assert.ok(existsSync(join(h.repoDir, `feature-${k1.toLowerCase()}.mjs`)));
+    assert.ok(existsSync(join(h.repoDir, `feature-${k2.toLowerCase()}.mjs`)));
+  } finally {
+    await h.cleanup();
   }
 });
 

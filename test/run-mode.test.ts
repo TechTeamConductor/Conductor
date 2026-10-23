@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectivePolicy, isCompleteAuto, POLICIES, storedPolicy, type ApprovalInput, type Policy } from '../src/policy/policy.ts';
+import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectiveLiftsHolds, effectivePolicy, isCompleteAuto, POLICIES, storedPolicy, type ApprovalInput, type Policy } from '../src/policy/policy.ts';
 import { defaultConfig, normalizeConfig, toSettings } from '../src/config.ts';
 import type { Config } from '../src/types.ts';
 
@@ -34,12 +34,12 @@ const inputOf = (cause: Cause, risky: boolean): Omit<ApprovalInput, 'policy' | '
 });
 /** Exactly the composition the approval gate (stages.ts) performs. */
 const gate = (cfg: Config, i: Omit<ApprovalInput, 'policy' | 'firstPlanHold'>, approved: number) =>
-  decideApproval({ ...i, policy: effectivePolicy(cfg, 'ENG'), firstPlanHold: effectiveFirstPlanHold(cfg, approved) });
+  decideApproval({ ...i, policy: effectivePolicy(cfg, 'ENG'), firstPlanHold: effectiveFirstPlanHold(cfg, approved), completeAuto: effectiveLiftsHolds(cfg) });
 /** Today's (pre-M8-4) gate, written out literally: the Per-settings baseline. */
 const legacyGate = (cfg: Config, i: Omit<ApprovalInput, 'policy' | 'firstPlanHold'>, approved: number) =>
   decideApproval({ ...i, policy: storedPolicy(cfg, 'ENG'), firstPlanHold: cfg.pipeline.planApproval === 'first' && approved === 0 });
 
-test('T1 run-mode: matrix — every forced hold stops under Complete auto; nothing else does; Per settings is today\'s decision', () => {
+test('T1 run-mode: matrix — nothing waits under Complete auto (every forced hold is lifted); Per settings is today\'s decision', () => {
   let cells = 0;
   for (const policy of POLICIES) for (const project of [undefined, ...POLICIES] as (Policy | undefined)[]) for (const planApproval of ['auto', 'manual', 'first'] as const)
     for (const approved of [0, 1]) for (const cause of CAUSES) for (const risky of [false, true]) {
@@ -52,17 +52,10 @@ test('T1 run-mode: matrix — every forced hold stops under Complete auto; nothi
       }
       const ca = cfgWith({ runMode: 'complete-auto', policy, planApproval, project });
       const d = gate(ca, i, approved);
-      const fullAuto = decideApproval({ ...i, policy: 'full-auto', firstPlanHold: false });
-      assert.deepEqual(d, fullAuto, `complete-auto === full-auto without the first-plan rule ${where}`);
-      if (cause === 'none') {
-        assert.equal(d.auto, true, `no forced cause ⇒ builds (risky and first-plan included) ${where}`);
-        assert.equal(decidedByRunMode(ca, i, 'ENG', approved), !legacyGate(ca, i, approved).auto, `history wording only when the mode made the difference ${where}`);
-      } else {
-        assert.equal(d.auto, false, `forced ⇒ waits ${where}`);
-        assert.equal(d.forcedHold, true, where);
-        assert.equal(decidedByRunMode(ca, i, 'ENG', approved), false, where);
-        if (risky) assert.ok(d.risks.length > 0, `a forced hold still shows its risks ${where}`);
-      }
+      const fullAuto = decideApproval({ ...i, completeAuto: true, policy: 'full-auto', firstPlanHold: false });
+      assert.deepEqual(d, fullAuto, `complete-auto === full-auto without holds ${where}`);
+      assert.equal(d.auto, true, `nothing waits under Complete auto ${where}`);
+      assert.equal(decidedByRunMode(ca, i, 'ENG', approved), !legacyGate(ca, i, approved).auto, `history wording only when the mode made the difference ${where}`);
       // the stored settings are never touched by evaluating the overlay
       assert.equal(ca.pipeline.policy, policy);
       assert.equal(ca.pipeline.planApproval, planApproval);
@@ -117,9 +110,10 @@ const stripComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(
 test('T9 static: the overlay is the only path — stages.ts reads no stored approval field, never the mode; only the allowed files read runMode/isCompleteAuto', () => {
   const stages = stripComments(readFileSync(join(ROOT, 'src/pipeline/stages.ts'), 'utf8'));
   assert.doesNotMatch(stages, /pipeline\.planApproval|pipeline\.policy\b|\.projects\??\.\[/, 'stages.ts reads approval settings only through policy.ts');
-  assert.doesNotMatch(stages, /runMode|isCompleteAuto|storedPolicy/, 'N7: forced inputs can never become mode-dependent');
+  assert.doesNotMatch(stages, /runMode|isCompleteAuto|storedPolicy/, 'N7: stages.ts never names the mode');
   assert.match(stages, /effectivePolicy\(cfg, project\)/);
   assert.match(stages, /effectiveFirstPlanHold\(cfg, approved\)/);
+  assert.match(stages, /completeAuto: effectiveLiftsHolds\(cfg\)/);
   // N7: who may name the mode at all (api.ts joins in commit 2 for PUT /api/run-mode and the live view)
   const allowed = new Set(['src/config.ts', 'src/types.ts', 'src/policy/policy.ts', 'src/accounts/limit-rule.ts', 'src/migrate.ts', 'src/server/api.ts']);
   const readers = srcFiles(join(ROOT, 'src'))
@@ -263,7 +257,7 @@ test('T4 run-mode API: strict body, confirm to turn on, idempotent same-mode, PU
     await bad({ runMode: 'complete-auto' }, 'confirm_required');
     await bad({ runMode: 'complete-auto', confirm: false }, 'confirm_required');
     await bad({ runMode: 'complete-auto', confirm: 'true' });
-    await assert.rejects(put({ runMode: 'complete-auto' }), (e: any) => /Large changes, protected files, plans with more than 8 tasks and cards from unverified sources/.test(e.message) && /next tool in the job's list/.test(e.message), 'N8 + M8-5 B2: confirm text names every forced hold and is chain-only');
+    await assert.rejects(put({ runMode: 'complete-auto' }), (e: any) => /large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work/.test(e.message) && /next tool in the job's list/.test(e.message), 'N8 + M8-5 B2: confirm text names every forced hold and is chain-only');
     assert.equal(saves, 0, 'nothing written by any refused call');
     // same mode: idempotent, nothing written
     let r = (await put({ runMode: 'per-settings' })).json;

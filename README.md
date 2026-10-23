@@ -36,14 +36,14 @@
 > **Type one line. Claude plans it, Cursor builds it, Claude checks it, and you merge it.**
 > One local dashboard that runs your AI coding CLIs as a team, with its own board, and never touches `git push`.
 
-You do the thinking. Conductor does the shuffling between tools: it plans, splits work into dependent tasks, builds in an **isolated git worktree**, runs **your** tests as ground truth, has a **second agent verify** the result, and sends bugs back automatically, up to three times, before it asks you.
+You do the thinking. Conductor does the shuffling between tools: it plans, splits work into dependent tasks, builds on the **branch the repository already has checked out**, runs **your** tests as ground truth, has a **second agent verify** the result, and sends bugs back automatically, up to three times, before it asks you.
 
 ```text
    "Add filters by user and date to the audit log"
         │
         ▼  Claude   reads a read-only snapshot, writes the plan   (+ independent plan review for bigger changes)
         ▼  You      approve only what is large, risky or came from model-written text
-        ▼  Cursor   builds in its own worktree and branch
+        ▼  Cursor   builds on the repository's current branch
         ▼  Gates    your tests · lint · typecheck — deterministic, not an opinion
         ▼  Claude   verifies every acceptance criterion against evidence
         │              └─ bugs? → bug cards → back to Cursor (max 3 loops, then it asks you)
@@ -55,7 +55,7 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 - **A second pair of eyes.** The tool that writes the code is never the tool that signs it off.
 - **Your tests decide.** Gates run your repo's own checks; the verifier must cite evidence, not vibes.
 - **It stays on your machine.** Loopback only, one-time sign-in link, cookie + CSRF. No cloud, no tracker, no account.
-- **Safe by construction.** The builder works in a worktree, cannot push, and its branch is scanned for secrets and protected files before you ever see it.
+- **Safe by construction.** The builder stays on the current branch, cannot push, and that branch is scanned for secrets and protected files before you ever see it.
 - **Bring your own tools.** Claude Code and Cursor today; roles, models and effort are configurable per job, discovered from the CLIs themselves, never hard-coded.
 - **Zero runtime dependencies.** Plain Node. Nothing to `npm install` to run it.
 
@@ -72,7 +72,7 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 | 🎛️ | **Who does what** | Seven jobs, each with a **tool · model · effort**. A "Runs as …" line shows the exact command it becomes. |
 | 🔌 | **Model discovery** | Conductor asks each CLI which models it offers, per account. Stale lists are marked, never invented. |
 | 👥 | **Several accounts per tool** | At a usage limit it moves to the next account, then the next tool *in that job's list*, or waits. Pauses and resumes by itself. |
-| ⚡ | **Run mode** | **Per settings** or **Complete auto**. Complete auto never removes a safety hold. Large, risky, protected-path and model-written plans still ask. |
+| ⚡ | **Run mode** | **Per settings** or **Complete auto**. Complete auto approves and builds every plan without asking, including large, protected-path and designed work. After each build the checks still run on your machine (tests, protected-file and secret scans); nothing is pushed or merged. |
 | 🧠 | **Project context** | A local, incremental index of your repo so agents don't rescan it every time. Works offline. |
 | 🛡️ | **Approval policies** | `full-auto` · `approve-plan` · `approve-risky` · `manual-stages`, per project, with forced holds no setting can remove. |
 
@@ -165,7 +165,7 @@ flowchart LR
     P --> H{Approval?}
     H -->|large · risky · model-written| U[You approve]
     H -->|safe| W
-    U --> W[Cursor builds<br/>isolated worktree]
+    U --> W[Cursor builds<br/>on the current branch]
     W --> G[Your gates<br/>tests · lint · types]
     G --> V[Claude verifies<br/>criteria → evidence]
     V -->|bugs, ≤ 3 loops| W
@@ -190,7 +190,7 @@ Conductor assumes the model can be wrong, and that text it writes can be hostile
 | --- | --- |
 | **Local only** | Listens on `127.0.0.1`, one-time sign-in link, `HttpOnly` cookie, CSRF on every change. |
 | **Read-only stages stay read-only** | Claude runs with `Read`, `Grep`, `Glob` only: no MCP, skills or plugins; credential files denied. A **fail-closed startup check** refuses to continue if the session isn't what was asked for. |
-| **The builder cannot push** | Own worktree and branch in a v2-only namespace, deny rule plus environment. Git hooks and config are snapshotted and restored around every build. |
+| **The builder cannot push** | Commits stay on the branch already checked out. Deny rule plus environment. Git hooks and config are snapshotted and restored around every build. |
 | **Branches are scanned** | Secrets and changes to protected files (`.claude/`, `.cursor/`, `AGENTS.md`, CI config…) are **held for you**. |
 | **Model text is untrusted** | Briefs, research and answers are labelled as model-written. Cards made from them **always wait for your approval**, under every policy and mode. |
 | **Nothing leaks across accounts** | Each child process gets an allow-listed environment; credentials never reach another account's process, config, logs or UI. |

@@ -162,7 +162,7 @@ test('B2b DELETE while sending ⇒ 409; index pruning skips running/sending reco
   } finally { await h.cleanup(); }
 });
 
-test('AC-6.7 cards are untrusted: plan waits for approval under every policy × both run modes (M8-4), as a forced hold', async () => {
+test('AC-6.7 cards are untrusted: plan waits for approval under every policy in Per settings; Complete auto builds it', async () => {
   for (const runMode of ['per-settings', 'complete-auto'] as const) for (const policy of ['full-auto', 'approve-risky', 'approve-plan', 'manual-stages'] as const) {
     const h = await makeHarness({ config: (c) => { c.pipeline.policy = policy; c.pipeline.runMode = runMode; } });
     try {
@@ -172,8 +172,13 @@ test('AC-6.7 cards are untrusted: plan waits for approval under every policy × 
       await h.settle();
       const where = `${runMode} ${policy}`;
       assert.equal(h.run(key).untrusted, true, where);
-      assert.equal(h.run(key).status, 'awaiting_approval', where);
-      assert.equal(h.run(key).forcedHold, true, where);
+      if (runMode === 'per-settings') {
+        assert.equal(h.run(key).status, 'awaiting_approval', where);
+        assert.equal(h.run(key).forcedHold, true, where);
+      } else {
+        assert.notEqual(h.run(key).status, 'awaiting_approval', where);
+        assert.equal(h.run(key).approvedBy, 'auto', where);
+      }
     } finally { await h.cleanup(); }
   }
 });

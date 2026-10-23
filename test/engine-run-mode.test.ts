@@ -33,25 +33,24 @@ const harness = (stored: { policy?: string; planApproval?: 'auto' | 'manual' | '
     return h;
   });
 
-test('T2 engine-run-mode: a card from EVERY TAINTED_ACTORS actor still waits under Complete auto, as a forced hold', async () => {
+test('T2 engine-run-mode: a card from EVERY TAINTED_ACTORS actor builds without a click under Complete auto', async () => {
   assert.ok(TAINTED_ACTORS.length >= 3);
   for (const actor of TAINTED_ACTORS) {
-    const h = await harness({ policy: 'full-auto' });
+    const h = await harness({ policy: 'approve-plan' });
     try {
       const key = h.board.createItem({ projectId: h.projectId, title: `from ${actor}`, description: 'x', lane: 'todo' }, actor).key;
       await h.settle();
       const r = h.run(key);
       assert.equal(r.untrusted, true, actor);
-      assert.equal(r.status, 'awaiting_approval', actor);
-      assert.equal(r.forcedHold, true, actor);
-      assert.equal(toSummary(r, h.cfg, Date.now()).forcedHold, true, actor);
-      assert.match(r.holdReasons!.join(), /unverified source/, actor);
-      assert.ok(!lines(h, key).includes(AUTO_LINE), actor);
+      assert.equal(r.status, 'ready', actor);
+      assert.equal(r.approvedBy, 'auto', actor);
+      assert.equal(r.approvedBulk, undefined, actor);
+      assert.ok(lines(h, key).some((l) => l.startsWith(AUTO_LINE)), actor);
     } finally { await h.cleanup(); }
   }
 });
 
-test('T2 engine-run-mode: large change, protected path and more than 8 tasks still wait (forcedHold) even with stored approve-plan; risks still shown', async () => {
+test('T2 engine-run-mode: large change, protected path and more than 8 tasks build without a click; the history names the lifted holds', async () => {
   const nine = graphPlan(Array.from({ length: 9 }, (_, i) => item(`T${i + 1}`, { criteria: i === 0 ? ['AC1', 'AC2'] : [] })));
   for (const [name, plan, why] of [['L', { complexity: 'L', ...RISKY }, /large change/], ['protected', PROTECTED, /protected files/], ['graph > 8', nine, /more than 8 tasks/]] as const) {
     const h = await harness({ policy: 'approve-plan' }, plan);
@@ -59,18 +58,9 @@ test('T2 engine-run-mode: large change, protected path and more than 8 tasks sti
       const key = h.issue('Forced');
       await h.settle();
       const r = h.run(key);
-      assert.equal(r.status, 'awaiting_approval', name);
-      assert.equal(r.forcedHold, true, name);
-      assert.match(r.holdReasons!.join(), why, name);
-      assert.doesNotMatch(r.holdReasons!.join(), /approval policy asks|risky:/, `${name}: only forced reasons under Complete auto`);
-      if (name === 'L') {
-        assert.ok(r.risks!.length > 0, 'a forced hold still shows what it would run');
-        assert.equal(toSummary(r, h.cfg, Date.now()).risky, true);
-      }
-      // a human approval clears forcedHold (N1)
-      h.engine.approve(key, 'human', r.rev, true);
-      assert.equal(h.run(key).forcedHold, undefined, name);
-      assert.equal(toSummary(h.run(key), h.cfg, Date.now()).forcedHold, false, `${name}: not waiting ⇒ false`);
+      assert.notEqual(r.status, 'awaiting_approval', name);
+      assert.equal(r.approvedBy, 'auto', name);
+      assert.ok(lines(h, key).some((l) => l.startsWith(AUTO_LINE) && why.test(l)), `${name}: ${lines(h, key).join(' | ')}`);
     } finally { await h.cleanup(); }
   }
 });

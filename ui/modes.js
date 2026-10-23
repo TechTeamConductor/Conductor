@@ -256,7 +256,7 @@
         { t: 'Approve', d: approve },
         { t: 'Build', d: who('implementation', 'Cursor') + ' writes the code in a worktree' },
         { t: 'Verify', d: 'Gates and ' + who('verification', 'Claude') + ' check every criterion' },
-        { t: 'Review', d: 'You merge. Conductor never pushes' },
+        { t: 'Push', d: 'You push the current branch as yourself. Conductor does not switch or merge branches' },
       ],
       howTail: planApproval === 'auto' ? '' : ' or a plan needs approval',
     };
@@ -342,7 +342,7 @@
   };
   /** Must match `COMPLETE_AUTO_CONFIRM` in `src/server/api.ts` (M8-5 B2). */
   const COMPLETE_AUTO_CONFIRM =
-    'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
+    'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. Nothing is pushed or merged, and the checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Commits stay on the local worktree. Send "confirm": true.';
   const SKIP_REASON_LABEL = Object.freeze({
     forced: 'Held for a safety reason',
     risky: 'Needs a per-card risk confirmation',

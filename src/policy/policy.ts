@@ -1,5 +1,6 @@
 // Approval policy (M6): who has to click. ONE decision function; the envelope and the isolation gates never depend on it.
 import type { Config, Plan } from '../types.ts';
+import { planFixtureRewrite } from '../git/fixture-hold.ts';
 import { riskHits, type RiskHit } from './rules.ts';
 
 export type Policy = 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
@@ -30,6 +31,18 @@ export function effectiveFirstPlanHold(cfg: Config, approvedCount: number): bool
   return !isCompleteAuto(cfg) && cfg.pipeline.planApproval === 'first' && approvedCount === 0;
 }
 
+/** Complete auto lifts every forced hold. Stages passes this through; it never names the mode itself. */
+export const effectiveLiftsHolds = (cfg: Config): boolean => isCompleteAuto(cfg);
+
+/**
+ * Complete auto, once: credential-shaped text that is only in tests or fixtures. Callers never name the mode.
+ * A secret file name, a copied .env value, or the same shape in any other path returns null.
+ */
+export function effectiveFixtureRewrite(cfg: Config, used: number | undefined, reason: string) {
+  if (!isCompleteAuto(cfg)) return null;
+  return planFixtureRewrite(used, reason);
+}
+
 export interface ApprovalInput {
   plan: Plan;
   policy: Policy;
@@ -37,6 +50,8 @@ export interface ApprovalInput {
   forced: { protectedPaths: boolean; untrusted: boolean; bigGraph: boolean };
   /** The per-repo "first plan waits" rule (legacy `planApproval: 'first'`). */
   firstPlanHold: boolean;
+  /** Complete auto: every forced hold (large change, protected files, unverified source, big graph) is lifted; the post-build guards still run (see Stages). */
+  completeAuto?: boolean;
 }
 export interface ApprovalDecision {
   auto: boolean;
@@ -51,10 +66,11 @@ export interface ApprovalDecision {
 export function decideApproval(i: ApprovalInput): ApprovalDecision {
   const reasons: string[] = [];
   let forcedHold = false;
-  if (i.plan.complexity === 'L') { reasons.push('large change'); forcedHold = true; }
-  if (i.forced.protectedPaths) { reasons.push('the plan touches protected files such as CI or agent config'); forcedHold = true; }
-  if (i.forced.untrusted) { reasons.push('the task text came from an unverified source'); forcedHold = true; }
-  if (i.forced.bigGraph) { reasons.push('more than 8 tasks'); forcedHold = true; }
+  const ca = i.completeAuto === true;
+  if (!ca && i.plan.complexity === 'L') { reasons.push('large change'); forcedHold = true; }
+  if (!ca && i.forced.protectedPaths) { reasons.push('the plan touches protected files such as CI or agent config'); forcedHold = true; }
+  if (!ca && i.forced.untrusted) { reasons.push('the task text came from an unverified source'); forcedHold = true; }
+  if (!ca && i.forced.bigGraph) { reasons.push('more than 8 tasks'); forcedHold = true; }
   const risks = riskHits(i.plan); // always computed: a plan held for another reason still shows what it would run
   if (i.policy === 'approve-plan' || i.policy === 'manual-stages') reasons.push('your approval policy asks for every plan');
   if (i.policy === 'approve-risky' && risks.length) reasons.push(`risky: ${risks.map((r) => r.rule).join(', ')}`);
@@ -70,8 +86,8 @@ export function decideApproval(i: ApprovalInput): ApprovalDecision {
  */
 export function decidedByRunMode(cfg: Config, input: Omit<ApprovalInput, 'policy' | 'firstPlanHold'>, projectKey: string | null, approvedCount: number): boolean {
   if (!isCompleteAuto(cfg)) return false;
-  const effective = decideApproval({ ...input, policy: effectivePolicy(cfg, projectKey), firstPlanHold: effectiveFirstPlanHold(cfg, approvedCount) });
+  const effective = decideApproval({ ...input, completeAuto: true, policy: effectivePolicy(cfg, projectKey), firstPlanHold: effectiveFirstPlanHold(cfg, approvedCount) });
   if (!effective.auto) return false;
-  const stored = decideApproval({ ...input, policy: storedPolicy(cfg, projectKey), firstPlanHold: cfg.pipeline.planApproval === 'first' && approvedCount === 0 });
+  const stored = decideApproval({ ...input, completeAuto: false, policy: storedPolicy(cfg, projectKey), firstPlanHold: cfg.pipeline.planApproval === 'first' && approvedCount === 0 });
   return !stored.auto;
 }

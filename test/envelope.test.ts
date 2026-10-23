@@ -6,9 +6,10 @@
 // GIT_CONFIG_GLOBAL, a provider without prepare) are added in 1b.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, makeHarness, TestClock, type Harness } from './helpers/harness.ts';
+import { postBuildChecks } from '../src/pipeline/envelope.ts';
 
 const fail = (h: Harness, key: string) => h.run(key).needsHuman?.reason ?? '';
 const cursorCalls = (h: Harness) => h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build');
@@ -70,6 +71,31 @@ test('E4: a protected file the plan did not list (uncommitted) is held for a hum
     assert.equal(h.run(key).status, 'needs_human');
     assert.match(fail(h, key), /protected files/);
     assert.match(fail(h, key), /\.github\/workflows\/ci\.yml/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('E4b: protected files already on the branch at the start of the attempt are not blamed on the builder', async () => {
+  const h = await makeHarness({ gates: false });
+  try {
+    const dir = h.repoDir;
+    const base = git(dir, 'rev-parse', 'HEAD');
+    mkdirSync(join(dir, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(dir, '.github', 'workflows', 'old.yml'), 'name: old\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'ci already on the branch');
+    const attempt = git(dir, 'rev-parse', 'HEAD');
+    writeFileSync(join(dir, 'feature.mjs'), 'export const x = 1;\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'the build');
+    assert.equal(await postBuildChecks(dir, base, [], [], attempt), null);
+    const blamed = await postBuildChecks(dir, base, [], []);
+    assert.match(blamed ?? '', /\.github\/workflows\/old\.yml/);
+    writeFileSync(join(dir, '.github', 'workflows', 'new.yml'), 'name: new\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'builder touched CI');
+    assert.match((await postBuildChecks(dir, base, [], [], attempt)) ?? '', /\.github\/workflows\/new\.yml/);
   } finally {
     await h.cleanup();
   }

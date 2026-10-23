@@ -12,11 +12,13 @@ export interface CardSpec {
   part: string; // P1..P8
   index: number; // 1-based position in the brief
   title: string;
-  /** Selected parts this card depends on (transitively through unticked ones). */
+  /** Selected parts this card depends on (transitively through unticked ones). Same parallelGroup peers are omitted. */
   deps: string[];
   /** Unticked parts this card would have depended on. */
   notSent: string[];
   idemKey: string;
+  /** Set when this part shares a group with peers that must not wait on each other. */
+  parallelGroup?: string;
 }
 
 export const designIdemKey = (briefId: string, part: string): string => `design:${briefId}:${part}`;
@@ -33,6 +35,8 @@ export function planCards(brief: WorkBrief, briefId: string, selection: readonly
       seen.add(d);
       const dp = byId.get(d);
       if (!dp) continue;
+      // Same group: the model marked them runnable together. Do not chain them, and do not inherit that peer's deps.
+      if (chosen.has(d) && p.parallelGroup && dp.parallelGroup === p.parallelGroup) continue;
       if (chosen.has(d)) out.add(d);
       else {
         notSent.add(d);
@@ -47,7 +51,7 @@ export function planCards(brief: WorkBrief, briefId: string, selection: readonly
       const notSent = new Set<string>();
       const deps = resolve(p, new Set(), notSent);
       const order = (a: string, b: string) => Number(a.slice(1)) - Number(b.slice(1));
-      return { part: p.id, index: Number(p.id.slice(1)), title: p.title || `Part ${p.id.slice(1)}`, deps: [...deps].sort(order), notSent: [...notSent].sort(order), idemKey: designIdemKey(briefId, p.id) };
+      return { part: p.id, index: Number(p.id.slice(1)), title: p.title || `Part ${p.id.slice(1)}`, deps: [...deps].sort(order), notSent: [...notSent].sort(order), idemKey: designIdemKey(briefId, p.id), ...(p.parallelGroup ? { parallelGroup: p.parallelGroup } : {}) };
     });
 }
 
@@ -60,7 +64,7 @@ const quote = (text: string): string[] => String(text).split('\n').map((l) => `>
  * never removes the user's line, the "Untrusted" header or the closing line.
  */
 export function cardDescription(args: { line: string; briefId: string; brief: WorkBrief; spec: CardSpec; depKeys: string[]; baseBranch: string }): string {
-  const { line, briefId, brief, spec, depKeys, baseBranch } = args;
+  const { line, briefId, brief, spec, depKeys } = args;
   const part = brief.parts.find((p) => p.id === spec.part)!;
   const head = [
     line,
@@ -77,7 +81,8 @@ export function cardDescription(args: { line: string; briefId: string; brief: Wo
   if (part.summary) model(part.summary);
   code(`Size: ${part.size} · Files it expects to touch:${part.files.length ? '' : ' none named'}`);
   for (const f of part.files) model(f);
-  if (depKeys.length) code(`Starts after ${depKeys.join(', ')}: merge ${depKeys.length > 1 ? 'them' : 'it'} into your local \`${baseBranch}\`, then move ${depKeys.length > 1 ? 'them' : 'it'} to Done. Conductor does not merge or check this.`);
+  if (depKeys.length) code(`Starts after ${depKeys.join(', ')}. Their commits are already on this repository's current branch. Build on that code. Conductor does not create a branch and does not push.`);
+  else if (spec.parallelGroup) code(`Runs alongside the other parts in group ${spec.parallelGroup} on this repository's current branch. Conductor does not create a branch and does not push.`);
   for (const ns of spec.notSent) code(`Part ${ns.slice(1)} was not sent.`);
   if (brief.approach) {
     code('Shared brief — approach:');

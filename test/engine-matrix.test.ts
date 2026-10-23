@@ -119,7 +119,10 @@ for (const [cmd, cells] of Object.entries(OTHER) as [Cmd, Partial<Record<Status,
         if (cmd === 'cleanup') {
           assert.equal(h.run(key).status, want, 'cleanup does not change the status');
           assert.equal(h.run(key).worktree, '');
-          if (wt) assert.equal(existsSync(wt), false, 'the worktree was removed');
+          if (wt) {
+            const leftOnBranch = h.run(key).history.some((e) => e.text.startsWith('Left the commits'));
+            assert.equal(existsSync(wt), leftOnBranch, leftOnBranch ? 'the repository checkout stays' : 'the worktree was removed');
+          }
         } else assert.equal(h.run(key).status, want);
         if (cmd === 'abort' && status !== 'finished' && status !== 'aborted') {
           await h.engine.abort(key); // a second abort is a no-op, not a second comment

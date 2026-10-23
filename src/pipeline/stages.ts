@@ -19,11 +19,11 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
-import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectivePolicy } from '../policy/policy.ts';
+import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectiveFixtureRewrite, effectivePolicy, effectiveLiftsHolds } from '../policy/policy.ts';
 import { projectKeyOf } from '../context/service.ts';
 import { buildGraph, graphBudgets, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
 import { GraphBuilder } from './graph-build.ts';
-import { postBuildChecks, runBuild } from './envelope.ts';
+import { exemptPaths, postBuildChecks, runBuild } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
 import type { Role } from '../agents/roles.ts';
@@ -111,8 +111,8 @@ export class Stages {
       finishSession: (k, res) => this.finishSession(k, res),
       refundIfLimit: (k, res) => this.refundIfLimit(k, res),
       emitter: (k, st, loop, rev) => this.emitter(k, st, loop, rev),
-      runAllGates: (k, repo, defs) => this.runAllGates(k, repo, defs),
-      reinstallIfLockChanged: (k, st) => this.reinstallIfLockChanged(k, st),
+      runAllGates: (k, repo, defs, cwd) => this.runAllGates(k, repo, defs, cwd),
+      reinstallIfLockChanged: (k, st, cwd) => this.reinstallIfLockChanged(k, st, cwd),
       hasUncommitted: (wt) => this.hasUncommitted(wt),
       writePromptAudit: (k, name, text) => this.writePromptAudit(k, name, text),
       runsLimit: (r) => this.runsLimit(r),
@@ -124,6 +124,7 @@ export class Stages {
       looksOffline: (res) => this.looksOffline(res),
       refundRun: (k) => this.patch(k, (r) => void (r.agentRuns = Math.max(0, r.agentRuns - 1))),
       analysisSlot: (k) => ctx.analysisSlot(ctx.signal(k)),
+      buildSlot: (k) => ctx.buildSlot(ctx.signal(k)),
       projectBlocks: (k, consumer, files) => this.projectBlocks(k, consumer, files),
       protectedPaths: PROTECTED,
     });
@@ -226,6 +227,25 @@ export class Stages {
     this.c.emit(key, { agent: 'conductor', stage: run.stage ?? 'engine', kind: 'error', text: `Needs human: ${reason}` });
     await this.c.effects.flush(key);
     this.c.notify(`${key} needs you`, truncate(reason, 160));
+  }
+
+  /**
+   * Complete auto, once per run: a credential shape that appears only in tests or fixtures is rewritten in place instead of
+   * stopping. The scan still ran; a second failure, a secret file name, or the same shape outside tests still needs a person.
+   * Returns true when the run stays on `build`.
+   */
+  private scheduleFixtureRewrite(key: string, reason: string, commitSha?: string): boolean {
+    const rw = effectiveFixtureRewrite(this.c.cfg(), this.run(key).secretFixtureRewrites, reason);
+    if (!rw) return false;
+    this.patch(key, (r) => {
+      r.secretFixtureRewrites = rw.nextUsed;
+      r.fixtureRewriteNote = rw.note;
+      if (commitSha) r.commitSha = commitSha;
+      r.next = 'build';
+      r.history.push({ ts: this.c.clock.now(), text: `Complete auto: rewriting credential-shaped text in ${rw.paths.join(', ')} (local worktree only; nothing is pushed)` });
+    });
+    this.note(key, 'build', `Complete auto is rewriting credential-shaped text in ${rw.paths.join(', ')}. The change stays on this machine; nothing is pushed.`);
+    return true;
   }
 
   /** A candidate hit a usage limit but the chain moved on: remember the pause (on THAT account) so later stages skip it until it resets. */
@@ -573,7 +593,7 @@ export class Stages {
     const repo = this.repo(run);
     const cfg = this.c.cfg();
     if (run.worktree && existsSync(run.worktree)) {
-      // B-2: only ever work in the checkout v2 itself created for this card
+      // Only the repository checkout, or a checkout this run already opened for this card.
       try {
         await W.assertOwnedWorktree(repo, run.key, run.worktree, cfg.worktreeRoot);
       } catch (e) {
@@ -582,8 +602,8 @@ export class Stages {
       }
     }
     if (!run.worktree || !existsSync(run.worktree)) {
-      this.note(key, 'plan', `Creating isolated worktree for ${repo.name}…`);
-      const wt = await W.createWorktree({ repo, key: run.key, worktreeRoot: cfg.worktreeRoot });
+      this.note(key, 'plan', `Using the current branch of ${repo.name}…`);
+      const wt = await W.useCurrentCheckout({ repo, key: run.key });
       run = this.patch(key, (r) => {
         r.worktree = wt.path;
         r.branch = wt.branch;
@@ -617,21 +637,23 @@ export class Stages {
   }
 
   /** Dependencies are re-installed before gates run when the lockfile changed since the last install (a failure is a visible note, not a stop). */
-  private async reinstallIfLockChanged(key: string, stage: StageName): Promise<void> {
+  private async reinstallIfLockChanged(key: string, stage: StageName, cwd?: string): Promise<void> {
     const run = this.run(key);
     const repo = this.repo(run);
     const cfg = this.c.cfg();
-    const lock = await W.lockfileHash(run.worktree);
+    const dir = cwd ?? run.worktree;
+    const lock = await W.lockfileHash(dir);
     if (run.lockfileHash && run.lockfileHash !== lock) {
-      const inst = await W.installDeps(run.worktree, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
+      const inst = await W.installDeps(dir, repo, { env: toolEnv(repo.envPassthrough), timeoutMs: cfg.pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key) });
       if (inst.ok) this.patch(key, (r) => void (r.lockfileHash = lock));
       else this.note(key, stage, `Re-installing dependencies failed (${truncate(inst.output.slice(-200), 200)}) — gates may fail for that reason.`);
     }
   }
 
-  private async runAllGates(key: string, repo: RepoConfig, defs: GateDef[]): Promise<GateRun> {
+  private async runAllGates(key: string, repo: RepoConfig, defs: GateDef[], cwd?: string): Promise<GateRun> {
     const run = this.run(key);
-    const o = { cwd: run.worktree, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key), secrets: this.c.secretsFor(run) };
+    const dir = cwd ?? run.worktree;
+    const o = { cwd: dir, env: toolEnv(repo.envPassthrough), timeoutMs: this.c.cfg().pipeline.timeoutsMin.gate * 60_000, signal: this.c.signal(key), secrets: this.c.secretsFor(run) };
     const results: GateResult[] = [];
     for (const def of defs) {
       let r = await G.runGate(def, o);
@@ -641,7 +663,7 @@ export class Stages {
     }
     let sha = '';
     try {
-      sha = await gitOk(run.worktree, ['rev-parse', 'HEAD']);
+      sha = await gitOk(dir, ['rev-parse', 'HEAD']);
     } catch {
       /* ignore */
     }
@@ -804,17 +826,22 @@ export class Stages {
       policy: effectivePolicy(cfg, project),
       forced,
       firstPlanHold: effectiveFirstPlanHold(cfg, approved),
+      completeAuto: effectiveLiftsHolds(cfg),
     });
     if (decision.auto) {
       const byMode = decidedByRunMode(cfg, { plan, forced }, project, approved);
       this.patch(key, (r) => {
         r.planApproved = true;
         r.approvedBy = 'auto';
+        r.approvedBulk = undefined;
         r.next = 'build';
         r.holdReasons = undefined;
         r.risks = undefined;
         r.forcedHold = undefined;
-        if (byMode) r.history.push({ ts: this.c.clock.now(), text: 'Plan approved automatically (Complete auto)' });
+        if (byMode) {
+          const lifted = [plan.complexity === 'L' ? 'large change' : '', touchesProtected ? 'protected files' : '', bigGraph ? 'more than 8 tasks' : ''].filter(Boolean);
+          r.history.push({ ts: this.c.clock.now(), text: `Plan approved automatically (Complete auto)${lifted.length ? `; holds lifted: ${lifted.join(', ')}` : ''}` });
+        }
         this.attachGraph(r, plan);
       });
       await this.c.effects.flush(key);
@@ -869,6 +896,11 @@ export class Stages {
     if (head && head !== known && head !== run.baseSha && !(await this.hasUncommitted(run.worktree))) {
       const scope = await this.fastPathScopeProblem(run, plan, head);
       if (scope) return this.toNeedsHuman(key, scope, 'build');
+      const secretProblem = await postBuildChecks(run.worktree, run.baseSha, exemptPaths(run, plan), this.c.secretsFor(run), known);
+      if (secretProblem) {
+        if (this.scheduleFixtureRewrite(key, secretProblem, head)) return;
+        return this.toNeedsHuman(key, secretProblem, 'build');
+      }
       this.note(key, 'build', 'Found a finished build from before a restart — moving on to verification.');
       this.patch(key, (r) => {
         r.commitSha = head;
@@ -876,7 +908,7 @@ export class Stages {
       });
       return;
     }
-    if ((await this.hasUncommitted(run.worktree)) && !run.commitNote) {
+    if ((await this.hasUncommitted(run.worktree)) && !run.commitNote && !run.fixtureRewriteNote) {
       // leftover partial work from an interrupted build: keep a recoverable copy, then start clean.
       // (A commit rejected by a repo hook leaves the previous build's files in place ON PURPOSE — fixed in place.)
       let refs: Awaited<ReturnType<typeof W.backupRefs>> | null = null;
@@ -891,7 +923,9 @@ export class Stages {
 
     const baseline = this.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
-    const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open');
+    const rewriteNote = run.fixtureRewriteNote;
+    if (rewriteNote) this.patch(key, (r) => void (r.fixtureRewriteNote = undefined));
+    const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open') || !!rewriteNote;
     const commonVars = {
       ...(await this.projectBlocks(key, 'builder', plan.filesToChange.map((f) => f.path))),
       preamble: preamble(isFix ? 'fix' : 'build'),
@@ -916,7 +950,7 @@ export class Stages {
         bugs: this.bugList(run),
         verifierSummary: this.c.store.readArtifact<Verdict | null>(key, `verdict-${prevLoop}.json`, null)?.summary ?? '',
         gateFailures,
-        commitNote: run.commitNote ? fence('commit-hook-output', run.commitNote, 4000) : '',
+        commitNote: [run.commitNote ? fence('commit-hook-output', run.commitNote, 4000) : '', rewriteNote ? fence('fixture-rewrite', rewriteNote, 2000) : ''].filter(Boolean).join('\n\n'),
       });
     }
     this.writePromptAudit(key, `build-${run.loop}`, prompt);
@@ -951,12 +985,20 @@ export class Stages {
     // M8-2: the role's model/effort for the tool that actually builds (B2: a choice made for another tool is not applied) — M8-3: against THIS account's list
     const sel = this.c.agents.selectionFor(role, builder.id, { account: cand.account });
     for (const n of sel.notes) this.note(key, 'build', redact(n, secrets));
+    const release = await this.c.buildSlot(this.c.signal(key));
+    if (!release) return;
+    const tip = (await gitOk(run.worktree, ['rev-parse', 'HEAD'])).trim();
+    const buildWt = W.detachedBuildPath(repo, run.key, 'build', cfg.worktreeRoot);
+    // A commit hook rejects the commit and leaves the files uncommitted. The next attempt continues in that same directory.
+    const reuse = !!run.commitNote && existsSync(buildWt);
+    try {
+    if (!reuse) await W.openDetachedBuild(repo, buildWt, tip);
     const out = await runBuild({
       provider: builder,
       sel,
       ...(cand.account !== DEFAULT_ACCOUNT ? { account } : {}),
       repoPath: repo.path,
-      worktree: run.worktree,
+      worktree: buildWt,
       baseSha: run.baseSha,
       subject: `${run.key}: ${truncate(run.title, 80)}${isFix ? ` (fix, loop ${run.loop})` : ''}`,
       rev: run.rev,
@@ -965,7 +1007,7 @@ export class Stages {
       onEvent: this.emitter(key, 'build', run.loop, run.rev),
       signal: this.c.signal(key),
       secrets,
-      planPaths: plan.filesToChange.map((f) => f.path),
+      planPaths: exemptPaths(run, plan),
       onPrepared: (prep) => {
         this.patch(key, (r) => {
           r.guardSha = prep.guardSha ?? undefined;
@@ -981,8 +1023,10 @@ export class Stages {
       },
     });
     switch (out.kind) {
-      case 'held':
+      case 'held': {
+        if (this.scheduleFixtureRewrite(key, out.reason)) return;
         return this.toNeedsHuman(key, out.reason, 'build');
+      }
       case 'failed':
         return this.handleBuildFailure(key, out.res, out.provider, cand.account, role);
       case 'hook':
@@ -993,18 +1037,24 @@ export class Stages {
         return this.nextLoopOrHuman(key, 'The repository commit hook rejected the build');
       case 'nothing': {
         // the builder may have committed by itself: accept real work instead of calling it "no changes"
-        const headNow = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
-        if (headNow && headNow !== known && headNow !== run.baseSha) {
-          const selfProblem = await postBuildChecks(run.worktree, run.baseSha, plan.filesToChange.map((f) => f.path), secrets);
-          if (selfProblem) return this.toNeedsHuman(key, selfProblem, 'build');
+        const headNow = await gitOk(buildWt, ['rev-parse', 'HEAD']).catch(() => '');
+        if (headNow && headNow !== tip) {
+          const selfProblem = await postBuildChecks(buildWt, run.baseSha, exemptPaths(run, plan), secrets, tip);
+          if (selfProblem) {
+            if (this.scheduleFixtureRewrite(key, selfProblem)) return;
+            return this.toNeedsHuman(key, selfProblem, 'build');
+          }
           const selfScope = await this.fastPathScopeProblem(run, plan, headNow);
           if (selfScope) return this.toNeedsHuman(key, selfScope, 'build');
+          const landed = await W.mergeOntoCurrent(repo.path, headNow);
+          if (!landed.ok) return this.toNeedsHuman(key, landed.detail, 'build');
           this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
           this.patch(key, (r) => {
-            r.commitSha = headNow;
+            r.commitSha = landed.sha;
             r.commitNote = undefined;
             r.next = 'verify';
           });
+          this.refreshContextSoon(key);
           return;
         }
         if (run.loop === 1 && !isFix) {
@@ -1023,16 +1073,32 @@ export class Stages {
           // no plan review happened: the build may touch ONLY the files the plan listed, for every path
           const planSet = new Set(plan.filesToChange.map((f) => f.path.replace(/^\.\//, '')));
           const extra = out.files.filter((f) => !planSet.has(f));
-          if (extra.length) return this.toNeedsHuman(key, `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. Review them (they are committed on the branch), then continue.`, 'build');
+          if (extra.length) return this.toNeedsHuman(key, `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. They were not merged onto the current branch.`, 'build');
         }
+        const landed = await W.mergeOntoCurrent(repo.path, out.sha);
+        if (!landed.ok) return this.toNeedsHuman(key, landed.detail, 'build');
         this.patch(key, (r) => {
-          r.commitSha = out.sha;
+          r.commitSha = landed.sha;
           r.commitNote = undefined;
           r.next = 'verify';
-          r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${out.files.length} file(s) committed (${out.sha.slice(0, 7)})` });
+          r.history.push({ ts: this.c.clock.now(), text: `Build ${run.loop}: ${out.files.length} file(s) committed (${landed.sha.slice(0, 7)})` });
         });
+        this.refreshContextSoon(key);
         return;
     }
+    } finally {
+      const after = this.run(key);
+      const keep = !!after.commitNote && after.next === 'build' && after.status !== 'needs_human';
+      if (!keep) await W.removeDetachedBuild(repo.path, buildWt).catch(() => undefined);
+      release();
+    }
+  }
+
+  /** The plan-time refresh can finish before the build commit lands. Scan again so the stored context matches the branch. */
+  private refreshContextSoon(key: string): void {
+    const run = this.run(key);
+    const repo = this.repo(run);
+    void this.c.context.refresh(run, repo).then(() => this.c.context.refresh(run, repo)).catch(() => undefined);
   }
 
   private async hasUncommitted(wt: string): Promise<boolean> {
@@ -1381,7 +1447,7 @@ export class Stages {
   }
 
   // used by the engine when a human approves
-  markApproved(key: string, by: 'human' | 'auto'): void {
+  markApproved(key: string, by: 'human' | 'auto', bulk = false): void {
     const run = this.run(key);
     const st = this.c.persistent.load();
     st.repos[run.repo] = { approvedPlans: (st.repos[run.repo]?.approvedPlans ?? 0) + 1 };
@@ -1390,6 +1456,7 @@ export class Stages {
     this.patch(key, (r) => {
       r.planApproved = true;
       r.approvedBy = by;
+      r.approvedBulk = bulk || undefined;
       r.status = 'queued';
       r.next = 'build';
       r.forcedHold = undefined; // M8-4 (N1): holdReasons stay as today; the view hides them outside awaiting_approval

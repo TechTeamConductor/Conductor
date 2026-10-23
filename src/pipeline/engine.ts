@@ -9,12 +9,12 @@ import type { PersistentState } from '../config.ts';
 import { loadState, saveState } from '../config.ts';
 import type { Agents } from '../agents/provider.ts';
 import type { EmitEvent } from '../agents/claude.ts';
-import { errMsg, sha1, systemClock, truncate, slug, type Clock } from '../util.ts';
+import { errMsg, sha1, systemClock, truncate, type Clock } from '../util.ts';
 import { loadEnvSecrets, redact } from '../redact.ts';
 import { logger } from '../log.ts';
 import { notify as defaultNotify } from '../notify.ts';
 import * as W from '../git/worktree.ts';
-import { BRANCH_PREFIX } from '../git/worktree.ts';
+import { pushTicket } from '../git/push-ticket.ts';
 import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
 import { TAINTED_ACTORS } from '../board/types.ts';
@@ -111,6 +111,8 @@ export class Engine {
   private unsubBoard: (() => void) | null = null;
   /** The ONE cap on concurrent read-only analysis calls across all runs (task graphs). */
   private analysisSem = new Semaphore(() => this.d.getConfig().pipeline.readOnlyParallel);
+  /** The ONE cap on concurrent builds (graph items and whole-card builds), `pipeline.maxParallel`. */
+  private buildSem = new Semaphore(() => this.d.getConfig().pipeline.maxParallel);
   private context!: ContextLike;
   readonly probe: OfflineProbe;
   private persistentDeps: { load(): PersistentState; save(s: PersistentState): void };
@@ -152,6 +154,7 @@ export class Engine {
       noteCandidate: (key, ref) => this.noteCandidate(key, ref),
       tickSoon: () => this.tickSoon(),
       analysisSlot: (signal) => this.analysisSem.acquire(signal),
+      buildSlot: (signal) => this.buildSem.acquire(signal),
       context: this.context,
       networkState: () => this.probe.check(),
       recordQuota: (ref, q) => this.recordQuota(ref, q),
@@ -578,7 +581,7 @@ export class Engine {
       description: item.description ?? '',
       descHash: sha1(item.description ?? ''),
       repo: repo?.name ?? '',
-      branch: `${BRANCH_PREFIX}${slug(item.key)}`,
+      branch: '',
       worktree: '',
       baseSha: '',
       loopBudget: cfg.pipeline.maxLoops,
@@ -665,7 +668,8 @@ export class Engine {
         if (!repo0) throw new Error(`repository "${run0.repo}" is not registered, so ownership of ${run0.worktree} cannot be verified`);
         await W.assertOwnedWorktree(repo0, run0.key, run0.worktree, cfg.worktreeRoot);
         await W.backupRefs(run0.worktree, run0.key, run0.rev); // recoverable copy first, always
-        if (!keepCommits) await W.resetToBase(run0.worktree, run0.baseSha);
+        // Never hard-reset the repository's own checkout. A private conductor worktree can still be reset.
+        if (!keepCommits && !(await W.isRepoCheckout(repo0.path, run0.worktree))) await W.resetToBase(run0.worktree, run0.baseSha);
       } catch (e) {
         log.warn(`${key}: backup/reset skipped: ${errMsg(e)}`);
       }
@@ -989,12 +993,12 @@ export class Engine {
   }
 
   /** `rev` (when given) must be the current plan revision: an approval for a replaced plan is refused. */
-  approve(key: string, by: 'human' | 'auto' = 'human', rev?: number, confirmRisks = false): void {
+  approve(key: string, by: 'human' | 'auto' = 'human', rev?: number, confirmRisks = false, bulk = false): void {
     const run = this.d.store.get(key);
     if (!run || run.status !== 'awaiting_approval') throw new EngineError('bad_state', 'This run is not waiting for approval.');
     if (rev !== undefined && rev !== run.rev) throw new EngineError('stale', 'This plan was replaced by a newer revision — review it and approve again.');
     if (by === 'human' && run.risks?.length && !confirmRisks) throw new EngineError('confirm_required', `This plan includes risky steps (${run.risks.map((x) => x.rule).join(', ')}). Confirm that you understand them to approve.`);
-    this.stages.markApproved(key, by);
+    this.stages.markApproved(key, by, bulk);
     this.tickSoon();
   }
 
@@ -1057,6 +1061,37 @@ export class Engine {
     this.changed();
   }
 
+  /**
+   * Push one done ticket. Stays on the branch already checked out: no checkout, no new branch, no merge.
+   * The commit contains only the files this ticket's commits changed, and its author is the person's git identity.
+   */
+  async push(key: string): Promise<void> {
+    const run = this.d.store.get(key);
+    if (!run) throw new EngineError('missing', 'Unknown run.');
+    if (run.status !== 'ready' && run.status !== 'finished') throw new EngineError('bad_state', 'Only a done card can be pushed.');
+    if (run.pushedAt && run.pushedSha) return;
+    const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
+    if (!repo) throw new EngineError('bad_repo', 'This card’s repository is not registered.');
+    const shas = new Set<string>();
+    if (run.commitSha) shas.add(run.commitSha);
+    for (const item of run.graph?.items ?? []) if (item.commitSha) shas.add(item.commitSha);
+    const pushed = await pushTicket({ repoPath: repo.path, key: run.key, title: run.title, shas: [...shas] });
+    if (!pushed.ok) throw new EngineError('push_failed', pushed.detail);
+    const { result } = pushed;
+    this.d.store.update(key, (r) => {
+      const map = result.replacements;
+      if (r.commitSha && map[r.commitSha]) r.commitSha = map[r.commitSha];
+      for (const item of r.graph?.items ?? []) if (item.commitSha && map[item.commitSha]) item.commitSha = map[item.commitSha];
+      r.pushedAt = this.clock.now();
+      r.pushedSha = result.sha;
+      r.history.push({
+        ts: this.clock.now(),
+        text: `Pushed ${result.branch} as you. The commit has only this ticket’s files (${result.files.length}). The branch was not changed.`,
+      });
+    });
+    this.changed();
+  }
+
   async cleanup(key: string): Promise<void> {
     const run = this.d.store.get(key);
     if (!run) throw new EngineError('missing', 'Unknown run.');
@@ -1066,6 +1101,13 @@ export class Engine {
       await W.assertOwnedWorktree(repo, run.key, run.worktree, this.d.getConfig().worktreeRoot).catch((e) => {
         throw new EngineError('foreign_worktree', errMsg(e));
       });
+      if (await W.isRepoCheckout(repo.path, run.worktree)) {
+        this.d.store.update(key, (r) => {
+          r.worktree = '';
+          r.history.push({ ts: this.clock.now(), text: 'Left the commits on the repository’s current branch' });
+        });
+        return;
+      }
       const { branchKept } = await W.removeWorktree(repo.path, run.worktree, run.branch, { deleteBranch: true }); // git refuses to delete an unmerged branch: the work is kept
       this.d.store.update(key, (r) => {
         r.worktree = '';

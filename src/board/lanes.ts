@@ -20,7 +20,6 @@ export function laneForRun(run: Pick<Run, 'status'>): Lane {
     case 'needs_human':
       return 'needs_you';
     case 'ready':
-      return 'review';
     case 'finished':
       return 'done';
     case 'aborted':

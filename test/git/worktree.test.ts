@@ -12,6 +12,7 @@ import {
   checkCursorGuard,
   commitAll,
   createWorktree,
+  useCurrentCheckout,
   detectSetupCommand,
   diffAgainst,
   diffScopeViolations,
@@ -356,6 +357,27 @@ describe('createWorktree', () => {
       await assert.rejects(mkWt(r, k), /invalid run key/, k);
     }
     await assert.rejects(createWorktree({ repo: cfg(r, { name: '../x' }), key: 'ENG-1' }), /invalid repo name/);
+  });
+
+  it('useCurrentCheckout stays on the current branch and the next card sees the commit', async () => {
+    const r = makeRepo();
+    const base = r.head();
+    const a = await useCurrentCheckout({ repo: cfg(r), key: 'ENG-1' });
+    assert.equal(a.path, r.dir);
+    assert.equal(a.branch, 'main');
+    assert.equal(a.baseSha, base);
+    assert.equal(a.created, false);
+    const committed = await commitAllIn(a.path, 'first card', { 'a.txt': 'a\n' });
+    assert.equal(committed, true);
+    const tip = sgt(a.path, ['rev-parse', 'HEAD']);
+    assert.notEqual(tip, base);
+    const b = await useCurrentCheckout({ repo: cfg(r), key: 'ENG-2' });
+    assert.equal(b.path, a.path);
+    assert.equal(b.branch, 'main');
+    assert.equal(b.baseSha, tip, 'the next card starts where the previous commit landed');
+    assert.equal(sgt(r.dir, ['symbolic-ref', '--short', 'HEAD']), 'main');
+    assert.equal(sgt(r.dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']), 'main');
+    assert.equal(existsSync(join(r.dir, 'a.txt')), true);
   });
 
   it('refuses to adopt a non-empty directory that is not a registered worktree', async () => {

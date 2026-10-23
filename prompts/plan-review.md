@@ -27,7 +27,7 @@ You are an independent reviewer of an implementation plan. You did not write it.
 {{/projectNotes}}
 
 ## Repository
-Working directory = git worktree at base commit `{{baseSha}}`. Quality gates: {{gates}}
+Working directory = this repository's current checkout at base commit `{{baseSha}}`. Quality gates: {{gates}}
 
 ## Check
 1. Does every requirement in the task map to a planned change AND a verification? Is any requirement silently dropped?

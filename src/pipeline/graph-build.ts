@@ -3,12 +3,14 @@
 // until every item is done. The single-task path in stages.ts is never entered for a run with a graph that is still being built.
 //
 // Safety properties (plan M3 §2b, Security M3-S1..S5):
-//  - ONE builder at a time; every builder start goes through `runBuild` (eligibility, guard, env allow-list, git-meta restore, scans).
+//  - File-disjoint builders run together up to `pipeline.maxParallel`. Each one goes through `runBuild` in its own detached worktree
+//    (eligibility, guard, env allow-list, git-meta restore, scans), then its commit is merged onto the current branch and the directory is removed.
 //  - An item is `running` only together with its `startHead` and a per-attempt nonce (one write). After a crash the item is ADOPTED only
 //    if exactly one commit sits on `startHead`, the tree is clean and the commit message carries this item's id AND nonce — and even then
 //    scope/secret checks and the item's gates run before it becomes `done`. Anything else is backed up and reset.
 //  - A failed item leaves no commits on the branch (they are backed up under refs/conductor/…): independent items continue on good code.
 //  - Agent-derived text reaches a builder only fenced and capped (the approved plan, item notes); nothing persisted across runs.
+import { existsSync } from 'node:fs';
 import type { EmitEvent } from '../agents/claude.ts';
 import type { Role } from '../agents/roles.ts';
 import { route } from '../agents/routing.ts';
@@ -17,12 +19,13 @@ import { providerLabel } from '../agents/providers/registry.ts';
 import type { AgentResult, GateComparison, GateDef, GateRun, ItemRun, LimitInfo, NextStep, Plan, RepoConfig, Run, StageName } from '../types.ts';
 import * as W from '../git/worktree.ts';
 import * as G from '../git/gates.ts';
-import { gitOk } from '../git/exec.ts';
+import { git, gitOk } from '../git/exec.ts';
 import { redact } from '../redact.ts';
 import { truncate } from '../util.ts';
 import type { PipelineCtx } from './context.ts';
-import { postBuildChecks, runBuild } from './envelope.ts';
-import { ANALYSIS_ROLES, ancestorsOf, itemMarker, newNonce, parseItemMarker, pickNext, propagateBlocked, readySet, sanitizeLine, stripInvisible } from './graph.ts';
+import { exemptPaths, postBuildChecks, runBuild } from './envelope.ts';
+import { effectiveFixtureRewrite } from '../policy/policy.ts';
+import { ANALYSIS_ROLES, ancestorsOf, itemMarker, newNonce, parseItemMarker, pickReadyBuilds, propagateBlocked, readySet, sanitizeLine, stripInvisible } from './graph.ts';
 import type { Hold } from './stages.ts';
 import { fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
 
@@ -54,8 +57,8 @@ export interface GraphHost {
   finishSession(key: string, res: AgentResult): void;
   refundIfLimit(key: string, res: AgentResult): void;
   emitter(key: string, stage: StageName, loop: number, rev: number): (ev: EmitEvent) => void;
-  runAllGates(key: string, repo: RepoConfig, defs: GateDef[]): Promise<GateRun>;
-  reinstallIfLockChanged(key: string, stage: StageName): Promise<void>;
+  runAllGates(key: string, repo: RepoConfig, defs: GateDef[], cwd?: string): Promise<GateRun>;
+  reinstallIfLockChanged(key: string, stage: StageName, cwd?: string): Promise<void>;
   hasUncommitted(worktree: string): Promise<boolean>;
   writePromptAudit(key: string, name: string, text: string): void;
   runsLimit(run: Run): number;
@@ -71,6 +74,8 @@ export interface GraphHost {
   projectBlocks(key: string, consumer: 'builder' | 'readonly', files?: string[]): Promise<{ projectFacts: string; projectHistory: string; projectNotes: string }>;
   /** One slot of the engine's single cap on concurrent analysis calls (null = the run was stopped while waiting). */
   analysisSlot(key: string): Promise<(() => void) | null>;
+  /** One slot of `pipeline.maxParallel` for a build (shared by every run; null = the run was stopped while waiting). */
+  buildSlot(key: string): Promise<(() => void) | null>;
   protectedPaths: string;
 }
 
@@ -87,6 +92,9 @@ export function capNote(raw: unknown): ItemNote {
 
 export class GraphBuilder {
   private h: GraphHost;
+  /** Per run, the land-order gates for the build wave that is in flight. Lower ids land first so the branch stays one commit per task. */
+  private landGates = new Map<string, Map<string, Promise<void>>>();
+  private landRelease = new Map<string, Map<string, () => void>>();
   constructor(host: GraphHost) {
     this.h = host;
   }
@@ -129,11 +137,11 @@ export class GraphBuilder {
       if (propagateBlocked(probe)) h.patch(key, (r) => void propagateBlocked(r.graph!.items));
     }
     const items = h.run(key).graph!.items;
-    // read-only analysis first, as many at once as the cap allows; then exactly ONE build item
+    // read-only analysis first, as many at once as the cap allows; then every ready build whose files do not overlap, up to maxParallel
     const analysis = readySet(items).filter((i) => ANALYSIS_ROLES.has(i.role)).slice(0, h.c.cfg().pipeline.readOnlyParallel);
     if (analysis.length) return this.runAnalysisWave(key, plan, analysis.map((i) => i.id));
-    const next = pickNext(items);
-    if (next) return this.runBuildItem(key, plan, next.id);
+    const builds = pickReadyBuilds(items, h.c.cfg().pipeline.maxParallel);
+    if (builds.length) return this.runBuildWave(key, plan, builds.map((i) => i.id));
     if (items.every((i) => i.state === 'done')) return this.finalize(key);
     return this.endWithProblems(key);
   }
@@ -216,7 +224,7 @@ export class GraphBuilder {
       if (adoptable) {
         h.note(key, 'build', `Found the finished commit of ${id} from before a restart — checking it before it counts.`);
         const files = (await gitOk(wt, ['diff', '--name-only', '-z', start, head])).split('\0').filter(Boolean);
-        return this.finishItem(key, id, head, files, plan, 'adopted');
+        return this.finishItem(key, id, head, files, plan, 'adopted', start);
       }
     }
     // not adoptable: a recoverable copy first, then back to where the attempt started
@@ -227,10 +235,49 @@ export class GraphBuilder {
       await h.toNeedsHuman(key, `Unfinished work on ${id} from before a restart could not be backed up (${truncate(String((e as Error)?.message ?? e), 160)}), so Conductor will not discard it. Check the worktree, then move the card to To do.`, 'build');
       return 'stop';
     }
-    await W.resetToCommit(wt, start ?? run.commitSha ?? run.baseSha);
+    const target = start ?? run.commitSha ?? run.baseSha;
+    if (await this.resetWouldDropDone(key, target)) {
+      this.setItem(key, id, (x) => void (x.state = 'pending'));
+      h.note(key, 'build', `${id} was interrupted. Its private directory is gone, and the current branch already has other finished tasks, so those commits stay.`);
+      return 'ok';
+    }
+    await W.resetToCommit(wt, target);
     this.setItem(key, id, (x) => void (x.state = 'pending'));
     h.note(key, 'build', `Discarded the unfinished attempt at ${id} from before a restart${refs.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
     return 'ok';
+  }
+
+  /** True when resetting the checkout to `target` would drop a commit that already belongs to a finished task. */
+  private async resetWouldDropDone(key: string, target: string): Promise<boolean> {
+    const run = this.h.run(key);
+    for (const it of run.graph?.items ?? []) {
+      if (it.state !== 'done' || !it.commitSha || !SHA_RE.test(it.commitSha)) continue;
+      const anc = await git(run.worktree, ['merge-base', '--is-ancestor', it.commitSha, target]);
+      if (anc.code !== 0) return true;
+    }
+    return false;
+  }
+
+  /** Ready build items run together. Each waits for a `maxParallel` slot. Results land on the current branch in id order. */
+  private async runBuildWave(key: string, plan: Plan, ids: string[]): Promise<void> {
+    const gates = new Map<string, Promise<void>>();
+    const release = new Map<string, () => void>();
+    for (const id of ids) {
+      let done!: () => void;
+      gates.set(id, new Promise<void>((r) => { done = r; }));
+      release.set(id, done);
+    }
+    this.landGates.set(key, gates);
+    this.landRelease.set(key, release);
+    try {
+      const settled = await Promise.allSettled(ids.map((id) => this.runBuildItem(key, plan, id)));
+      const failure = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+      if (failure) throw failure.reason;
+    } finally {
+      for (const done of release.values()) done();
+      this.landGates.delete(key);
+      this.landRelease.delete(key);
+    }
   }
 
   // ───────────────────────── analysis items (read-only, concurrent) ─────────────────────────
@@ -317,6 +364,32 @@ export class GraphBuilder {
     await this.cardNote(key, id, 'done', `✅ **${id} — analysis done**\n\n${note.summary}${note.decisions.length ? `\n\n**Decisions**\n${note.decisions.map((d) => `- ${d}`).join('\n')}` : ''}`);
   }
 
+  /**
+   * Complete auto, once per item: leave the item pending and the rewrite note on the run so the next step builds again.
+   * A committed secret records `commitSha` so a later crash window does not treat that commit as finished work.
+   */
+  private queueFixtureRewrite(key: string, id: string, reason: string, commitSha?: string): boolean {
+    const h = this.h;
+    const rw = effectiveFixtureRewrite(h.c.cfg(), this.item(key, id).fixtureRewrites, reason);
+    if (!rw) return false;
+    h.patch(key, (r) => {
+      const x = r.graph?.items.find((i) => i.id === id);
+      if (x) {
+        x.fixtureRewrites = rw.nextUsed;
+        x.state = 'pending';
+        x.startHead = undefined;
+        x.nonce = undefined;
+        x.note = truncate(rw.note, 600);
+      }
+      r.fixtureRewriteNote = rw.note;
+      if (commitSha) r.commitSha = commitSha;
+      r.next = 'build';
+      r.history.push({ ts: h.c.clock.now(), text: `Complete auto: rewriting credential-shaped text in ${rw.paths.join(', ')} (local worktree only; nothing is pushed)` });
+    });
+    h.note(key, 'build', `Complete auto is rewriting credential-shaped text in ${rw.paths.join(', ')} (${id}). The change stays on this machine; nothing is pushed.`);
+    return true;
+  }
+
   // ───────────────────────── build items ─────────────────────────
   private async runBuildItem(key: string, plan: Plan, id: string): Promise<void> {
     const h = this.h;
@@ -339,19 +412,15 @@ export class GraphBuilder {
     const builder = h.c.agents.provider(cand.id);
     const account = { provider: cand.id, id: cand.account };
 
-    // 2) a clean tree to start from (a repo-hook rejection of the previous attempt leaves its files in place ON PURPOSE — fixed in place)
-    if ((await h.hasUncommitted(run.worktree)) && !run.commitNote) {
-      try {
-        const refs = await W.backupRefs(run.worktree, run.key, run.rev);
-        await W.resetToCommit(run.worktree, await gitOk(run.worktree, ['rev-parse', 'HEAD']));
-        h.note(key, 'build', `Discarded uncommitted changes in the worktree before starting ${id}${refs.stashRef ? ` (backup: ${refs.stashRef})` : ''}.`);
-      } catch (e) {
-        return h.toNeedsHuman(key, `Uncommitted changes in the worktree could not be backed up (${truncate(String((e as Error)?.message ?? e), 160)}), so Conductor will not discard them. Check the worktree, then move the card to To do.`, 'build');
-      }
-    }
-
-    // 3) the attempt starts: state, startHead and nonce are ONE write (crash adoption depends on it)
-    const startHead = await gitOk(run.worktree, ['rev-parse', 'HEAD']);
+    // 2) one slot of the parallel cap, then a detached directory cut from the current branch tip.
+    // The repository checkout is not written by the builder. The commit is merged onto it when the item succeeds.
+    const release = await h.buildSlot(key);
+    if (!release) return;
+    const startHead = (await gitOk(run.worktree, ['rev-parse', 'HEAD'])).trim();
+    const wt = W.detachedBuildPath(repo, run.key, id, cfg.worktreeRoot);
+    const reuse = !!run.commitNote && existsSync(wt);
+    try {
+      if (!reuse) await W.openDetachedBuild(repo, wt, startHead);
     const nonce = newNonce();
     h.patch(key, (r) => {
       const x = r.graph!.items.find((i) => i.id === id)!;
@@ -364,6 +433,8 @@ export class GraphBuilder {
     });
     run = h.run(key);
     const cur = this.item(key, id);
+    const rewriteNote = run.fixtureRewriteNote;
+    if (rewriteNote) h.patch(key, (r) => void (r.fixtureRewriteNote = undefined));
 
     const baseline = h.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
@@ -382,7 +453,7 @@ export class GraphBuilder {
       gates: repo.gates.length ? repo.gates.map((g) => `\`${g.cmd}\``).join(', ') : '(none detected)',
       baselineFailing,
       gateFailures: cur.feedback ? fence('gate-output', cur.feedback, 4_000) : '',
-      commitNote: run.commitNote ? fence('commit-hook-output', run.commitNote, 4_000) : '',
+      commitNote: [run.commitNote ? fence('commit-hook-output', run.commitNote, 4_000) : '', rewriteNote ? fence('fixture-rewrite', rewriteNote, 2_000) : ''].filter(Boolean).join('\n\n'),
     });
     h.writePromptAudit(key, `build-${id}-${cur.loop}`, prompt);
 
@@ -397,7 +468,7 @@ export class GraphBuilder {
       ...(cand.account !== DEFAULT_ACCOUNT ? { account } : {}),
       sel,
       repoPath: repo.path,
-      worktree: run.worktree,
+      worktree: wt,
       baseSha: run.baseSha,
       subject,
       trailer: itemMarker(cur.id, nonce),
@@ -407,7 +478,7 @@ export class GraphBuilder {
       onEvent: h.emitter(key, 'build', cur.loop, run.rev),
       signal: h.c.signal(key),
       secrets,
-      planPaths: plan.filesToChange.map((f) => f.path),
+      planPaths: exemptPaths(run, plan),
       onPrepared: (prep) => {
         h.patch(key, (r) => {
           r.guardSha = prep.guardSha ?? undefined;
@@ -424,8 +495,10 @@ export class GraphBuilder {
     });
 
     switch (out.kind) {
-      case 'held':
-        // a safety stop (guard, protected paths, git settings): the whole run waits for a person; the item is not failed, just not done
+      case 'held': {
+        // a safety stop (guard, protected paths, git settings): the whole run waits for a person; the item is not failed, just not done.
+        // Complete auto: credential-shaped text that is only in tests/fixtures gets one rewrite instead.
+        if (this.queueFixtureRewrite(key, id, out.reason)) return;
         this.setItem(key, id, (x) => {
           x.state = 'pending';
           x.startHead = undefined;
@@ -433,6 +506,7 @@ export class GraphBuilder {
           x.note = truncate(out.reason, 600);
         });
         return h.toNeedsHuman(key, out.reason, 'build');
+      }
       case 'failed': {
         const res = out.res;
         if (res.errorKind === 'aborted') return; // stays `running`; recovery decides on the next start
@@ -458,23 +532,31 @@ export class GraphBuilder {
           return;
         }
         h.patch(key, (r) => void (r.buildFails = 0));
-        return this.failItem(key, id, `${providerLabel(out.provider)} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`);
+        return this.failItem(key, id, `${providerLabel(out.provider)} failed twice: ${truncate(res.error ?? 'unknown error', 300)}`, wt);
       }
       case 'hook':
         h.patch(key, (r) => void (r.commitNote = truncate(out.detail, 4000)));
-        return this.retryOrFail(key, id, 'The repository commit hook rejected the build', undefined);
+        return this.retryOrFail(key, id, 'The repository commit hook rejected the build', undefined, wt);
       case 'nothing': {
         // the builder may have committed by itself: accept real work (after the same checks) instead of calling it "no changes"
-        const headNow = await gitOk(run.worktree, ['rev-parse', 'HEAD']).catch(() => '');
-        if (headNow && headNow !== startHead && !(await h.hasUncommitted(run.worktree))) {
-          const files = (await gitOk(run.worktree, ['diff', '--name-only', '-z', startHead, headNow])).split('\0').filter(Boolean);
+        const headNow = await gitOk(wt, ['rev-parse', 'HEAD']).catch(() => '');
+        if (headNow && headNow !== startHead && !(await h.hasUncommitted(wt))) {
+          const files = (await gitOk(wt, ['diff', '--name-only', '-z', startHead, headNow])).split('\0').filter(Boolean);
           h.note(key, 'build', `The builder committed ${id} by itself — keeping it after the usual checks.`);
-          return void (await this.finishItem(key, id, headNow, files, plan, 'self'));
+          return void (await this.finishItem(key, id, headNow, files, plan, 'self', startHead, wt));
         }
-        return this.failItem(key, id, 'The builder finished without changing any files. The task may need to be clarified.');
+        return this.failItem(key, id, 'The builder finished without changing any files. The task may need to be clarified.', wt);
       }
       case 'committed':
-        return void (await this.finishItem(key, id, out.sha, out.files, plan, 'built'));
+        return void (await this.finishItem(key, id, out.sha, out.files, plan, 'built', undefined, wt));
+    }
+    } finally {
+      this.landRelease.get(key)?.get(id)?.();
+      const after = h.run(key);
+      const kept = after.graph?.items.find((i) => i.id === id);
+      const keep = !!after.commitNote && kept?.state === 'pending';
+      if (!keep) await W.removeDetachedBuild(repo.path, wt).catch(() => undefined);
+      release();
     }
   }
 
@@ -482,13 +564,15 @@ export class GraphBuilder {
    * A build item has a commit. (adopted/self-made commits get the scope + secret checks the envelope already ran for a live build)
    * Then the item's gates decide: no regression ⇒ `done`; a regression ⇒ another attempt, or `failed` when the item's loop budget is spent.
    */
-  private async finishItem(key: string, id: string, sha: string, files: string[], plan: Plan, how: 'built' | 'adopted' | 'self'): Promise<'ok' | 'stop'> {
+  private async finishItem(key: string, id: string, sha: string, files: string[], plan: Plan, how: 'built' | 'adopted' | 'self', scopeSince?: string, wt?: string): Promise<'ok' | 'stop'> {
     const h = this.h;
     const run = h.run(key);
     const repo = h.repo(run);
+    const dir = wt ?? run.worktree;
     if (how !== 'built') {
-      const problem = await postBuildChecks(run.worktree, run.baseSha, plan.filesToChange.map((f) => f.path), h.c.secretsFor(run));
+      const problem = await postBuildChecks(dir, run.baseSha, exemptPaths(run, plan), h.c.secretsFor(run), scopeSince);
       if (problem) {
+        if (this.queueFixtureRewrite(key, id, problem, dir === run.worktree ? sha : undefined)) return 'stop';
         this.setItem(key, id, (x) => {
           x.state = 'pending';
           x.startHead = undefined;
@@ -501,9 +585,9 @@ export class GraphBuilder {
     }
     let regression: GateComparison | null = null;
     if (repo.gates.length) {
-      await h.reinstallIfLockChanged(key, 'build');
+      await h.reinstallIfLockChanged(key, 'build', dir);
       const baseline = h.c.store.readArtifact<GateRun | null>(key, 'baseline.json', null);
-      const current = await h.runAllGates(key, repo, repo.gates);
+      const current = await h.runAllGates(key, repo, repo.gates, dir);
       if (this.aborted(key)) return 'stop';
       const cmp = G.compareGates(baseline, current);
       h.c.store.writeArtifact(key, `gates-item-${id}-${this.item(key, id).loop}.json`, { run: current, comparison: cmp });
@@ -513,9 +597,35 @@ export class GraphBuilder {
       const feedback = regression.regressions
         .map((r) => `- gate \`${r.gate}\`: ${r.newFailures.length ? r.newFailures.slice(0, 15).join('; ') : r.note ?? 'now failing'}`)
         .join('\n');
-      await this.retryOrFail(key, id, `Quality gates regress (${regression.regressions.map((r) => r.gate).join(', ')})`, feedback);
+      await this.retryOrFail(key, id, `Quality gates regress (${regression.regressions.map((r) => r.gate).join(', ')})`, feedback, dir);
       return 'ok';
     }
+    const peers = this.landGates.get(key);
+    if (peers) {
+      const n = Number(id.replace(/\D/g, '')) || 0;
+      const lower = [...peers.keys()].filter((i) => (Number(i.replace(/\D/g, '')) || 0) < n);
+      await Promise.all(lower.map((i) => peers.get(i)!));
+    }
+    const landed = await W.mergeOntoCurrent(repo.path, sha);
+    if (!landed.ok) {
+      let kept = '';
+      try {
+        const refs = await W.backupRefs(dir, run.key, run.rev);
+        kept = ` The commit is kept as ${refs.headRef}.`;
+      } catch {
+        /* the private directory is removed after this; the message still tells the person what conflicted */
+      }
+      this.setItem(key, id, (x) => {
+        x.state = 'pending';
+        x.startHead = undefined;
+        x.nonce = undefined;
+        x.note = truncate(landed.detail, 600);
+      });
+      await h.toNeedsHuman(key, `${landed.detail}.${kept}`, 'build');
+      return 'stop';
+    }
+    sha = landed.sha;
+    void h.c.context.refresh(h.run(key), repo).then(() => h.c.context.refresh(h.run(key), repo)).catch(() => undefined);
     const title = this.item(key, id).title;
     h.patch(key, (r) => {
       const x = r.graph!.items.find((i) => i.id === id)!;
@@ -536,10 +646,10 @@ export class GraphBuilder {
   }
 
   /** Another attempt at the item with the given feedback, or — when its loop budget is spent — the item fails. */
-  private async retryOrFail(key: string, id: string, why: string, feedback: string | undefined): Promise<void> {
+  private async retryOrFail(key: string, id: string, why: string, feedback: string | undefined, buildWt?: string): Promise<void> {
     const h = this.h;
     const it = this.item(key, id);
-    if (it.loop >= it.loopBudget) return this.failItem(key, id, `${why}, and the attempt limit (${it.loopBudget}) for this task is reached.`);
+    if (it.loop >= it.loopBudget) return this.failItem(key, id, `${why}, and the attempt limit (${it.loopBudget}) for this task is reached.`, buildWt);
     this.setItem(key, id, (x, r) => {
       x.state = 'pending';
       x.loop += 1;
@@ -555,17 +665,19 @@ export class GraphBuilder {
    * The item failed for good. Its commits are backed up and the branch goes back to where the item began, so independent items continue on
    * good code (a half-working item never poisons them); Retry runs it again from there.
    */
-  private async failItem(key: string, id: string, reason: string): Promise<void> {
+  private async failItem(key: string, id: string, reason: string, buildWt?: string): Promise<void> {
     const h = this.h;
     const run = h.run(key);
     const it = this.item(key, id);
+    const wt = buildWt ?? run.worktree;
+    const onBranch = wt === run.worktree;
     let backup = '';
     try {
-      const head = await gitOk(run.worktree, ['rev-parse', 'HEAD']);
-      const dirty = await h.hasUncommitted(run.worktree);
+      const head = (await gitOk(wt, ['rev-parse', 'HEAD'])).trim();
+      const dirty = await h.hasUncommitted(wt);
       if (it.floor && SHA_RE.test(it.floor) && (head !== it.floor || dirty)) {
-        const refs = await W.backupRefs(run.worktree, run.key, run.rev);
-        await W.resetToCommit(run.worktree, it.floor);
+        const refs = await W.backupRefs(wt, run.key, run.rev);
+        if (onBranch && !(await this.resetWouldDropDone(key, it.floor))) await W.resetToCommit(wt, it.floor);
         backup = ` Its work is kept as ${refs.headRef}${refs.stashRef ? ` and ${refs.stashRef}` : ''} in the repository.`;
       }
     } catch (e) {

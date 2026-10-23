@@ -277,7 +277,7 @@ test('a REAL storage failure (the journal cannot be written) keeps every effect 
     const e2 = new Engine({ getConfig: () => h.cfg, store: h.store, board: board2, agents: h.agents, notify: () => undefined, persistent: { load: () => ({ repos: {} }), save: () => undefined } });
     await e2.tick();
     assert.equal(e2.effects.pendingCount(key), 0);
-    assert.equal(board2.item(key)!.lane, 'review');
+    assert.equal(board2.item(key)!.lane, 'done');
     const bodies = board2.comments(key).map((c) => c.body);
     assert.equal(bodies.filter((b) => b.includes('Ready for review')).length, 1, 'applied exactly once');
     assert.equal(bodies.filter((b) => b.includes('Conductor plan')).length, 1);

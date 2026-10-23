@@ -7,6 +7,7 @@ import { fmtDuration, isUuid, shellQuote, truncate } from '../util.ts';
 import { isReady, nextBuildRole } from './graph.ts';
 
 export function columnOf(run: Run): BoardColumn {
+  if (run.pushedAt && (run.status === 'ready' || run.status === 'finished')) return 'pushed';
   switch (run.status) {
     case 'queued':
       return 'queued';
@@ -51,6 +52,7 @@ export function workingAgent(run: Run, cfg: Config): ProviderId | null {
 const STAGE_VERB: Record<string, string> = { plan: 'planning', plan_review: 'reviewing the plan', build: 'building', verify: 'verifying' };
 
 export function activityOf(run: Run, cfg: Config, now: number): string {
+  if (run.pushedAt && (run.status === 'ready' || run.status === 'finished')) return `Pushed to ${run.branch || 'the current branch'}`;
   const since = run.stageStartedAt ? ` · ${fmtDuration(now - run.stageStartedAt)}` : '';
   switch (run.status) {
     case 'queued':
@@ -69,7 +71,7 @@ export function activityOf(run: Run, cfg: Config, now: number): string {
     case 'parked':
       return 'Parked — move the issue to Todo to continue';
     case 'ready':
-      return run.unverified ? 'Ready for review — not verified by tests' : 'Verified — ready for your review';
+      return run.unverified ? 'Done — not verified by tests' : 'Done';
     case 'failed':
       return `Internal error — retrying (${truncate(run.lastError ?? '', 100)})`;
     case 'aborted':
@@ -142,6 +144,7 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
     canCleanup: ['ready', 'finished', 'aborted'].includes(st) && !!run.worktree,
     canPark: !['finished', 'aborted', 'parked'].includes(st),
     canFinish: !['finished', 'aborted'].includes(st),
+    canPush: (st === 'ready' || st === 'finished') && !run.pushedAt,
     ...(run.graph ? { taskProgress: graphProgress(run) } : {}),
     // M8-4 (C4/N3c/N3e): only meaningful while waiting. ABSENT on the run counts as forced (a run held before M8-4) — fail closed.
     forcedHold: st === 'awaiting_approval' ? run.forcedHold !== false : false,

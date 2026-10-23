@@ -7,7 +7,7 @@
 import type { Schema } from '../agents/json.ts';
 import { validateSchema } from '../agents/json.ts';
 import { safeEntryName } from '../asks/snapshot.ts';
-import { sanitizeLine, stripInvisible } from '../pipeline/graph.ts';
+import { parallelGroupOf, sanitizeLine, stripInvisible } from '../pipeline/graph.ts';
 import { redact } from '../redact.ts';
 import { isProtectedPath } from '../git/worktree.ts';
 import { SECRET_FILE } from '../policy/rules.ts';
@@ -31,7 +31,8 @@ export const WORK_BRIEF_SCHEMA: Schema = {
         properties: {
           title: str, summary: str, size: { type: 'string', enum: ['S', 'M', 'L'] },
           files: { type: 'array', maxItems: 10, items: str },
-          deps: { type: 'array', maxItems: 7, items: { type: 'integer' }, description: '1-based numbers of EARLIER parts this one needs' },
+          deps: { type: 'array', maxItems: 7, items: { type: 'integer' }, description: '1-based numbers of EARLIER parts this one needs. Empty between parts that share a parallelGroup.' },
+          parallelGroup: { ...str, description: 'short label (letters, digits, hyphen). Parts with the same label can run together and must not depend on each other.' },
         },
       },
     },
@@ -109,6 +110,8 @@ export function validateWorkBrief(j: unknown): string[] {
       else if (seen.has(d)) errs.push(`${at}.deps[${k}]: duplicate dependency`);
       else seen.add(d);
     });
+    const group = own(part, 'parallelGroup');
+    if (group !== undefined && group !== '' && !parallelGroupOf(group)) errs.push(`${at}.parallelGroup: a short label of letters, digits and hyphens (at most 32 characters)`);
   });
   return errs.slice(0, 12);
 }
@@ -133,6 +136,7 @@ export function shapeWorkBrief(j: unknown, secrets: readonly string[], facts: Fi
     size: (['S', 'M', 'L'].includes(own(p, 'size') as string) ? own(p, 'size') : 'M') as PartSize,
     files: [...new Set(arr(own(p, 'files')).map(normalizeBriefPath).filter((x): x is string => x !== null && seen.has(x)))].slice(0, 10).map(R),
     deps: [...new Set(arr(own(p, 'deps')).filter((d): d is number => typeof d === 'number' && Number.isInteger(d) && d >= 1 && d <= i))].sort((a, b) => a - b).map((d) => `P${d}`),
+    ...(parallelGroupOf(own(p, 'parallelGroup')) ? { parallelGroup: parallelGroupOf(own(p, 'parallelGroup')) } : {}),
   }));
   return {
     title: R(line(own(j, 'title'), CAPS.title)),
@@ -168,7 +172,8 @@ export function reshapeStoredWork(raw: unknown): WorkBrief | null {
     if (!deps.every((d) => typeof d === 'string' && /^P[1-8]$/.test(d) && Number(d.slice(1)) <= i)) return null;
     const title = line(own(p, 'title'), CAPS.partTitle);
     if (!title) return null;
-    out.push({ id: `P${i + 1}`, title, summary: line(own(p, 'summary'), CAPS.partSummary), size: (['S', 'M', 'L'].includes(own(p, 'size') as string) ? own(p, 'size') : 'M') as PartSize, files: [...new Set(arr(own(p, 'files')).map(normalizeBriefPath).filter((x): x is string => x !== null && seen.has(x)))].slice(0, 10), deps: [...new Set(deps as string[])] });
+    const group = parallelGroupOf(own(p, 'parallelGroup'));
+    out.push({ id: `P${i + 1}`, title, summary: line(own(p, 'summary'), CAPS.partSummary), size: (['S', 'M', 'L'].includes(own(p, 'size') as string) ? own(p, 'size') : 'M') as PartSize, files: [...new Set(arr(own(p, 'files')).map(normalizeBriefPath).filter((x): x is string => x !== null && seen.has(x)))].slice(0, 10), deps: [...new Set(deps as string[])], ...(group ? { parallelGroup: group } : {}) });
   }
   const title = line(own(raw, 'title'), CAPS.title);
   if (!title) return null;

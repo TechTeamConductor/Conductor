@@ -33,7 +33,7 @@ test('question task: the planner answers, Conductor posts the answer on the card
     assert.equal(h.calls().filter((c) => c.who === 'cursor').length, 0, 'the builder never ran');
     assert.equal(h.calls().filter((c) => c.who === 'claude' && c.stage === 'verify').length, 0, 'the verifier never ran');
     assert.ok((await comments(h, key)).some((c) => c.includes('Multi-tenant isolation') && c.includes('Answer')), 'the answer is on the card');
-    assert.equal(laneOf(h, key), 'review');
+    assert.equal(laneOf(h, key), 'done');
     assert.equal(stageOf(h, key), 'ready');
     assert.ok(h.notes.some((n) => /answered/i.test(n.title)));
   } finally {

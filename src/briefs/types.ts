@@ -17,7 +17,7 @@ export const SOURCE_TYPES = ['official-docs', 'release-notes', 'source-code', 's
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
 export interface BriefFile { path: string; why: string; state: FileState; protected: boolean; secretLike: boolean }
-export interface BriefPart { id: string; title: string; summary: string; size: PartSize; files: string[]; deps: string[] }
+export interface BriefPart { id: string; title: string; summary: string; size: PartSize; files: string[]; deps: string[]; parallelGroup?: string }
 export interface WorkBrief { title: string; summary: string; approach: string; files: BriefFile[]; acceptance: string[]; risks: string[]; parts: BriefPart[] }
 export interface ResearchBrief { title: string; objective: string; questions: string[]; scope: { in: string[]; out: string[]; timeWindow?: string }; sourceTypes: SourceType[]; deliverable: string }
 

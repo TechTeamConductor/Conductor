@@ -133,19 +133,48 @@ export function topoOrder(items: ReadonlyArray<{ id: string; dependsOn: readonly
   return out.length === items.length ? out : null;
 }
 
-/** The runtime form of a validated plan graph: every item `pending`, counters zeroed. */
+const GROUP_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,31}$/;
+/** A parallel-group label, or undefined when the model text is not a short token. */
+export function parallelGroupOf(raw: unknown): string | undefined {
+  const t = sanitizeLine(raw, 32);
+  return GROUP_RE.test(t) ? t : undefined;
+}
+
+/**
+ * Drop dependency edges between items that share a parallelGroup. Explicit deps to items outside the group stay.
+ * Ready build items whose files do not overlap start together, up to `pipeline.maxParallel` (`pickReadyBuilds`).
+ */
+export function depsWithoutParallelPeers(items: readonly { id: string; dependsOn: readonly string[]; parallelGroup?: string }[]): Map<string, string[]> {
+  const group = new Map(items.map((i) => [i.id, parallelGroupOf(i.parallelGroup)]));
+  const out = new Map<string, string[]>();
+  for (const it of items) {
+    const mine = group.get(it.id);
+    out.set(
+      it.id,
+      it.dependsOn.filter((d) => {
+        const other = group.get(d);
+        return !(mine && other && mine === other);
+      }),
+    );
+  }
+  return out;
+}
+
+/** The runtime form of a validated plan graph: every item `pending`, counters zeroed. Same-group edges are removed. */
 export function buildGraph(plan: Plan, rev: number, now: number, loopBudget: number): TaskGraphRun {
+  const planned = itemsOf(plan);
+  const deps = depsWithoutParallelPeers(planned);
   return {
     rev,
     startedAt: now,
     final: 'pending',
-    items: itemsOf(plan).map<ItemRun>((it) => ({
+    items: planned.map<ItemRun>((it) => ({
       id: it.id,
       key: null,
       title: sanitizeLine(it.title, 160),
       role: it.role,
       objective: sanitizeLine(it.objective, 2000),
-      dependsOn: [...it.dependsOn],
+      dependsOn: [...(deps.get(it.id) ?? it.dependsOn)],
       files: it.files.map(normPath),
       criteria: [...it.criteria],
       verification: it.verification.map((v) => sanitizeLine(v, 300)).slice(0, 40),
@@ -242,14 +271,44 @@ export function ancestorsOf(items: readonly ItemRun[], id: string): ItemRun[] {
 }
 
 /**
- * The next piece of work, or undefined when nothing can run: an interrupted (`running`) item first, then ready analysis items
- * (declaration order), then the ready build item with the lowest id. Build items are strictly one at a time.
+ * The next piece of work for routing, or undefined when nothing can run: an interrupted (`running`) item first, then the first ready
+ * analysis item, then the ready build item with the lowest id. Scheduling starts every ready file-disjoint build (`pickReadyBuilds`).
  */
 export function pickNext(items: readonly ItemRun[]): ItemRun | undefined {
   const running = items.find((i) => i.state === 'running');
   if (running) return running;
   const ready = readySet(items);
   return ready.find((i) => ANALYSIS_ROLES.has(i.role)) ?? [...ready].filter((i) => BUILD_ROLES.has(i.role)).sort((a, b) => idNum(a.id) - idNum(b.id))[0];
+}
+
+const fileKey = (p: string): string => p.replace(/^\.\//, '').replace(/\\/g, '/');
+
+/**
+ * Ready build items that can start now: dependencies done, files disjoint from each other and from builds already running,
+ * at most `limit` of them (the free `pipeline.maxParallel` slots). A build that lists no files runs by itself.
+ * Lowest id first. Analysis items are not included.
+ */
+export function pickReadyBuilds(items: readonly ItemRun[], limit: number): ItemRun[] {
+  const running = items.filter((i) => i.state === 'running' && BUILD_ROLES.has(i.role));
+  const slots = Math.max(0, Math.floor(limit) - running.length);
+  if (slots === 0 || running.some((i) => i.files.length === 0)) return [];
+  const taken = new Set(running.flatMap((i) => i.files.map(fileKey)));
+  const ready = readySet(items)
+    .filter((i) => BUILD_ROLES.has(i.role))
+    .sort((a, b) => idNum(a.id) - idNum(b.id));
+  const out: ItemRun[] = [];
+  for (const it of ready) {
+    if (out.length >= slots) break;
+    if (it.files.length === 0) {
+      if (out.length === 0 && running.length === 0) out.push(it);
+      break;
+    }
+    const files = it.files.map(fileKey);
+    if (files.some((f) => taken.has(f))) continue;
+    for (const f of files) taken.add(f);
+    out.push(it);
+  }
+  return out;
 }
 
 /**

@@ -31,7 +31,7 @@ test('M3-AC1: a 3-task graph builds in dependency order, one commit per task wit
     assert.deepEqual(run.graph!.items.map((i) => i.commitSha), bodies.map((b) => b.split('\0')[0]));
     assert.deepEqual(run.sessions.map((s) => [s.agent, s.stage]), [['claude', 'plan'], ['cursor', 'build'], ['cursor', 'build'], ['cursor', 'build'], ['claude', 'verify']]);
     assert.deepEqual(lanes(h, key), ['done', 'done', 'done']);
-    assert.equal(h.board.item(key)!.lane, 'review');
+    assert.equal(h.board.item(key)!.lane, 'done');
     assert.ok((await comments(h, key)).some((c) => /Ready for review/.test(c)));
     assert.ok((await comments(h, run.graph!.items[0]!.key!)).some((c) => /T1 done/.test(c)), 'the subtask card says what happened');
     assert.match(readFileSync(join(h.run(key).worktree, 't3.mjs'), 'utf8'), /t3\.mjs/);
@@ -56,7 +56,7 @@ test('M3-AC3: a task that fails blocks its dependents, independent tasks continu
   const h = await makeHarness({ config: manual });
   try {
     const plan = graphPlan([item('T1', { criteria: ['AC1'] }), item('T2', { dependsOn: ['T1'], criteria: ['AC2'] }), item('T3'), item('T4', { dependsOn: ['T2'] })]);
-    const key = await approvedPaused(h, plan, { cursor: { 'ENG-1': { build: [writes('t1.mjs'), { error: 'boom' }, { error: 'boom' }, writes('t3.mjs'), writes('t2.mjs'), writes('t4.mjs')] } } });
+    const key = await approvedPaused(h, plan, { cursor: { 'ENG-1': { build: [writes('t1.mjs'), writes('t3.mjs'), { error: 'boom' }, { error: 'boom' }, writes('t2.mjs'), writes('t4.mjs')] } } });
     await resume(h);
     let run = h.run(key);
     assert.equal(run.status, 'needs_human');
@@ -95,7 +95,7 @@ test('a gate regression sends the task back for another attempt with the failure
     assert.equal(run.status, 'ready');
     const t1 = run.graph!.items[0]!;
     assert.equal(t1.loop, 2, 'a second attempt was needed');
-    assert.deepEqual(subjects(h, key), ['ENG-1: Add the greeting — T1: Task T1', 'ENG-1: Add the greeting — T1: Task T1 (fix, loop 2)', 'ENG-1: Add the greeting — T2: Task T2']);
+    assert.deepEqual(subjects(h, key), ['ENG-1: Add the greeting — T1: Task T1 (fix, loop 2)', 'ENG-1: Add the greeting — T2: Task T2']);
     const second = readFileSync(join(h.fakeDir, 'prompt-cursor-ENG-1-build-1.txt'), 'utf8');
     assert.match(second, /Quality-gate regressions from your previous attempt at this task/);
     assert.match(second, /<untrusted source="gate-output">/);
@@ -296,7 +296,9 @@ test('M3-AC5/S3: the final verification reads the whole change; a finding is att
   try {
     const bug = (file: string, title: string) => ({ title, severity: 'major', file, line: 1, evidence: 'wrong', suggestedFix: 'fix it' });
     const bugs = [bug('t2.mjs', 'T2 is wrong'), bug('ghost.mjs', 'file not in the diff'), bug('../../etc/passwd', 'path escape'), bug(':(glob)*', 'pathspec magic')];
-    const key = await approvedPaused(h, three(), {
+    // T3 waits for T2 so the scripted build steps stay in item order (file-disjoint items would otherwise share one step list).
+    const plan = graphPlan([item('T1', { criteria: ['AC1'] }), item('T2', { dependsOn: ['T1'], criteria: ['AC2'] }), item('T3', { dependsOn: ['T2'], criteria: ['AC2'] })]);
+    const key = await approvedPaused(h, plan, {
       claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'Problems.', bugs } }, { json: { verdict: 'pass' } }] } },
       cursor: { 'ENG-1': { build: [writes('t1.mjs'), writes('t2.mjs'), writes('t3.mjs'), { ...writes('t2.mjs', 'export const fixed = 1;\n'), savePrompt: true }] } },
     });

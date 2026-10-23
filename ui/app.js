@@ -37,20 +37,21 @@ const COLUMNS = [
   { id: 'verifying', label: 'Verifying', icon: 'shield', hint: 'Gates, then Claude checks' },
   { id: 'needs_human', label: 'Needs you', icon: 'alert', hint: 'Blocked until you act', attn: true },
   { id: 'paused', label: 'Paused', icon: 'pause', hint: 'On hold, resumes by itself' },
-  { id: 'ready', label: 'Ready for review', icon: 'check', hint: 'Verified. You review and merge' },
+  { id: 'ready', label: 'Done', icon: 'check', hint: 'Verified. Cards that depend on it can start' },
+  { id: 'pushed', label: 'Pushed', icon: 'arrow-up', hint: 'Pushed on the branch that was already checked out' },
 ];
-const MOBILE_ORDER = ['needs_human', 'plan_ready', 'paused', 'ready', 'building', 'verifying', 'planning', 'queued', 'todo', 'backlog'];
+const MOBILE_ORDER = ['needs_human', 'plan_ready', 'paused', 'pushed', 'ready', 'building', 'verifying', 'planning', 'queued', 'todo', 'backlog'];
 const COL_BY_ID = Object.fromEntries(COLUMNS.map((c) => [c.id, c]));
 const WORKING_COLUMNS = ['planning', 'building', 'verifying'];
 const WAITING_COLUMNS = ['plan_ready', 'needs_human', 'ready'];
 
 const STATUS_LABEL = {
   queued: 'Queued', running: 'Running', awaiting_approval: 'Plan ready', needs_human: 'Needs you', paused: 'Paused',
-  parked: 'Parked', ready: 'Ready for review', aborted: 'Aborted', failed: 'Failed', finished: 'Finished',
+  parked: 'Parked', ready: 'Done', aborted: 'Aborted', failed: 'Failed', finished: 'Finished',
 };
 const COLUMN_ICON = {
   backlog: 'archive', todo: 'clipboard', queued: 'clock', planning: 'pen', plan_ready: 'clipboard', building: 'code', verifying: 'shield',
-  needs_human: 'alert', paused: 'pause', ready: 'check', closed: 'archive',
+  needs_human: 'alert', paused: 'pause',   ready: 'check', pushed: 'arrow-up', closed: 'archive',
 };
 const AGENT_LABEL = { claude: 'Claude', cursor: 'Cursor', conductor: 'Conductor' };
 const AGENT_ICON = { claude: 'claude', cursor: 'cursor', conductor: 'diamond' };
@@ -193,7 +194,10 @@ function activitySentence(r, live) {
   if (reason && t.toLowerCase().includes(reason.slice(0, 24).toLowerCase())) t = 'Blocked, waiting for you';
   return t || runLabel(r);
 }
-function runLabel(run) { return run.status === 'awaiting_approval' ? 'Plan ready' : (STATUS_LABEL[run.status] || run.status); }
+function runLabel(run) {
+  if (run.column === 'pushed') return 'Pushed';
+  return run.status === 'awaiting_approval' ? 'Plan ready' : (STATUS_LABEL[run.status] || run.status);
+}
 function statusClass(run) {
   if (run.column === 'closed') return 'st-' + (run.status === 'failed' ? 'failed' : run.status === 'finished' ? 'finished' : 'aborted');
   return 'st-' + run.column;
@@ -908,6 +912,14 @@ const actApprove = async (key) => {
 };
 const actMove = (key, lane, msg) => runAction(key, 'move:' + lane, () => api('POST', `/api/items/${enc(key)}/move`, { lane }), msg);
 const actRetry = (key) => runAction(key, 'retry', () => api('POST', runUrl(key, 'retry')), `${key}: retry started.`);
+async function actPush(key) {
+  const ok = await confirmDialog({
+    title: `Push ${key}?`,
+    body: 'This commits only the files this ticket changed, as you (your git name), and pushes the branch that is already checked out. It does not switch branches or merge.',
+    confirmLabel: 'Push',
+  });
+  if (ok) await runAction(key, 'push', () => api('POST', runUrl(key, 'push')), `${key} pushed.`);
+}
 const actResume = (key) => runAction(key, 'resume', () => api('POST', runUrl(key, 'resume')), `${key} resumed.`);
 const actOpen = (key, target) => runAction(key, 'open:' + target, () => api('POST', runUrl(key, 'open'), { target }), OPEN_LABEL[target] || 'Opened');
 async function actAbort(key) {
@@ -2420,7 +2432,7 @@ function updateSummary(byCol, extra, rx) {
   const items = [];
   if (n('needs_human')) items.push({ col: 'needs_human', cls: 'st-needs_human', ic: 'alert', n: n('needs_human'), text: n('needs_human') === 1 ? 'needs you' : 'need you' });
   if (n('plan_ready')) items.push({ col: 'plan_ready', cls: 'st-plan_ready', ic: 'clipboard', n: n('plan_ready'), text: n('plan_ready') === 1 ? 'plan to approve' : 'plans to approve' });
-  if (n('ready')) items.push({ col: 'ready', cls: 'st-ready', ic: 'check', n: n('ready'), text: 'ready for review' });
+  if (n('ready')) items.push({ col: 'ready', cls: 'st-ready', ic: 'check', n: n('ready'), text: 'done' });
   if (working) items.push({ col: working === n('building') ? 'building' : 'planning', cls: 'st-building', ic: 'code', n: working, text: 'working' });
   if (n('paused')) items.push({ col: 'paused', cls: 'st-paused', ic: 'pause', n: n('paused'), text: 'paused' });
   if (n('queued')) items.push({ col: 'queued', cls: 'st-queued', ic: 'clock', n: n('queued'), text: 'queued' });
@@ -2488,7 +2500,8 @@ function createCard(key) {
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
-  p.actions = h('div', { class: 'card-actions', hidden: true }, p.bApprove, p.bRetry, p.bResume);
+  p.bPush = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'push' } }, icon('arrow-up'), h('span', null, 'Push'));
+  p.actions = h('div', { class: 'card-actions', hidden: true }, p.bApprove, p.bRetry, p.bResume, p.bPush);
   const el = h('li', { class: 'card is-entering', data: { key } },
     h('div', { class: 'card-top' }, p.key, h('span', { class: 'card-spacer' }), p.agent), p.main, p.act, p.reason, p.meta, p.actions);
   el._p = p;
@@ -2552,11 +2565,13 @@ function updateCard(el, r) {
   const showApprove = !!r.canApprove;
   const showRetry = !!r.canRetry && r.column === 'needs_human';
   const showResume = r.status === 'paused' || r.status === 'parked';
-  toggleHidden(p.bApprove, !showApprove); toggleHidden(p.bRetry, !showRetry); toggleHidden(p.bResume, !showResume);
-  toggleHidden(p.actions, !(showApprove || showRetry || showResume));
+  const showPush = !!r.canPush;
+  toggleHidden(p.bApprove, !showApprove); toggleHidden(p.bRetry, !showRetry); toggleHidden(p.bResume, !showResume); toggleHidden(p.bPush, !showPush);
+  toggleHidden(p.actions, !(showApprove || showRetry || showResume || showPush));
   setBusy(p.bApprove, S.busy.has(r.key + ':approve'));
   setBusy(p.bRetry, S.busy.has(r.key + ':retry'));
   setBusy(p.bResume, S.busy.has(r.key + ':resume'));
+  setBusy(p.bPush, S.busy.has(r.key + ':push'));
 }
 
 function onViewClick(e) {
@@ -2569,6 +2584,7 @@ function onViewClick(e) {
     case 'approve': if (key) actApprove(key); break;
     case 'retry': if (key) actRetry(key); break;
     case 'resume': if (key) actResume(key); break;
+    case 'push': if (key) actPush(key); break;
     case 'jump': jumpToColumn(t.dataset.col); break;
     case 'new-task': openNewTask(); break;
     case 'open-setup': navigate('#/setup'); break;
@@ -2783,17 +2799,18 @@ function retryLabel(r) {
   return map[o] || 'Retry';
 }
 function nextAction(r) {
+  if (r.column === 'pushed') return 'Pushed on the branch that was already checked out, as you. Only this ticket’s files were committed.';
   switch (r.status) {
     case 'awaiting_approval': return 'Read the plan, then approve it so Cursor can start building.';
     case 'needs_human': return r.needsHuman ? `Sort out the blocker below, then press ${retryLabel(r)}.` : 'Check the run, then press Retry.';
-    case 'ready': return `Review branch ${r.branch || ''} and merge it yourself${r.unverified ? '. Look closely: this run is unverified' : ''}. Conductor never pushes or merges.`;
+    case 'ready': return `Done${r.unverified ? '. Look closely: this run is unverified' : ''}. Press Push to commit only this ticket’s files as you and push the branch already checked out. The branch is not switched or merged.`;
     case 'paused': return r.pausedUntil ? `On hold by a usage limit. It resumes automatically at ${fmtWhen(r.pausedUntil)}, or press Resume now to try immediately.` : 'On hold by a usage limit. It resumes automatically.';
     case 'parked': return 'Parked in Backlog: nothing runs. Press Move to To do to restart it (it re-plans and keeps the work so far).';
     case 'queued': return 'Waiting for a free worker slot. Nothing for you to do.';
     case 'running': return r.agent ? `${AGENT_LABEL[r.agent] || r.agent} is working. Nothing for you to do.` : 'Working. Nothing for you to do.';
     case 'failed': return 'Infrastructure failure. Conductor retries automatically, or press Retry to try now.';
     case 'aborted': return r.canCleanup ? 'This run was stopped. The worktree is kept until you remove it.' : 'This run was stopped.';
-    case 'finished': return r.canCleanup ? 'Marked done. You can remove the worktree.' : 'Marked done.';
+    case 'finished': return r.canPush ? 'Marked done. Press Push to send only this ticket’s files on the branch already checked out.' : r.canCleanup ? 'Marked done. You can remove the worktree.' : 'Marked done.';
     default: return '';
   }
 }
@@ -2814,6 +2831,7 @@ function renderOverview(d) {
   if (d.status === 'parked') bar.appendChild(actBtn(d, 'move:todo', 'Move to To do (restart)', 'play', 'btn-primary', () => actMove(d.key, 'todo', `${d.key} restarted.`)));
   if (d.canPark) bar.appendChild(actBtn(d, 'move:backlog', 'Park in Backlog', 'archive', '', () => actMove(d.key, 'backlog', `${d.key} parked in Backlog.`)));
   if (d.canFinish) bar.appendChild(actBtn(d, 'move:done', 'Mark done', 'tick', '', () => actMove(d.key, 'done', `${d.key} marked done.`)));
+  if (d.canPush) bar.appendChild(actBtn(d, 'push', 'Push', 'arrow-up', 'btn-primary', () => actPush(d.key)));
   if (d.canCleanup) bar.appendChild(actBtn(d, 'cleanup', 'Remove worktree', 'folder', '', () => actCleanup(d.key)));
   if (d.canAbort) bar.appendChild(actBtn(d, 'abort', 'Abort run', 'x-circle', 'btn-danger', () => actAbort(d.key)));
   root.appendChild(bar);
@@ -3362,7 +3380,7 @@ function renderTasks(d) {
       failed ? h('span', { class: 'chip' }, failed + ' failed') : null,
       n('blocked') ? h('span', { class: 'chip' }, n('blocked') + ' blocked') : null,
       h('span', { class: 'chip' }, 'Plan rev ' + g.rev)),
-    h('p', { class: 'muted' }, 'The plan was split into tasks. Conductor builds them one at a time on one branch, in dependency order, and runs the quality gates after each one; the whole change is verified at the end.'),
+    h('p', { class: 'muted' }, 'The plan was split into tasks. Independent tasks build at the same time, up to the parallel cap, then each result is merged onto the current branch. Tasks that share files or depend on each other wait. Quality gates run after each one; the whole change is verified at the end.'),
     d.status === 'needs_human' && (failed || n('blocked'))
       ? h('p', null, h('b', null, 'Retry'), ' runs the failed and blocked tasks again; finished tasks and their commits are kept. Moving the card to To do does the same as Retry; to start over with a new plan, edit the card description (or stop the run, then Retry).')
       : null));
@@ -3791,7 +3809,7 @@ function openSettings(focus) {
   applyOverrides();
   const setRm = runModeOn() ? runModeSeg() : null;
   const rmHint = h('p', { class: 'muted', role: 'status' },
-    'Complete auto approves and builds ordinary plans without asking, and at a usage limit moves to the next account then the next tool in the job\'s list. Large changes, protected files and unverified cards still wait.');
+    'Complete auto approves and builds every plan without asking, including large changes, protected files and designed work, and at a usage limit moves to the next account then the next tool in the job\'s list. Checks still run after each build; nothing is pushed.');
   const rmApprove = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => { $('#dlg').close(); openApproveWaiting(); } }, 'Approve waiting plans');
   const syncRmApprove = () => {
     const n = waitingOf().bulkApprovable;
@@ -3914,7 +3932,7 @@ function openSettings(focus) {
       h('p', { class: 'muted' }, 'This switch saves at once. It is not part of Save changes below.'))] : []),
     group('Planning',
       fld('Plan approval', c.planApproval, M.runModeOverridden((S.state.settings && S.state.settings.overriddenByRunMode) || [], 'planApproval')
-        ? 'Complete auto is on: ordinary plans approve themselves. Large changes, protected files and unverified cards still wait.'
+        ? 'Complete auto is on: every plan approves itself and builds. Checks still run after each build.'
         : 'Automatic starts building as soon as the plan is written. Large plans always ask.'),
       fld('Plan review', c.planReview, 'A second pass checks the plan before anything is built.')),
     group('Who does what',
@@ -3974,7 +3992,7 @@ function renderWizard(force) {
       h('h1', { id: 'wiz-h' }, complete ? 'Setup and repositories' : 'Set up Conductor'),
       h('p', null, complete
         ? 'Everything is connected. Add another repository or re-check a step.'
-        : 'Two short steps. Conductor never pushes or merges code, and everything stays on this computer.'),
+        : 'Two short steps. The builder never pushes. A done card can be pushed later, on the branch already checked out.'),
       h('div', { class: 'wiz-progress' },
         h('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(WIZ_STEPS.length), 'aria-valuenow': String(done), 'aria-label': 'Setup progress' },
           (() => { const f = h('span'); f.style.setProperty('--pct', (done / WIZ_STEPS.length) * 100 + '%'); return f; })()),

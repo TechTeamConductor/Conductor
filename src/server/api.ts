@@ -15,6 +15,7 @@ import { PROVIDER_IDS, isProviderId, providerLabel } from '../agents/providers/r
 import { COMPLEXITIES, ROLES, ROLE_NEEDS, isComplexity, isRole, type RoleConfig, type Roles } from '../agents/roles.ts';
 import { validatePairing, type ProviderState } from '../agents/routing.ts';
 import { redact } from '../redact.ts';
+import { isCompleteAuto } from '../policy/policy.ts';
 import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
@@ -97,7 +98,7 @@ const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 const log = logger('api');
 /** M8-4 §2.3/N8: the static confirmation text for turning Complete auto on (names every forced hold). */
 const COMPLETE_AUTO_CONFIRM =
-  'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. Large changes, protected files, plans with more than 8 tasks and cards from unverified sources (imports, Ask and research results, designed work) still wait for you. Send "confirm": true.';
+  'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. Nothing is pushed or merged, and the checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Commits stay on the local worktree. Send "confirm": true.';
 // L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -171,6 +172,7 @@ export class Api {
    */
   private notBulkApprovable(run: Run): 'forced' | 'risky' | 'not_waiting' | null {
     if (run.status !== 'awaiting_approval') return 'not_waiting';
+    if (isCompleteAuto(this.d.getConfig())) return null; // Complete auto: nothing waits for a person
     if (run.forcedHold !== false) return 'forced';
     if (run.untrusted === true) return 'forced';
     const createdBy = this.d.board.item(run.key)?.createdBy;
@@ -657,7 +659,7 @@ export class Api {
         const why = !run ? 'missing' : w.rev !== run.rev && run.status === 'awaiting_approval' ? 'stale' : this.notBulkApprovable(run);
         if (why) { skipped.push({ key: w.key, reason: why }); continue; }
         try {
-          this.d.engine.approve(w.key, 'human', w.rev, false);
+          this.d.engine.approve(w.key, 'human', w.rev, isCompleteAuto(this.d.getConfig()), true);
         } catch (e) {
           if (e instanceof EngineError) { skipped.push({ key: w.key, reason: e.code === 'stale' ? 'stale' : e.code === 'confirm_required' ? 'risky' : 'not_waiting' }); continue; }
           throw e;
@@ -670,7 +672,7 @@ export class Api {
       return { json: { approved, skipped } };
     }
 
-    if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open)$/.exec(path)) && method === 'POST') {
+    if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open|push)$/.exec(path)) && method === 'POST') {
       const key = safeDecode(m[1]!);
       if (!KEY_RE.test(key) || !this.d.store.get(key)) throw new ApiFail(404, 'not_found', 'Unknown run.');
       switch (m[2]) {
@@ -689,6 +691,9 @@ export class Api {
           break;
         case 'cleanup':
           await this.d.engine.cleanup(key);
+          break;
+        case 'push':
+          await this.d.engine.push(key);
           break;
         case 'open': {
           const r = await openRun(this.d.store.get(key)!, this.d.getConfig(), String(body.target ?? ''), this.d.openExec);

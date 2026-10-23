@@ -10,6 +10,7 @@ import { capabilitiesOf, isRegisteredProvider } from '../agents/providers/regist
 import { buildBaseline } from '../agents/providers/verification.ts';
 import type { EmitEvent } from '../agents/claude.ts';
 import * as W from '../git/worktree.ts';
+import { gitOk } from '../git/exec.ts';
 import { scanBranchForSecrets } from '../git/branchscan.ts';
 import { revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
 import { errMsg, truncate } from '../util.ts';
@@ -129,6 +130,15 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
     return { kind: 'held', reason: isolationMessage(`added ${label}`, e instanceof AccountIsolationError ? e.cls : 'an account folder that could not be checked') };
   }
 
+  // HEAD before the builder runs. Scope is judged from here, so protected files already on the branch are not blamed on this attempt.
+  // Commits the builder makes itself still sit after this point and are still checked. A missing HEAD falls back to the run base (fail closed).
+  let attemptBase = i.baseSha;
+  try {
+    attemptBase = (await gitOk(i.worktree, ['rev-parse', 'HEAD'])).trim() || i.baseSha;
+  } catch {
+    attemptBase = i.baseSha;
+  }
+
   // 4 — run, with the git-meta restore guaranteed (also when the provider throws, times out or is aborted)
   let res: AgentResult | undefined;
   let thrown: { e: unknown } | undefined;
@@ -166,16 +176,29 @@ export async function runBuild(i: BuildInput): Promise<BuildOutcome> {
     return { kind: 'held', reason: `Could not commit the build: ${committed.detail}` };
   }
 
-  // 7 — everything the BRANCH now contains must pass the scope and secret checks
-  const problem = await postBuildChecks(i.worktree, i.baseSha, i.planPaths, i.secrets);
+  // 7 — this attempt's changes must pass the scope check; the branch since the run base must pass the secret scan
+  const problem = await postBuildChecks(i.worktree, i.baseSha, i.planPaths, i.secrets, attemptBase);
   if (problem) return { kind: 'held', reason: problem };
   return { kind: 'committed', sha: committed.sha, files: committed.files };
 }
 
-/** Everything the BRANCH now contains (incl. commits the agent made itself) must pass the scope and secret checks. */
-export async function postBuildChecks(worktree: string, baseSha: string, planPaths: string[], secrets: string[]): Promise<string | null> {
-  const diff = await W.diffAgainst(worktree, baseSha);
-  const paths = diff.files.flatMap((f) => [f.path, ...(f.from ? [f.from] : [])]); // a rename's SOURCE counts too (M6)
+/** Protected files a plan may list and still pass the post-build scope check: ONLY when a person approved that plan individually. Auto and bulk approvals get none. */
+export function exemptPaths(run: { approvedBy?: 'auto' | 'human'; approvedBulk?: boolean }, plan: { filesToChange: { path: string }[] }): string[] {
+  return run.approvedBy === 'human' && run.approvedBulk !== true ? plan.filesToChange.map((f) => f.path) : [];
+}
+
+/**
+ * Scope is the diff since `scopeSince` (the HEAD before this attempt), so protected files already on the branch are not
+ * "the builder changed" them. Commits the builder makes during the attempt are still in that diff. The secret scan stays
+ * against the run base. Omit `scopeSince` to judge scope from the run base, which is the fail-closed default.
+ */
+export async function postBuildChecks(worktree: string, baseSha: string, planPaths: string[], secrets: string[], scopeSince?: string): Promise<string | null> {
+  const scopeBase = scopeSince && /^[0-9a-f]{40}$/i.test(scopeSince) ? scopeSince : baseSha;
+  const diff = await W.diffAgainst(worktree, scopeBase);
+  // Conductor replaces a tracked `.conductor` symlink with a real directory and writes `.cursor/cli.json` itself.
+  // Those paths are not the builder's change, and `commitAll` does not put them in the product commit (B-1).
+  const conductorOwned = (p: string) => p === '.conductor' || p.startsWith('.conductor/') || p === '.cursor/cli.json';
+  const paths = diff.files.flatMap((f) => [f.path, ...(f.from ? [f.from] : [])]).filter((p) => !conductorOwned(p)); // a rename's SOURCE counts too (M6)
   const violations = W.diffScopeViolations(paths, planPaths);
   if (violations.length) {
     return `The builder changed protected files that the plan did not list: ${violations.slice(0, 6).join(', ')}. Review them (they are committed on the branch) before continuing.`;

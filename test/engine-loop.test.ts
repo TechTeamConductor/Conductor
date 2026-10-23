@@ -35,7 +35,7 @@ test('verifier fails → bug child card (never claimed as a task) → fix loop �
     assert.ok(fixPrompt.includes('One real problem') || fixPrompt.includes('Verifier'), 'the verifier summary is included');
     const cs = await comments(h, key);
     assert.ok(cs.some((c) => c.includes('Verification failed (loop 1')));
-    assert.equal(laneOf(h, key), 'review');
+    assert.equal(laneOf(h, key), 'done');
     assert.equal(stageOf(h, key), 'ready');
     // the engine must not have treated its own bug card as a new task
     assert.equal(h.store.list().length, 1);

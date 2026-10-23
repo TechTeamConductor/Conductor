@@ -39,6 +39,7 @@ export type BoardColumn =
   | 'needs_human'
   | 'paused'
   | 'ready'
+  | 'pushed'
   | 'closed';
 
 // ───────────────────────────── LLM structured outputs ─────────────────────────────
@@ -82,7 +83,8 @@ export interface PlanItem {
   files: string[];
   criteria: string[]; // acceptance-criterion ids this item satisfies
   verification: string[];
-  parallelGroup?: string; // recorded for later parallel work; never used to schedule builds in v2.0
+  /** Peers that share this label do not wait for each other. File-disjoint builds may run together, up to `pipeline.maxParallel`. */
+  parallelGroup?: string;
 }
 /** Stored item states. `ready` is DERIVED (pending with every dependency done), never stored. */
 export type ItemState = 'pending' | 'running' | 'done' | 'failed' | 'blocked';
@@ -110,6 +112,8 @@ export interface ItemRun {
   floor?: string;
   commitSha?: string;
   note?: string;
+  /** Complete-auto rewrites already used for credential-shaped text in this item's tests or fixtures (one). */
+  fixtureRewrites?: number;
 }
 export interface TaskGraphRun {
   items: ItemRun[];
@@ -239,10 +243,14 @@ export interface Run {
   description: string; // snapshot at claim; a later edit halts the run at the next stage boundary
   descHash: string;
   repo: string; // RepoConfig.name
-  branch: string; // conductor-v2/<key-lower>
+  branch: string; // the branch the repository already had checked out; empty until the checkout is opened
   worktree: string;
   baseSha: string;
   commitSha?: string;
+  /** Set when a person pushed this ticket. The run stays done; the board shows it under Pushed. */
+  pushedAt?: number;
+  /** HEAD after that push. */
+  pushedSha?: string;
   status: RunStatus;
   next: NextStep;
   stage: StageName | null; // current or last stage
@@ -265,6 +273,8 @@ export interface Run {
   untrusted?: boolean;
   planApproved: boolean;
   approvedBy?: 'auto' | 'human';
+  /** Approved from the "Approve waiting plans" bulk action: the plan was not individually reviewed, so it gets no protected-file exemption after the build. */
+  approvedBulk?: boolean;
   planReviewDone: boolean;
   planReviewRounds: number; // revisions requested by plan review so far
   answered?: boolean; // deliverable was an answer (no code); finished without build/verify
@@ -316,6 +326,10 @@ export interface Run {
   limitPauses?: number;
   /** The episode already counted in `limitPauses` (an episode is counted once). */
   limitPausedEpisode?: number;
+  /** Complete-auto rewrites already used for credential-shaped text in tests or fixtures (one per run, single-task path). */
+  secretFixtureRewrites?: number;
+  /** Instruction for the next build: rewrite those test/fixture strings. Cleared once the prompt is built. Keeps the dirty worktree. */
+  fixtureRewriteNote?: string;
 }
 
 export interface RunMove {
@@ -600,6 +614,7 @@ export interface ApiRunSummary {
   canCleanup: boolean;
   canPark: boolean; // move the card to Backlog
   canFinish: boolean; // mark it done
+  canPush: boolean; // commit this ticket's files as the person and push the current branch
   /** Progress of the task graph, when the run has one. */
   taskProgress?: ApiGraphProgress;
   /** M8-3: the account of the current/last stage, and the last automatic move. */

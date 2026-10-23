@@ -390,6 +390,138 @@ export async function createWorktree(opts: {
   });
 }
 
+/**
+ * Use the checkout the repository already has. The branch stays whatever is checked out there.
+ * No `conductor-v2/<key>` branch and no second worktree: a later card sees the earlier card's commits.
+ */
+export async function useCurrentCheckout(opts: { repo: RepoConfig; key: string }): Promise<CreatedWorktree> {
+  assertKey(opts.key);
+  const repo = opts.repo;
+  if (!NAME_RE.test(repo.name)) throw new Error(`invalid repo name ${JSON.stringify(repo.name)}`);
+  const copyList = repo.copyFiles.map(validateCopyFile);
+  const repoRoot = await realpath(repo.path);
+  return withRepoLock(repoRoot, async () => {
+    const head = await git(repoRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (head.code !== 0 || !head.stdout.trim()) {
+      throw new Error('this repository is not on a branch; Conductor stays on the current branch and will not create one');
+    }
+    const branch = head.stdout.trim();
+    const recorded = await git(repoRoot, ['rev-parse', '--verify', '--quiet', `${baseRefFor(opts.key)}^{commit}`]);
+    const haveRecord = recorded.code === 0 && recorded.stdout.trim() !== '';
+    const baseSha = haveRecord ? recorded.stdout.trim() : await gitOk(repoRoot, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    if (!haveRecord) await gitOk(repoRoot, ['update-ref', baseRefFor(opts.key), baseSha]);
+    ensureRealDir(repoRoot, '.conductor');
+    await addToSharedExclude(repoRoot, ['/.conductor/', 'node_modules', '/.cursor/cli.json', ...copyList.map((f) => '/' + f)]);
+    return { path: repoRoot, branch, baseSha, created: false, copied: [], skipped: [] };
+  });
+}
+
+const SLOT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$/;
+
+/** Directory for one in-flight build. Detached: no `conductor-v2/<key>` branch is created. */
+export function detachedBuildPath(repo: RepoConfig, key: string, slot: string, worktreeRoot?: string): string {
+  assertKey(key);
+  if (!SLOT_RE.test(slot)) throw new Error(`invalid build slot ${JSON.stringify(slot)}`);
+  if (!NAME_RE.test(repo.name)) throw new Error(`invalid repo name ${JSON.stringify(repo.name)}`);
+  const root = worktreeRoot ?? join(dirname(repo.path), DEFAULT_WORKTREE_DIR);
+  return join(root, repo.name, `${key}--${slot}`);
+}
+
+/**
+ * A detached worktree at `sha`, for one build. Replaces a previous directory at `dest`.
+ * Does not create a branch. Copies the repo's untracked `copyFiles` the same way a card checkout does.
+ */
+export async function openDetachedBuild(repo: RepoConfig, dest: string, sha: string): Promise<void> {
+  assertRev(sha, 'commit');
+  const copyList = (repo.copyFiles ?? []).map(validateCopyFile);
+  const repoRoot = await realpath(repo.path);
+  await withRepoLock(repoRoot, async () => {
+    await removeDetachedUnlocked(repoRoot, dest);
+    await mkdir(dirname(dest), { recursive: true });
+    await gitOk(repoRoot, ['worktree', 'add', '--detach', '--', dest, sha]);
+    ensureRealDir(dest, '.conductor');
+    await copyUntrackedFiles(repoRoot, dest, copyList);
+    // The builder's deny rule lives in the temporary directory (prepare writes it there). The checkout the run records
+    // also gets it, so the rule is still present after that directory is removed, and it stays git-excluded.
+    await writeCursorGuard(repoRoot);
+  });
+}
+
+async function removeDetachedUnlocked(repoRoot: string, dest: string): Promise<void> {
+  const all = await listWorktrees(repoRoot);
+  const main = all[0];
+  const real = await realpathLoose(dest);
+  const reg = all.find((w) => w.path === real || w.path === dest);
+  if (reg) {
+    if (main && reg.path === main.path) throw new Error('refusing to remove the main working tree');
+    await gitOk(repoRoot, ['worktree', 'remove', '--force', '--', reg.path]);
+  } else if (await exists(dest)) {
+    await rm(dest, { recursive: true, force: true });
+  }
+  await git(repoRoot, ['worktree', 'prune']);
+}
+
+/** Remove a detached build directory. Never deletes a branch. */
+export async function removeDetachedBuild(repoRoot: string, dest: string): Promise<void> {
+  const root = await realpath(repoRoot);
+  await withRepoLock(root, () => removeDetachedUnlocked(root, dest));
+}
+
+/** Porcelain lines that are only Conductor replacing a tracked `.conductor` link, or its own `.cursor` guard, do not block a merge. */
+function checkoutDirtBlocksMerge(porcelain: string): boolean {
+  for (const line of porcelain.split('\n')) {
+    if (!line.trim()) continue;
+    const path = line.slice(3).replace(/^"|"$/g, '');
+    if (path === '.conductor' || path.startsWith('.conductor/') || path === '.cursor' || path.startsWith('.cursor/')) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Merge `sha` onto the branch checked out at `repoRoot`. One merge at a time.
+ * A conflict aborts the merge and leaves the other commits in place.
+ * Fast-forwards when it can, so a single build stays that commit.
+ */
+export async function mergeOntoCurrent(repoRoot: string, sha: string): Promise<{ ok: true; sha: string } | { ok: false; detail: string }> {
+  assertRev(sha, 'commit');
+  const root = await realpath(repoRoot);
+  return withRepoLock(root, async () => {
+    const branch = await git(root, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (branch.code !== 0 || !branch.stdout.trim()) return { ok: false, detail: 'the checkout is not on a branch, so this build was not merged' };
+    const name = branch.stdout.trim();
+    const anc = await git(root, ['merge-base', '--is-ancestor', sha, 'HEAD']);
+    if (anc.code === 0) return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
+    const dirty = (await gitOk(root, ['status', '--porcelain'])).trim();
+    if (checkoutDirtBlocksMerge(dirty)) return { ok: false, detail: `the current checkout has uncommitted changes, so this build was not merged onto ${name}` };
+    const cfg = ['-c', 'commit.gpgsign=false'];
+    const nm = await git(root, ['config', '--get', 'user.name']);
+    const em = await git(root, ['config', '--get', 'user.email']);
+    if (nm.code !== 0 || !nm.stdout.trim()) cfg.push('-c', 'user.name=Conductor', '-c', 'user.email=conductor@localhost');
+    else if (em.code !== 0 || !em.stdout.trim()) cfg.push('-c', 'user.email=conductor@localhost');
+    const ff = await git(root, [...cfg, 'merge', '--ff-only', sha]);
+    if (ff.code === 0) return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
+    // A sibling build already moved the branch. Replay this commit on top so the branch stays a straight line.
+    const picked = await git(root, [...cfg, 'cherry-pick', sha]);
+    if (picked.code !== 0) {
+      const text = `${picked.stdout}\n${picked.stderr}`;
+      await git(root, ['cherry-pick', '--abort']);
+      if (/empty/i.test(text)) return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
+      return { ok: false, detail: `merging this build onto ${name} conflicted; the other files on that branch were left as they are` };
+    }
+    return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
+  });
+}
+
+/** True when `worktreePath` is the repository's own checkout (the branch it already has). */
+export async function isRepoCheckout(repoPath: string, worktreePath: string): Promise<boolean> {
+  try {
+    return (await realpath(repoPath)) === (await realpath(worktreePath));
+  } catch {
+    return false;
+  }
+}
+
 async function recordedBase(repoRoot: string, key: string, branch: string, baseBranch: string): Promise<string> {
   const ref = await git(repoRoot, ['rev-parse', '--verify', '--quiet', `${baseRefFor(key)}^{commit}`]);
   if (ref.code === 0 && ref.stdout.trim()) return ref.stdout.trim();
@@ -532,6 +664,9 @@ export async function commitAll(o: {
       await unstage();
       return { ok: false, reason: 'error', detail: `git add failed: ${redact(tail(add.stderr.trim(), 800), secrets)}` };
     }
+    // A repo that tracks `.conductor` as a symlink must not have that replacement committed (B-1). The checkout keeps a
+    // real directory; the product commit does not delete the link. Ignored copies were never staged, so a miss here is fine.
+    await git(top, ['reset', '-q', '--', '.conductor', '.cursor']);
 
     // staged files (name-status so deletions are exempt from content/name guards)
     const ns = await git(top, ['diff', '--cached', '--name-status', '-z', '--no-renames']);
@@ -856,15 +991,23 @@ export function expectedWorktreePath(repo: { name: string; path: string }, key: 
  * Throws a human-readable error otherwise.
  */
 export async function assertOwnedWorktree(repo: { name: string; path: string }, key: string, worktreePath: string, worktreeRoot?: string): Promise<void> {
-  const want = await realpathLoose(expectedWorktreePath(repo, key, worktreeRoot));
+  if (existsSync(worktreePath) && (await lstat(worktreePath)).isSymbolicLink()) {
+    throw new Error(`${worktreePath} is a symbolic link, not a checkout Conductor may use; refusing to touch it`);
+  }
+  const repoRoot = await realpathLoose(repo.path);
   const have = await realpathLoose(worktreePath);
+  // The repository's own checkout is the place a card works: whichever branch is already checked out there.
+  if (have === repoRoot) {
+    const head = await git(worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    if (head.code !== 0) throw new Error(`the checkout at ${worktreePath} is detached; Conductor stays on the current branch and will not touch it`);
+    return;
+  }
+  const want = await realpathLoose(expectedWorktreePath(repo, key, worktreeRoot));
   if (have !== want) throw new Error(`the recorded worktree is not the one Conductor v2 created for this card (${worktreePath}); refusing to touch it`);
   if (existsSync(worktreePath)) {
-    // a symlink planted at the expected path would make `have === want` while pointing at someone else's checkout (security review B-2 residual)
-    if ((await lstat(worktreePath)).isSymbolicLink()) throw new Error(`${worktreePath} is a symbolic link, not a checkout Conductor v2 created; refusing to touch it`);
     const head = await git(worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
     if (head.code !== 0) throw new Error(`the checkout at ${worktreePath} is on a detached HEAD, not ${branchFor(key)}; refusing to touch it`);
-    if (head.code === 0 && head.stdout.trim() !== branchFor(key)) throw new Error(`the checkout at ${worktreePath} is on branch ${head.stdout.trim()}, not ${branchFor(key)}; refusing to touch it`);
+    if (head.stdout.trim() !== branchFor(key)) throw new Error(`the checkout at ${worktreePath} is on branch ${head.stdout.trim()}, not ${branchFor(key)}; refusing to touch it`);
   }
 }
 
