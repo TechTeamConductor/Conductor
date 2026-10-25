@@ -143,15 +143,15 @@ test('M2: pre-commit hook rejects the first commit → the fix loop keeps loop-1
 });
 
 // ───────────── M3: no actionable problem → a human, never a blind loop ─────────────
-test('M3: verifier "fail" with only an unverifiable criterion → needs_human after ONE build (no empty-problem loops)', async () => {
-  const h = await makeHarness();
+test('M3: verifier "fail" with only an unverifiable criterion loops to Building with details, then stops at the loop limit (R2-7)', async () => {
+  const h = await makeHarness({ config: (c) => void (c.pipeline.maxLoops = 2) });
   try {
     h.scenario({ claude: { '*': { verify: [{ json: { verdict: 'fail', summary: 'The UI part cannot be checked here.', acceptance: [{ id: 'AC1', status: 'unverifiable', evidence: 'needs a browser' }], bugs: [] } }] } } });
     const key = h.issue('UI thing');
     await h.settle();
     assert.equal(h.run(key).status, 'needs_human');
-    assert.equal(h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build').length, 1, 'no second build');
-    assert.ok((await comments(h, key)).some((c) => c.includes('could not give a clean pass') && c.includes('needs a browser')));
+    assert.equal(h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build').length, 2, 'one fix loop, then the limit');
+    assert.ok((await comments(h, key)).some((c) => c.includes('loop limit')));
   } finally {
     await h.cleanup();
   }

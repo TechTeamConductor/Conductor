@@ -160,3 +160,32 @@ export const ASK_SCHEMA: Schema = {
     citations: { type: 'array', maxItems: 30, items: { type: 'object', required: ['file', 'lines'], properties: { file: str, lines: str } } },
   },
 };
+
+/**
+ * Stuck resolver: ONE typed action from a closed list. The reply is untrusted: `additionalProperties:false`, an enum action, and string
+ * caps applied by code (resolver.ts). Which fields an action needs is checked by code, never by the model.
+ */
+export const RESOLVER_ACTIONS = ['retry_stage', 'replan', 'rebuild', 'accept_baseline', 'rewrite_to_placeholder', 'revert_paths', 'exclude_from_push', 'switch_route', 'extend_budget', 'wait', 'give_up'] as const;
+export const RESOLVER_SCHEMA: Schema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['analysis', 'action'],
+  properties: {
+    analysis: { ...str, description: 'two or three sentences: what is blocking this card and why this action fixes it' },
+    action: { type: 'string', enum: [...RESOLVER_ACTIONS] },
+    origin: { type: 'string', enum: ['build', 'verify', 'plan_review', 'ship'], description: 'retry_stage only' },
+    feedback: { ...str, description: 'replan only: what the new plan must change' },
+    bugs: {
+      type: 'array',
+      maxItems: 6,
+      description: 'rebuild only: concrete problems for the builder to fix',
+      items: { type: 'object', additionalProperties: false, required: ['title', 'detail'], properties: { title: str, detail: str, file: str } },
+    },
+    paths: { ...strArr, maxItems: 20, description: 'rewrite_to_placeholder, revert_paths, exclude_from_push: repo-relative paths from this run\'s own diff' },
+    role: { ...str, description: 'switch_route only: a configured role' },
+    provider: { ...str, description: 'switch_route only: a tool already configured for that role' },
+    kind: { type: 'string', enum: ['runs', 'loops'], description: 'extend_budget only' },
+    minutes: { type: 'integer', description: 'wait only: 1 to 60' },
+    reason: { ...str, description: 'give_up only' },
+  },
+};

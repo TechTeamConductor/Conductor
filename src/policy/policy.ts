@@ -1,6 +1,8 @@
 // Approval policy (M6): who has to click. ONE decision function; the envelope and the isolation gates never depend on it.
 import type { Config, Plan } from '../types.ts';
 import { planFixtureRewrite } from '../git/fixture-hold.ts';
+import { HEAL_BUDGET, type HealCause } from '../pipeline/selfheal.ts';
+import { RESOLVER_MAX_PER_CARD } from '../pipeline/resolver-limits.ts';
 import { riskHits, type RiskHit } from './rules.ts';
 
 export type Policy = 'full-auto' | 'approve-plan' | 'approve-risky' | 'manual-stages';
@@ -41,6 +43,31 @@ export const effectiveLiftsHolds = (cfg: Config): boolean => isCompleteAuto(cfg)
 export function effectiveFixtureRewrite(cfg: Config, used: number | undefined, reason: string) {
   if (!isCompleteAuto(cfg)) return null;
   return planFixtureRewrite(used, reason);
+}
+
+/**
+ * The person accepted the Complete auto confirm that says it also pushes (`pipeline.completeAutoPushAck`, written only by PUT /api/run-mode with confirm).
+ * A config that was already in Complete auto before pushing existed does not push until that is accepted once. Ship never runs without it.
+ */
+export const pushConsentGiven = (cfg: Config): boolean => typeof cfg?.pipeline?.completeAutoPushAck === 'number' && cfg.pipeline.completeAutoPushAck > 0;
+
+/** Pushing is in effect: Complete auto AND its push confirm accepted. There is no separate switch. Ship, the claim gate and the card's push actions key off this. */
+export const effectiveShip = (cfg: Config): boolean => isCompleteAuto(cfg) && pushConsentGiven(cfg);
+
+/** Complete auto pushes finished cards by itself, so the manual Push click is refused there (Done to Pushed is automatic). */
+export const completeAutoOwnsPush = (cfg: Config): boolean => isCompleteAuto(cfg);
+
+/** Complete auto only, and only while this cause's budget (one) is unspent. Per settings never heals. Callers never name the mode. */
+export function effectiveHeal(cfg: Config, cause: HealCause, used: number | undefined): boolean {
+  return isCompleteAuto(cfg) && (used ?? 0) < HEAL_BUDGET[cause];
+}
+
+/**
+ * Stuck resolver: Complete auto only, and only while this card's invocation budget is unspent. Per settings never resolves.
+ * Callers never name the mode (same pattern as `effectiveHeal`).
+ */
+export function effectiveResolve(cfg: Config, run?: { resolverUsed?: number }): boolean {
+  return isCompleteAuto(cfg) && (run?.resolverUsed ?? 0) < RESOLVER_MAX_PER_CARD;
 }
 
 export interface ApprovalInput {

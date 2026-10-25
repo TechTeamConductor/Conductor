@@ -1,6 +1,6 @@
 // The desktop app's server process (M7b, macOS): the same runtime as `conductor start`, started by the Electron main process as a
-// utilityProcess. It binds 127.0.0.1 on port 0 and hands {port, otp} to the parent over the process's own message channel — never a fixed
-// port (a squatter could receive the one-time code), never a control socket, never a file. The parent loads the dashboard with that code.
+// utilityProcess. It binds 127.0.0.1 on port 0 and hands {port} to the parent over the process's own message channel — never a fixed
+// port, never a control socket, never a file. The parent loads the dashboard at http://127.0.0.1:<port>/.
 import { ensureHome, paths } from './paths.ts';
 import { acquireLock, LockHeldError } from './lock.ts';
 import { loadConfig } from './config.ts';
@@ -42,10 +42,9 @@ async function main(): Promise<void> {
   };
   parent!.on('message', (e) => {
     if (e.data?.type === 'quit') void shutdown();
-    if (e.data?.type === 'otp') parent!.postMessage({ type: 'otp', otp: rt.auth.mintOtp() });
   });
   process.on('SIGTERM', () => void shutdown());
-  parent!.postMessage({ type: 'ready', port, otp: rt.auth.mintOtp() });
+  parent!.postMessage({ type: 'ready', port });
 }
 main().catch((e) => {
   parent!.postMessage({ type: 'error', code: 'start-failed', message: String((e as Error)?.message ?? e).slice(0, 400) });

@@ -32,26 +32,26 @@ const COLUMNS = [
   { id: 'todo', label: 'To do', icon: 'clipboard', hint: 'Starts by itself', cards: true },
   { id: 'queued', label: 'Queued', icon: 'clock', hint: 'Waiting for a free slot' },
   { id: 'planning', label: 'Planning', icon: 'pen', hint: 'Claude writes the plan' },
-  { id: 'plan_ready', label: 'Plan ready', icon: 'clipboard', hint: 'Waiting for your approval', ask: true },
+  { id: 'plan_ready', label: 'Plan review', icon: 'clipboard', hint: 'Plan being reviewed; points go back to Planning', ask: true },
   { id: 'building', label: 'Building', icon: 'code', hint: 'Cursor writes the code' },
   { id: 'verifying', label: 'Verifying', icon: 'shield', hint: 'Gates, then Claude checks' },
-  { id: 'needs_human', label: 'Needs you', icon: 'alert', hint: 'Blocked until you act', attn: true },
-  { id: 'paused', label: 'Paused', icon: 'pause', hint: 'On hold, resumes by itself' },
-  { id: 'ready', label: 'Done', icon: 'check', hint: 'Verified. Cards that depend on it can start' },
-  { id: 'pushed', label: 'Pushed', icon: 'arrow-up', hint: 'Pushed on the branch that was already checked out' },
+  { id: 'needs_human', label: 'Stuck resolver', icon: 'alert', hint: 'Blocked — needs you', attn: true },
+  { id: 'ready', label: 'Done', icon: 'check', hint: 'Built and tested — moves to Pushed' },
+  { id: 'pushed', label: 'Pushed', icon: 'arrow-up', hint: 'On the current branch, as you, with the ticket key in the commit' },
 ];
-const MOBILE_ORDER = ['needs_human', 'plan_ready', 'paused', 'pushed', 'ready', 'building', 'verifying', 'planning', 'queued', 'todo', 'backlog'];
+const MOBILE_ORDER = ['needs_human', 'plan_ready', 'pushed', 'ready', 'building', 'verifying', 'planning', 'queued', 'todo', 'backlog'];
 const COL_BY_ID = Object.fromEntries(COLUMNS.map((c) => [c.id, c]));
 const WORKING_COLUMNS = ['planning', 'building', 'verifying'];
 const WAITING_COLUMNS = ['plan_ready', 'needs_human', 'ready'];
 
 const STATUS_LABEL = {
-  queued: 'Queued', running: 'Running', awaiting_approval: 'Plan ready', needs_human: 'Needs you', paused: 'Paused',
+  queued: 'Queued', running: 'Running', awaiting_approval: 'Plan review', needs_human: 'Stuck resolver',
   parked: 'Parked', ready: 'Done', aborted: 'Aborted', failed: 'Failed', finished: 'Finished',
 };
+const PUSH_CONSENT_CARD = 'Accept the updated Complete auto confirm once to start pushing';
 const COLUMN_ICON = {
   backlog: 'archive', todo: 'clipboard', queued: 'clock', planning: 'pen', plan_ready: 'clipboard', building: 'code', verifying: 'shield',
-  needs_human: 'alert', paused: 'pause',   ready: 'check', pushed: 'arrow-up', closed: 'archive',
+  needs_human: 'alert', ready: 'check', pushed: 'arrow-up', closed: 'archive',
 };
 const AGENT_LABEL = { claude: 'Claude', cursor: 'Cursor', conductor: 'Conductor' };
 const AGENT_ICON = { claude: 'claude', cursor: 'cursor', conductor: 'diamond' };
@@ -74,7 +74,6 @@ const S = {
   detail: null, detailKey: null, detailSig: '', detailError: null,
   verLoop: null,
   sse: { es: null, ok: false, everOpen: false, dropped: false, lastMsg: 0, attempts: 0, timer: 0, downSince: 0 },
-  expired: false,
   busy: new Set(),
   dismissed: new Set(),
   isMobile: false,
@@ -196,7 +195,7 @@ function activitySentence(r, live) {
 }
 function runLabel(run) {
   if (run.column === 'pushed') return 'Pushed';
-  return run.status === 'awaiting_approval' ? 'Plan ready' : (STATUS_LABEL[run.status] || run.status);
+  return run.status === 'awaiting_approval' ? 'Plan review' : (STATUS_LABEL[run.status] || run.status);
 }
 function statusClass(run) {
   if (run.column === 'closed') return 'st-' + (run.status === 'failed' ? 'failed' : run.status === 'finished' ? 'finished' : 'aborted');
@@ -263,37 +262,17 @@ async function api(method, path, body, retried) {
   try { res = await fetch(path, init); } catch {
     throw new ApiFail(0, 'network', "Can't reach Conductor. Is it still running? Start it with `conductor start`.");
   }
-  if (res.status === 401) {
-    showExpired();
-    throw new ApiFail(401, 'unauthorized', 'Session expired. Run `conductor open` in a terminal.');
-  }
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON body */ }
   if (!res.ok) {
     const e = data && data.error ? data.error : null;
     if (res.status === 403 && method !== 'GET' && !retried) {
       // Stale CSRF value (server restarted?): refresh state once and retry.
-      try { const st = await api('GET', '/api/state'); applyState(st, true); return api(method, path, body, true); } catch (err) { if (err instanceof ApiFail && err.status === 401) throw err; }
+      try { const st = await api('GET', '/api/state'); applyState(st, true); return api(method, path, body, true); } catch { /* fall through to the original error */ }
     }
     throw new ApiFail(res.status, e ? e.code : 'http_' + res.status, e && e.message ? e.message : `Request failed (${res.status}).`, e);
   }
   return data;
-}
-
-function showExpired() {
-  if (S.expired) return;
-  S.expired = true;
-  closeSSE();
-  for (const d of document.querySelectorAll('dialog[open]')) { try { d.close(); } catch { /* noop */ } }
-  for (const id of ['topbar', 'banners', 'main']) { const el = document.getElementById(id); if (el) el.inert = true; }
-  dropHome();
-  leaveBoard();
-  closeHomeMenus(false);
-  $('#view').replaceChildren();
-  S.view = null;
-  $('#expired').hidden = false;
-  const retry = $('#expired-retry');
-  if (retry) retry.focus();
 }
 
 /* ───────────────────────── routing ───────────────────────── */
@@ -448,7 +427,6 @@ function closeSSE() {
   S.sse.timer = 0;
 }
 function connectSSE() {
-  if (S.expired) return;
   closeSSE();
   let es;
   try { es = new EventSource('/api/events'); } catch { scheduleReconnect(); return; }
@@ -482,11 +460,11 @@ function connectSSE() {
   on('ping', (d) => { if (d.now) S.offset = d.now - Date.now(); });
 }
 function scheduleReconnect() {
-  if (S.expired || S.sse.timer) return;
+  if (S.sse.timer) return;
   const delay = Math.min(30000, 1000 * 2 ** Math.min(S.sse.attempts++, 5)) + Math.random() * 400;
   S.sse.timer = setTimeout(async () => {
     S.sse.timer = 0;
-    try { await loadState(); connectSSE(); } catch { if (!S.expired) scheduleReconnect(); }
+    try { await loadState(); connectSSE(); } catch { scheduleReconnect(); }
   }, delay);
 }
 async function resyncAfterDrop() {
@@ -589,6 +567,56 @@ function updateAcctButton(wizard) {
   HDR.acctBtn.title = lim ? (lim === 1 ? '1 account is at its usage limit' : lim + ' accounts are at their usage limit') : 'Accounts';
 }
 
+/* ───────────────────────── Push settings ─────────────────────────
+ * Pushing follows Complete auto (there is no separate switch). These controls save at once through PUT /api/auto-push
+ * (never Settings Save): the push remote and the developer identity. The server validates; the UI only shows its words. */
+async function putPushSettings(body, confirmText) {
+  if (confirmText && !(await confirmDialog({ title: 'Please confirm', body: confirmText.replace(/\s*Send "confirm": true\.\s*$/, ''), confirmLabel: 'Confirm' }))) return null;
+  try {
+    const r = await api('PUT', '/api/auto-push', confirmText ? Object.assign({ confirm: true }, body) : body);
+    if (r.settings) S.state.settings = Object.assign({}, S.state.settings, r.settings);
+    syncRunModeUi();
+    return r;
+  } catch (e) {
+    toast('error', e.message);
+    return null;
+  }
+}
+function pushSettingsPanel() {
+  const st = S.state && S.state.settings;
+  if (!st || !Array.isArray(st.pushTargets)) return null; // an older server: feature-detected, no panel
+  const rows = [];
+  for (const t of st.pushTargets) {
+    const rId = uid('apr');
+    const ri = h('input', { type: 'text', id: rId, value: t.pushRemote, maxlength: '64', spellcheck: 'false', autocomplete: 'off' });
+    const wr = { v: t.pushRemote };
+    ri.addEventListener('change', async () => {
+      if (ri.value === wr.v) return;
+      const r = await putPushSettings({ repo: t.repo, pushRemote: ri.value }, 'Change where ' + t.repo + ' pushes? In Complete auto, Conductor pushes finished work to this remote without asking you.');
+      if (r) { toast('good', 'Saved.'); wr.v = ri.value; } else ri.value = wr.v;
+    });
+    rows.push(h('fieldset', { class: 'push-target' }, h('legend', { class: 'legend' }, t.repo),
+      h('div', { class: 'row-2' }, field(rId, 'Push remote', ri, 'A remote name such as origin, never a URL. Work is pushed to the branch checked out in the repository.'))));
+  }
+  const di = st.developerIdentity;
+  const nId = uid('apn'), eId = uid('ape');
+  const ni = h('input', { type: 'text', id: nId, value: di ? di.name : '', maxlength: '100', autocomplete: 'off', placeholder: 'Your name' });
+  const ei = h('input', { type: 'email', id: eId, value: '', maxlength: '200', autocomplete: 'off', placeholder: di ? 'Currently ' + di.email + ' (type to replace)' : 'you@example.com' });
+  const saveId = h('button', { type: 'button', class: 'btn btn-sm', onclick: async () => {
+    const r = await putPushSettings({ developerIdentity: { name: ni.value, email: ei.value } }, 'Set the developer identity? Commits made as this name and email are treated as yours and will not be held for looking like an agent.');
+    if (r) { toast('good', 'Developer identity saved.'); ei.value = ''; }
+  } }, 'Save identity');
+  const clearId = h('button', { type: 'button', class: 'btn btn-sm', hidden: !di, onclick: async () => {
+    const r = await putPushSettings({ developerIdentity: null }, 'Remove the developer identity override?');
+    if (r) { toast('good', 'Developer identity removed.'); ni.value = ''; toggleHidden(clearId, true); }
+  } }, 'Remove');
+  rows.push(h('fieldset', { class: 'push-target' }, h('legend', { class: 'legend' }, 'Developer identity (optional)'),
+    h('div', { class: 'row-2' }, field(nId, 'Name', ni), field(eId, 'Email', ei)),
+    h('p', { class: 'muted' }, 'Only needed if your own name or email looks like an agent\'s (for example it contains "Claude"). Only you can set it here; no run or agent can.'),
+    h('div', { class: 'run-mode-wrap' }, saveId, clearId)));
+  return rows;
+}
+
 /* ───────────────────────── M8-5 run mode + approve waiting ───────────────────────── */
 const runModeOn = () => !!(S.state && S.state.settings && typeof S.state.settings.runMode === 'string');
 const currentRunMode = () => (S.state && ((S.state.engine && S.state.engine.runMode) || (S.state.settings && S.state.settings.runMode))) || 'per-settings';
@@ -623,7 +651,7 @@ async function setRunMode(runMode) {
   if (from === runMode) return;
   if (runMode === 'complete-auto') {
     const text = String(M.COMPLETE_AUTO_CONFIRM || '').replace(/\s*Send "confirm": true\.\s*$/, '');
-    if (!window.confirm(text)) { syncRunModeUi(); return; }
+    if (!(await confirmDialog({ title: 'Turn on Complete auto?', body: text, confirmLabel: 'Turn on' }))) { syncRunModeUi(); return; }
   }
   try {
     const body = runMode === 'complete-auto' ? { runMode, confirm: true } : { runMode };
@@ -642,7 +670,7 @@ async function setRunMode(runMode) {
     }
   } catch (e) {
     if (e instanceof ApiFail && e.code === 'confirm_required') {
-      if (window.confirm(e.message.replace(/\s*Send "confirm": true\.\s*$/, ''))) {
+      if (await confirmDialog({ title: 'Turn on Complete auto?', body: e.message.replace(/\s*Send "confirm": true\.\s*$/, ''), confirmLabel: 'Turn on' })) {
         try {
           const r = await api('PUT', '/api/run-mode', { runMode: 'complete-auto', confirm: true });
           if (r.settings) S.state.settings = Object.assign({}, S.state.settings, r.settings);
@@ -660,7 +688,22 @@ async function setRunMode(runMode) {
   }
 }
 
+/** One-time consent for pushing: re-submits the existing Complete auto control through the normal confirm dialog (no new switch or endpoint). */
+async function acceptPushConsent() {
+  const text = String(M.COMPLETE_AUTO_CONFIRM || '').replace(/\s*Send "confirm": true\.\s*$/, '');
+  if (!(await confirmDialog({ title: 'Confirm Complete auto?', body: text, confirmLabel: 'Confirm' }))) return;
+  try {
+    const r = await api('PUT', '/api/run-mode', { runMode: 'complete-auto', confirm: true });
+    if (r.settings) S.state.settings = Object.assign({}, S.state.settings, r.settings);
+    if (S.state.engine) S.state.engine.runMode = r.runMode;
+    syncRunModeUi();
+    renderLive();
+    toast('good', 'Complete auto confirmed. Finished work will now be pushed.');
+  } catch (e) { toast('error', e.message); }
+}
+
 function syncRunModeUi() {
+  if (B.consent) toggleHidden(B.consent, !(runModeOn() && currentRunMode() === 'complete-auto' && S.state.settings && S.state.settings.pushConsentNeeded === true));
   if (B.runMode) B.runMode.sync();
   if (B.approveBtn) {
     const n = waitingOf().bulkApprovable;
@@ -670,7 +713,7 @@ function syncRunModeUi() {
 }
 
 async function openApproveWaiting() {
-  try { await loadState(); } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); return; }
+  try { await loadState(); } catch (e) { toast('error', e.message); return; }
   const snap = waitingOf();
   const eligible = (snap.eligible || []).slice();
   if (!eligible.length) { toast('info', 'No plans are ready to approve from the waiting list.'); syncRunModeUi(); return; }
@@ -695,7 +738,6 @@ async function openApproveWaiting() {
       for (const s of skipped.slice(0, 8)) toast('warn', s.key + ': ' + M.skipReasonLabel(s.reason));
       loadState().catch(() => {});
     } catch (e) {
-      if (e instanceof ApiFail && e.status === 401) return;
       setText(err, e.message); err.hidden = false; setBusy(go, false);
     }
   });
@@ -797,7 +839,7 @@ async function runAction(scope, name, call, okMsg) {
   renderLive();
   let ok = false;
   try { await call(); ok = true; if (okMsg) toast('good', okMsg); }
-  catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', (e && e.message) || 'Something went wrong.'); }
+  catch (e) { toast('error', (e && e.message) || 'Something went wrong.'); }
   S.busy.delete(id);
   try { await loadState(); } catch { renderLive(); }
   if (S.detailKey) fetchDetail();
@@ -920,6 +962,14 @@ async function actPush(key) {
   });
   if (ok) await runAction(key, 'push', () => api('POST', runUrl(key, 'push')), `${key} pushed.`);
 }
+async function actUnblock(key) {
+  const ok = await confirmDialog({
+    title: `Let dependants of ${key} start?`,
+    body: 'Auto push is holding this card, so cards that depend on it are waiting for it to be pushed. This lets them start now, on the code already on your checkout. A note is added to the card. Nothing is pushed.',
+    confirmLabel: 'Unblock dependants',
+  });
+  if (ok) await runAction(key, 'unblock', () => api('POST', runUrl(key, 'unblock')), `Dependants of ${key} can start.`);
+}
 const actResume = (key) => runAction(key, 'resume', () => api('POST', runUrl(key, 'resume')), `${key} resumed.`);
 const actOpen = (key, target) => runAction(key, 'open:' + target, () => api('POST', runUrl(key, 'open'), { target }), OPEN_LABEL[target] || 'Opened');
 async function actAbort(key) {
@@ -953,9 +1003,9 @@ function loadRoles() {
   if (rolesLoading) return rolesLoading;
   rolesLoading = (async () => {
     try { S.roles = await api('GET', '/api/roles'); S.rolesErr = null; }
-    catch (e) { if (!(e instanceof ApiFail && e.status === 401)) S.rolesErr = e; }
+    catch (e) { S.rolesErr = e; }
     finally { rolesLoading = null; }
-    if (S.state && !S.expired) renderLive();
+    if (S.state) renderLive();
     return S.roles;
   })();
   return rolesLoading;
@@ -996,7 +1046,6 @@ async function applyRoleChanges(changes, sels, toolModels) {
     await loadRoles();
     return { ok: true, notices };
   } catch (e) {
-    if (e instanceof ApiFail && e.status === 401) return { ok: false, error: e.message };
     loadRoles();
     // a 409 here means the choices changed after the fresh GET: say so plainly, keep the server's text as the detail; never resend
     if (e instanceof ApiFail && e.status === 409) return { ok: false, error: 'The tool settings changed while you were editing. Reload Settings and try again.\n' + e.message };
@@ -1659,12 +1708,6 @@ function clearThread() {
   updateHome();
   if (HM.input) HM.input.focus();
 }
-/** Sign-out / expired session: nothing of the conversation stays on the page (Security U5). */
-function dropHome() {
-  for (const t of S.home.turns) { clearTimeout(t.timer); t.timer = 0; }
-  S.home = { text: '', mode: 'auto', scope: scopeInit(), repo: '', allowChange: false, menu: null, turns: [], err: '', who: null, newTopic: false };
-  HM.root = null; HM.turnEls = null;
-}
 const askPhase = (r) => (r.status === 'running' || r.status === 'paused' ? 'running' : r.status === 'done' ? 'done' : r.status === 'canceled' ? 'canceled' : 'failed');
 
 async function homeSubmit() {
@@ -1724,7 +1767,6 @@ async function homeSubmit() {
     hm.text = '';
     if (HM.input) { HM.input.value = ''; fitComposer(); }
   } catch (e) {
-    if (e instanceof ApiFail && e.status === 401) return;
     t.phase = 'error'; t.error = errText(e);
   }
   updateHome();
@@ -1738,13 +1780,12 @@ function pollTurn(t, delay) {
   clearTimeout(t.timer);
   t.timer = setTimeout(async () => {
     t.timer = 0;
-    if (!S.home.turns.includes(t) || S.expired) return;
+    if (!S.home.turns.includes(t)) return;
     try {
       const r = await api('GET', '/api/asks/' + enc(t.askId));
       t.rec = r; t.phase = askPhase(r);
       if (t.phase === 'running') pollTurn(t);
     } catch (e) {
-      if (e instanceof ApiFail && e.status === 401) return;
       if (e instanceof ApiFail && e.status === 404) { t.phase = 'error'; t.error = e.message; }
       else pollTurn(t, 5000); // the server is unreachable for a moment: keep watching the same question (never re-asks)
     }
@@ -1755,7 +1796,7 @@ async function stopRunningTurn() {
   const t = S.home.turns.find(stoppable);
   if (!t) return;
   if (t.phase === 'briefing') {
-    try { t.brief = await api('POST', '/api/briefs/' + enc(t.briefId) + '/cancel'); t.phase = briefPhase(t.brief); if (t.phase !== 'briefing') clearTimeout(t.timer); } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); }
+    try { t.brief = await api('POST', '/api/briefs/' + enc(t.briefId) + '/cancel'); t.phase = briefPhase(t.brief); if (t.phase !== 'briefing') clearTimeout(t.timer); } catch (e) { toast('error', e.message); }
     updateHome();
     return;
   }
@@ -1763,7 +1804,7 @@ async function stopRunningTurn() {
     const r = await api('POST', '/api/asks/' + enc(t.askId) + '/cancel');
     t.rec = r; t.phase = askPhase(r);
     if (t.phase === 'running') pollTurn(t); else clearTimeout(t.timer);
-  } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) toast('error', e.message); }
+  } catch (e) { toast('error', e.message); }
   updateHome();
 }
 async function convertTurn(t) {
@@ -1774,7 +1815,7 @@ async function convertTurn(t) {
     toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.');
     loadState().catch(() => {});
     t.rec = await api('GET', '/api/asks/' + enc(t.askId));
-  } catch (e) { if (!(e instanceof ApiFail && e.status === 401)) { t.convertErr = e.message; } }
+  } catch (e) { t.convertErr = e.message; }
   t.busy = false;
   updateHome();
 }
@@ -1978,13 +2019,12 @@ function pollBrief(t, delay) {
   clearTimeout(t.timer);
   t.timer = setTimeout(async () => {
     t.timer = 0;
-    if (!S.home.turns.includes(t) || S.expired) return;
+    if (!S.home.turns.includes(t)) return;
     try {
       t.brief = await api('GET', '/api/briefs/' + enc(t.briefId));
       t.phase = briefPhase(t.brief);
       if (t.phase === 'briefing') pollBrief(t);
     } catch (e) {
-      if (e instanceof ApiFail && e.status === 401) return;
       if (e instanceof ApiFail && e.status === 404) { t.phase = 'error'; t.error = e.message; }
       else pollBrief(t, 5000); // a moment without the server: keep watching the same brief (never re-sends)
     }
@@ -2105,7 +2145,6 @@ async function sendBrief(t, body) {
     }
     loadState().catch(() => {});
   } catch (e) {
-    if (e instanceof ApiFail && e.status === 401) return;
     t.sendErr = errText(e);
     try { t.brief = await api('GET', '/api/briefs/' + enc(t.briefId)); t.phase = briefPhase(t.brief); } catch { /* keep the last known brief */ }
   }
@@ -2113,7 +2152,7 @@ async function sendBrief(t, body) {
   updateHome();
 }
 async function discardBrief(t) {
-  try { await api('DELETE', '/api/briefs/' + enc(t.briefId)); } catch (e) { if (e instanceof ApiFail && e.status === 401) return; if (!(e instanceof ApiFail && e.status === 404)) { t.sendErr = e.message; updateHome(); return; } }
+  try { await api('DELETE', '/api/briefs/' + enc(t.briefId)); } catch (e) { if (!(e instanceof ApiFail && e.status === 404)) { t.sendErr = e.message; updateHome(); return; } }
   clearTimeout(t.timer);
   S.home.turns = S.home.turns.filter((x) => x !== t);
   updateHome();
@@ -2131,6 +2170,9 @@ function buildBoardView() {
   B.items = h('div', { class: 'summary-items' });
   B.polled = h('span', { class: 'sum-quiet' });
   B.runMode = runModeOn() ? runModeSeg() : null;
+  B.consentBtn = h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: () => acceptPushConsent() }, 'Confirm Complete auto');
+  B.consent = h('div', { class: 'banner b-warn push-consent', role: 'status', hidden: true },
+    h('span', null, 'Complete auto is on by default: it approves and builds plans, including protected files and large changes, without asking. Nothing is pushed until you confirm once. To use Per settings instead, switch the run mode.'), B.consentBtn);
   B.approveLbl = h('span', null, 'Approve waiting plans');
   B.approveBtn = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => openApproveWaiting() }, icon('tick'), B.approveLbl);
   B.summary = h('div', { class: 'summary' },
@@ -2157,7 +2199,7 @@ function buildBoardView() {
     h('ol', { class: 'how' },
       h('li', null, 'Press ', h('b', null, 'New task'), ' and describe what you want.'),
       h('li', null, 'Conductor picks it up straight away: the card moves through the stages by itself.'),
-      h('li', null, 'You only step in when a card says ', h('b', null, 'Needs you'), (B.howTail = h('span')), '.')),
+      h('li', null, 'You only step in when a card says ', h('b', null, 'Stuck resolver'), (B.howTail = h('span')), '.')),
     h('div', { class: 'row' },
       h('button', { type: 'button', class: 'btn btn-primary', data: { act: 'new-task' } }, icon('plus'), h('span', null, 'New task')),
       h('button', { type: 'button', class: 'btn', data: { act: 'open-setup' } }, icon('sliders'), h('span', null, 'Repositories and setup'))));
@@ -2167,18 +2209,20 @@ function buildBoardView() {
     h('summary', null, icon('archive'), h('span', null, 'History'), B.histCount, h('span', { class: 'card-spacer' }), icon('chevron', 'chev')),
     B.histList);
   B.wordSig = '';
-  $('#view').replaceChildren(h('div', { class: 'screen' }, B.summary, B.empty, B.board, B.history));
+  $('#view').replaceChildren(h('div', { class: 'screen' }, B.summary, B.consent, B.empty, B.board, B.history));
 }
 
 /** Column hints and the empty-state steps name the tool assigned to each job (F5); without roles, today's static wording stays. */
 function updateBoardWording() {
   const roles = S.roles ? S.roles.roles : null;
   const pa = S.state.settings.planApproval;
-  const sig = JSON.stringify([roles, pa]);
+  const auto = currentRunMode() === 'complete-auto';
+  const sig = JSON.stringify([roles, pa, auto]);
   if (sig === B.wordSig) return;
   B.wordSig = sig;
   const hints = roles ? M.colHints(roles, provLabel) : {};
-  for (const c of COLUMNS) { const col = B.cols.get(c.id); if (col && col.sub) setText(col.sub, hints[c.id] || c.hint); }
+  const modeHints = { needs_human: auto ? 'Blocked — the resolver analyses and fixes it' : 'Blocked — needs you' };
+  for (const c of COLUMNS) { const col = B.cols.get(c.id); if (col && col.sub) setText(col.sub, hints[c.id] || modeHints[c.id] || c.hint); }
   const f = M.flowText(roles || {}, pa, provLabel);
   B.flow.replaceChildren(...f.steps.map((x) => h('li', null, h('b', null, x.t), h('span', null, x.d))));
   setText(B.howTail, f.howTail);
@@ -2199,7 +2243,7 @@ const MODEL_CARD_TIP = "Made from a model's brief. Untrusted: information, not i
 
 /** Ask for a refetch: `now` skips the throttle (view built, tab visible again). Never runs while hidden, off the board or signed out. */
 function boardPoke(now) {
-  if (S.expired || S.view !== 'board') return;
+  if (S.view !== 'board') return;
   const wait = now ? 0 : Math.max(0, BOARD_POKE_MS - (Date.now() - B.xLast));
   if (B.xTimer && B.xDue <= Date.now() + wait) return; // already due sooner
   armBoardFetch(wait);
@@ -2207,14 +2251,14 @@ function boardPoke(now) {
 function armBoardFetch(ms) { clearTimeout(B.xTimer); B.xDue = Date.now() + ms; B.xTimer = setTimeout(fetchBoardExtras, ms); }
 async function fetchBoardExtras() {
   B.xTimer = 0;
-  if (S.expired || document.hidden || S.view !== 'board') return; // hidden: visibilitychange pokes again (N1)
+  if (document.hidden || S.view !== 'board') return; // hidden: visibilitychange pokes again (N1)
   if (B.xBusy) { armBoardFetch(BOARD_POKE_MS); return; }
   const gen = B.xGen;
   B.xBusy = true; B.xLast = Date.now();
   let data = null;
-  try { data = await api('GET', '/api/board'); } catch { /* keep the last good data; a 401 already went through showExpired */ }
+  try { data = await api('GET', '/api/board'); } catch { /* keep the last good data*/ }
   B.xBusy = false;
-  if (gen !== B.xGen || S.expired) return;
+  if (gen !== B.xGen) return;
   if (data) { B.extra = M.boardExtras(data); if (S.view === 'board' && S.state) updateBoard(); }
   const active = B.extra && B.extra.research.planning.length > 0;
   if (!B.xTimer && S.view === 'board') armBoardFetch(active ? BOARD_FAST_MS : BOARD_SLOW_MS);
@@ -2430,11 +2474,10 @@ function updateSummary(byCol, extra, rx) {
   const n = (id) => byCol.get(id).length + ((extra && extra.get(id)) || []).length + ((rx && rx.get(id)) || []).length;
   const working = n('planning') + n('building') + n('verifying');
   const items = [];
-  if (n('needs_human')) items.push({ col: 'needs_human', cls: 'st-needs_human', ic: 'alert', n: n('needs_human'), text: n('needs_human') === 1 ? 'needs you' : 'need you' });
-  if (n('plan_ready')) items.push({ col: 'plan_ready', cls: 'st-plan_ready', ic: 'clipboard', n: n('plan_ready'), text: n('plan_ready') === 1 ? 'plan to approve' : 'plans to approve' });
+  if (n('needs_human')) items.push({ col: 'needs_human', cls: 'st-needs_human', ic: 'alert', n: n('needs_human'), text: 'in Stuck resolver' });
+  if (n('plan_ready')) items.push({ col: 'plan_ready', cls: 'st-plan_ready', ic: 'clipboard', n: n('plan_ready'), text: 'in Plan review' });
   if (n('ready')) items.push({ col: 'ready', cls: 'st-ready', ic: 'check', n: n('ready'), text: 'done' });
   if (working) items.push({ col: working === n('building') ? 'building' : 'planning', cls: 'st-building', ic: 'code', n: working, text: 'working' });
-  if (n('paused')) items.push({ col: 'paused', cls: 'st-paused', ic: 'pause', n: n('paused'), text: 'paused' });
   if (n('queued')) items.push({ col: 'queued', cls: 'st-queued', ic: 'clock', n: n('queued'), text: 'queued' });
   const sig = JSON.stringify(items);
   if (sig !== B.itemsSig) {
@@ -2496,7 +2539,9 @@ function createCard(key) {
   // M8-3: the account of the current/last stage (only when its tool has several) and the last automatic move (N5 wording)
   p.acctT = h('span'); p.acct = h('span', { class: 'chip', hidden: true }, icon('lock'), p.acctT);
   p.movedT = h('span'); p.moved = h('span', { class: 'chip', hidden: true }, icon('repeat'), p.movedT);
-  p.meta = h('div', { class: 'card-meta' }, p.dc.part, p.dc.model, p.repo, p.acct, p.moved, p.loop, p.bugs, p.unv);
+  p.badgeT = h('span');
+  p.badge = h('span', { class: 'badge tone-warn', hidden: true }, icon('alert'), p.badgeT);
+  p.meta = h('div', { class: 'card-meta' }, p.dc.part, p.dc.model, p.repo, p.acct, p.moved, p.loop, p.bugs, p.unv, p.badge);
   p.bApprove = h('button', { type: 'button', class: 'btn btn-primary btn-sm', hidden: true, data: { act: 'approve' } }, icon('tick'), h('span', null, 'Approve plan'));
   p.bRetry = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'retry' } }, icon('refresh'), h('span', null, 'Retry'));
   p.bResume = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, data: { act: 'resume' } }, icon('play'), h('span', null, 'Resume now'));
@@ -2540,14 +2585,17 @@ function updateCard(el, r) {
   const icKey = working ? 'dot' : r.column;
   if (p._ic !== icKey) { p._ic = icKey; p.ic.replaceChildren(working ? h('span', { class: 'dot pulse' }) : icon(COLUMN_ICON[r.column] || 'info')); }
   if (live) { setText(p.lbl, ''); setTimer(p.timer, 't0', r.stageStartedAt); toggleHidden(p.tail, false); }
-  else if (r.column === 'paused' && r.pausedUntil) { setText(p.lbl, 'resumes in '); setTimer(p.timer, 't1', r.pausedUntil); toggleHidden(p.tail, false); }
+  else if (r.status === 'paused' && r.pausedUntil) { setText(p.lbl, 'resumes in '); setTimer(p.timer, 't1', r.pausedUntil); toggleHidden(p.tail, false); }
   else if (WAITING_COLUMNS.includes(r.column) && r.updatedAt) { setText(p.lbl, 'waiting '); setTimer(p.timer, 't0', r.updatedAt); toggleHidden(p.tail, false); }
   else toggleHidden(p.tail, true);
 
-  const reason = r.column === 'needs_human' && r.needsHuman ? r.needsHuman.reason : '';
+  const consentHold = r.column === 'ready' && !!(S.state.settings && S.state.settings.pushConsentNeeded) && currentRunMode() === 'complete-auto';
+  const reason = (r.column === 'needs_human' && r.needsHuman ? r.needsHuman.reason : '') || (consentHold ? PUSH_CONSENT_CARD : '') || M.shipHoldText(r);
+  const cardBadge = r.status === 'parked' ? 'Parked by you — move it to To do' : r.status === 'awaiting_approval' ? 'Needs your approval' : '';
+  setText(p.badgeT, cardBadge); toggleHidden(p.badge, !cardBadge);
   setText(p.reason, reason); toggleHidden(p.reason, !reason);
 
-  const showLoop = r.loop > 0 && r.maxLoops > 0 && ['building', 'verifying', 'needs_human', 'ready', 'paused'].includes(r.column);
+  const showLoop = r.loop > 0 && r.maxLoops > 0 && ['building', 'verifying', 'needs_human', 'ready'].includes(r.column);
   toggleHidden(p.loop, !showLoop);
   if (showLoop) setText(p.loopT, `Loop ${r.loop}/${r.maxLoops}`);
   toggleHidden(p.bugs, !(r.bugsOpen > 0));
@@ -2560,7 +2608,7 @@ function updateCard(el, r) {
   const mv = r.moved && !['ready', 'closed'].includes(r.column) ? M.movedChip(r.moved) : null;
   toggleHidden(p.moved, !mv);
   if (mv) { setText(p.movedT, mv.label); p.moved.title = mv.title; }
-  toggleHidden(p.meta, p.dc.part.hidden && p.dc.model.hidden && p.repo.hidden && p.acct.hidden && p.moved.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden);
+  toggleHidden(p.meta, p.dc.part.hidden && p.dc.model.hidden && p.repo.hidden && p.acct.hidden && p.moved.hidden && p.loop.hidden && p.bugs.hidden && p.unv.hidden && p.badge.hidden);
 
   const showApprove = !!r.canApprove;
   const showRetry = !!r.canRetry && r.column === 'needs_human';
@@ -2735,7 +2783,7 @@ async function fetchDetail() {
     updateLogStatus();
     if (changed) renderDetailPanels();
   } catch (e) {
-    if (S.detailKey !== key || (e instanceof ApiFail && e.status === 401)) return;
+    if (S.detailKey !== key) return;
     S.detailError = e;
     fillPanel('overview', detailErrorNode(e));
   } finally {
@@ -2788,7 +2836,7 @@ function activityNodes(r) {
   const live = working && r.stageStartedAt;
   const out = [activitySentence(r, live)];
   if (live) out.push(' · ', h('span', { class: 't-elapsed', data: { t0: r.stageStartedAt } }, ''));
-  else if (r.column === 'paused' && r.pausedUntil) out.push(' · resumes in ', h('span', { class: 't-until', data: { t1: r.pausedUntil } }, ''));
+  else if (r.status === 'paused' && r.pausedUntil) out.push(' · resumes in ', h('span', { class: 't-until', data: { t1: r.pausedUntil } }, ''));
   else if (WAITING_COLUMNS.includes(r.column) && r.updatedAt) out.push(' · waiting ', h('span', { class: 't-elapsed', data: { t0: r.updatedAt } }, ''));
   return out;
 }
@@ -2799,9 +2847,9 @@ function retryLabel(r) {
   return map[o] || 'Retry';
 }
 function nextAction(r) {
-  if (r.column === 'pushed') return 'Pushed on the branch that was already checked out, as you. Only this ticket’s files were committed.';
+  if (r.column === 'pushed') return 'Pushed' + (r.pushedBranch ? ' to ' + r.pushedBranch : ' on the current branch') + ', as you, with the ticket key in the commit.';
   switch (r.status) {
-    case 'awaiting_approval': return 'Read the plan, then approve it so Cursor can start building.';
+    case 'awaiting_approval': return 'Plan review: read the plan, then approve it so Cursor can start building.';
     case 'needs_human': return r.needsHuman ? `Sort out the blocker below, then press ${retryLabel(r)}.` : 'Check the run, then press Retry.';
     case 'ready': return `Done${r.unverified ? '. Look closely: this run is unverified' : ''}. Press Push to commit only this ticket’s files as you and push the branch already checked out. The branch is not switched or merged.`;
     case 'paused': return r.pausedUntil ? `On hold by a usage limit. It resumes automatically at ${fmtWhen(r.pausedUntil)}, or press Resume now to try immediately.` : 'On hold by a usage limit. It resumes automatically.';
@@ -2832,13 +2880,14 @@ function renderOverview(d) {
   if (d.canPark) bar.appendChild(actBtn(d, 'move:backlog', 'Park in Backlog', 'archive', '', () => actMove(d.key, 'backlog', `${d.key} parked in Backlog.`)));
   if (d.canFinish) bar.appendChild(actBtn(d, 'move:done', 'Mark done', 'tick', '', () => actMove(d.key, 'done', `${d.key} marked done.`)));
   if (d.canPush) bar.appendChild(actBtn(d, 'push', 'Push', 'arrow-up', 'btn-primary', () => actPush(d.key)));
+  if (d.canUnblockDependants) bar.appendChild(actBtn(d, 'unblock', 'Unblock dependants', 'play', '', () => actUnblock(d.key)));
   if (d.canCleanup) bar.appendChild(actBtn(d, 'cleanup', 'Remove worktree', 'folder', '', () => actCleanup(d.key)));
   if (d.canAbort) bar.appendChild(actBtn(d, 'abort', 'Abort run', 'x-circle', 'btn-danger', () => actAbort(d.key)));
   root.appendChild(bar);
 
   if (d.needsHuman) {
     root.appendChild(h('div', { class: 'callout c-bad' }, icon('alert'), h('div', { class: 'callout-body' },
-      h('b', null, 'Needs you'), h('div', { class: 'pre' }, d.needsHuman.reason),
+      h('b', null, 'Stuck resolver'), h('div', { class: 'pre' }, d.needsHuman.reason),
       h('p', { class: 'muted' }, 'Stopped before: ' + (d.needsHuman.origin === 'approval' ? 'approval' : STAGE_LABEL[d.needsHuman.origin] || d.needsHuman.origin)))));
   }
   if (d.status === 'paused' && d.pausedUntil) {
@@ -3064,7 +3113,7 @@ async function loadBacklog(key) {
     updateLogChrome();
     if (L.pinned) scrollLogBottom();
   } catch (e) {
-    if (L.key !== key || (e instanceof ApiFail && e.status === 401)) return;
+    if (L.key !== key) return;
     L.error = e.message;
     L.ready = true;
     updateLogChrome();
@@ -3641,7 +3690,6 @@ function openResearchReport(id, opener) {
     st.err = null; st.notFound = false; draw();
     try { st.rec = await api('GET', '/api/asks/' + enc(id)); }
     catch (e) {
-      if (e instanceof ApiFail && e.status === 401) return;
       if (e instanceof ApiFail && e.status === 404) st.notFound = true; else st.err = (e && e.message) || "Couldn't load the report.";
     }
     if (dlg.open) draw();
@@ -3649,7 +3697,7 @@ function openResearchReport(id, opener) {
   async function doDismiss() {
     st.busy = 'dismiss'; st.actErr = ''; draw();
     try { await api('POST', '/api/asks/' + enc(id) + '/dismiss', {}); toast('good', 'Report moved off the board.'); boardPoke(true); close(); return; }
-    catch (e) { if (e instanceof ApiFail && e.status === 401) return; st.actErr = (e && e.message) || 'Something went wrong.'; }
+    catch (e) { st.actErr = (e && e.message) || 'Something went wrong.'; }
     st.busy = ''; draw();
   }
   async function doConvert() {
@@ -3659,7 +3707,7 @@ function openResearchReport(id, opener) {
       toast('good', 'Created ' + c.key + ' — its plan always waits for your approval.');
       loadState().catch(() => {}); boardPoke(true);
       st.rec = await api('GET', '/api/asks/' + enc(id));
-    } catch (e) { if (e instanceof ApiFail && e.status === 401) return; st.actErr = (e && e.message) || 'Something went wrong.'; }
+    } catch (e) { st.actErr = (e && e.message) || 'Something went wrong.'; }
     st.busy = ''; draw();
   }
   draw();
@@ -3809,7 +3857,7 @@ function openSettings(focus) {
   applyOverrides();
   const setRm = runModeOn() ? runModeSeg() : null;
   const rmHint = h('p', { class: 'muted', role: 'status' },
-    'Complete auto approves and builds every plan without asking, including large changes, protected files and designed work, and at a usage limit moves to the next account then the next tool in the job\'s list. Checks still run after each build; nothing is pushed.');
+    'Complete auto approves and builds every plan without asking, including large changes, protected files and designed work, and at a usage limit moves to the next account then the next tool in the job\'s list. Checks still run after each build. Pushing is a separate switch, Auto push, below.');
   const rmApprove = h('button', { type: 'button', class: 'btn btn-sm', hidden: true, onclick: () => { $('#dlg').close(); openApproveWaiting(); } }, 'Approve waiting plans');
   const syncRmApprove = () => {
     const n = waitingOf().bulkApprovable;
@@ -3820,6 +3868,7 @@ function openSettings(focus) {
   };
   syncRmApprove();
   const accts = accountsPanel();
+  const pushPanel = pushSettingsPanel();
   const err = h('p', { class: 'err form-error', role: 'alert', hidden: true });
   const showErr = (m) => { setText(err, m); err.hidden = false; };
   const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Save changes');
@@ -3921,15 +3970,12 @@ function openSettings(focus) {
     toast('good', 'Settings saved.');
     loadState().catch(() => {});
   };
-  const signOut = h('button', { type: 'button', class: 'btn btn-ghost', onclick: async () => {
-    try { await api('POST', '/api/auth/logout'); } catch { /* cookie may already be gone */ }
-    $('#dlg').close(); showExpired();
-  } }, icon('logout'), h('span', null, 'Sign out'));
   const dlg = dlgShell('Settings', [
     ...(setRm ? [group('Run mode',
       h('div', { class: 'run-mode-wrap' }, setRm.el, rmApprove),
       rmHint,
       h('p', { class: 'muted' }, 'This switch saves at once. It is not part of Save changes below.'))] : []),
+    ...(pushPanel ? [group('Auto push', ...pushPanel)] : []),
     group('Planning',
       fld('Plan approval', c.planApproval, M.runModeOverridden((S.state.settings && S.state.settings.overriddenByRunMode) || [], 'planApproval')
         ? 'Complete auto is on: every plan approves itself and builds. Checks still run after each build.'
@@ -3946,7 +3992,7 @@ function openSettings(focus) {
       h('div', { class: 'row-2' }, fld('Fix loops', c.maxLoops, 'Build and verify rounds before Conductor asks you.'), fld('Parallel runs', c.maxParallel, 'Runs working at the same time.')),
       fld('When a repo has no tests or lint', c.noGates, 'Unverified runs are flagged on the board.')),
     err,
-  ], [signOut, h('button', { type: 'button', class: 'btn', onclick: () => { $('#dlg').close(); navigate('#/setup'); } }, icon('folder'), h('span', null, 'Repositories and setup')),
+  ], [h('button', { type: 'button', class: 'btn', onclick: () => { $('#dlg').close(); navigate('#/setup'); } }, icon('folder'), h('span', null, 'Repositories and setup')),
     h('span', { class: 'spacer' }), h('button', { type: 'button', class: 'btn', onclick: () => $('#dlg').close() }, 'Cancel'), submit], onSubmit, true);
   S._syncSettingsRunMode = syncRmApprove;
   dlg.addEventListener('close', () => { if (S._syncSettingsRunMode === syncRmApprove) delete S._syncSettingsRunMode; }, { once: true });
@@ -4134,11 +4180,11 @@ function showLoadError(e) {
     h('h1', null, "Can't load the dashboard"), h('p', null, e && e.message ? e.message : 'Conductor did not answer.'),
     h('div', { class: 'row' }, btn('Try again', { cls: 'btn-primary', icon: 'refresh', onclick: () => boot() }))));
   clearTimeout(showLoadError.t);
-  showLoadError.t = setTimeout(() => { if (S.view === 'error' && !S.expired) boot(); }, 6000);
+  showLoadError.t = setTimeout(() => { if (S.view === 'error') boot(); }, 6000);
 }
 async function boot() {
   try { await loadState(); connectSSE(); }
-  catch (e) { if (!S.expired) showLoadError(e); }
+  catch (e) { showLoadError(e); }
 }
 function init() {
   const mq = matchMedia('(max-width: 640px)');
@@ -4152,13 +4198,11 @@ function init() {
   drawer.addEventListener('cancel', (e) => { e.preventDefault(); closeRoute(); });
   drawer.addEventListener('click', (e) => { if (e.target === drawer) closeRoute(); });
   drawer.addEventListener('close', () => { if (D.silent) { D.silent = false; return; } if (S.route.key) closeRoute(); });
-  $('#expired-copy').addEventListener('click', async () => { const ok = await copyText('conductor open'); toast(ok ? 'good' : 'warn', ok ? 'Copied. Paste it in a terminal.' : "Couldn't copy. Type it in a terminal."); });
-  $('#expired-retry').addEventListener('click', () => location.reload());
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && S.state && !S.expired) { loadState().catch(() => {}); if (S.view === 'board') boardPoke(true); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && S.state) { loadState().catch(() => {}); if (S.view === 'board') boardPoke(true); } });
   setInterval(tick, 1000);
-  setInterval(() => { if (!document.hidden && S.state && !S.expired) loadState().catch(() => {}); }, STATE_POLL_MS);
+  setInterval(() => { if (!document.hidden && S.state) loadState().catch(() => {}); }, STATE_POLL_MS);
   setInterval(() => {
-    if (S.expired || !S.sse.es || !S.sse.ok) return;
+    if (!S.sse.es || !S.sse.ok) return;
     if (Date.now() - S.sse.lastMsg > SSE_DEAD_MS) {
       S.sse.dropped = true; S.sse.downSince = Date.now();
       closeSSE(); renderConn(); scheduleReconnect();

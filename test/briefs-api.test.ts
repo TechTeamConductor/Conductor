@@ -15,7 +15,7 @@ import { rmSync } from 'node:fs';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 function apiFor(h: Harness, kit?: ReturnType<typeof briefKit>) {
   const health = async () => ({ claude: { found: true, ok: true, detail: '' }, cursor: { found: true, ok: true, detail: '' }, codex: { found: false, ok: false, detail: '' }, warnings: [] }) as any;
-  const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: { csrf: 'x' } as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health, probe: async () => ({ ok: true, detail: '', durationMs: 1 }), ...(kit ? { briefs: kit.briefs, asks: kit.asks } : {}) });
+  const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health, probe: async () => ({ ok: true, detail: '', durationMs: 1 }), ...(kit ? { briefs: kit.briefs, asks: kit.asks } : {}) });
   const call = (m: string, p: string, b: any = {}) => api.handle(m, p, new URLSearchParams(), b) as Promise<any>;
   return { api, call };
 }
@@ -142,7 +142,6 @@ test('S9 static: the actor literal "design" is written only from src/board/*, sr
 // ─────────────── T8: CSRF / Sec-Fetch on every new mutation, over real HTTP ───────────────
 let demo: DemoHandle;
 let port = 0;
-let cookie = '';
 let csrf = '';
 function raw(path: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
@@ -159,11 +158,7 @@ function raw(path: string, opts: { method?: string; headers?: Record<string, str
 before(async () => {
   demo = await startDemo({ port: 0, pollMs: 60_000, delayMs: 15 });
   port = demo.rt.server.listeningPort;
-  const url = new URL(demo.rt.server.loginUrl());
-  const r = await new Promise<http.IncomingMessage>((res) => http.get({ host: '127.0.0.1', port, path: url.pathname + url.search }, res));
-  cookie = String(r.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
-  r.resume();
-  csrf = JSON.parse((await raw('/api/state', { headers: { cookie } })).text).csrf;
+  csrf = JSON.parse((await raw('/api/state')).text).csrf;
 });
 after(async () => {
   await demo.close();
@@ -175,15 +170,15 @@ test('T8: 403 without CSRF / cross-site on POST /api/briefs, cancel, send, DELET
   const routes: [string, string, unknown][] = [['POST', '/api/briefs', { kind: 'work', line: 'x' }], ['POST', `/api/briefs/${id}/cancel`, {}], ['POST', `/api/briefs/${id}/send`, { parts: ['P1'] }], ['DELETE', `/api/briefs/${id}`, undefined], ['POST', '/api/asks/ask-0123456789abcdef/dismiss', {}]];
   for (const [method, path, b] of routes) {
     const body = b === undefined ? undefined : JSON.stringify(b);
-    const base = { cookie, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' };
+    const base = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' };
     assert.equal((await raw(path, { method, headers: base, body })).status, 403, `${method} ${path}: no CSRF`);
     assert.equal((await raw(path, { method, headers: { ...base, 'x-conductor-csrf': csrf, 'sec-fetch-site': 'cross-site' }, body })).status, 403, `${method} ${path}: cross-site`);
     const ok = await raw(path, { method, headers: { ...base, 'x-conductor-csrf': csrf }, body });
     assert.notEqual(ok.status, 403, `${method} ${path}: with CSRF`);
   }
-  const st = JSON.parse((await raw('/api/state', { headers: { cookie } })).text);
+  const st = JSON.parse((await raw('/api/state')).text);
   assert.equal(st.home.design, true);
-  const bad = await raw('/api/briefs', { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', 'x-conductor-csrf': csrf }, body: JSON.stringify({ kind: 'work', line: 'x', repo: 'nope' }) });
+  const bad = await raw('/api/briefs', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', 'x-conductor-csrf': csrf }, body: JSON.stringify({ kind: 'work', line: 'x', repo: 'nope' }) });
   assert.equal(bad.status, 400);
   assert.equal(JSON.parse(bad.text).error.code, 'bad_request');
 });

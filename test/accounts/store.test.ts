@@ -64,7 +64,7 @@ test('load/save of a v6 file takes a pre-upgrade backup first, then writes v7 wi
 });
 
 test('C1: effectiveLimitRule reads the stored rule (default switch); the settings view has both fields; PUT edits only limitRule; onClaudeLimit still edits the chains (D-C)', () => {
-  const cfg = normalizeConfig({ pipeline: { limitRule: 'same' } });
+  const cfg = normalizeConfig({ pipeline: { limitRule: 'same', runMode: 'per-settings' } });
   assert.equal(effectiveLimitRule(cfg), 'same');
   assert.equal(normalizeConfig({ pipeline: { limitRule: 'bogus' } }).pipeline.limitRule, 'switch');
   const s = toSettings(cfg);

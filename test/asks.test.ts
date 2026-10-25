@@ -138,7 +138,7 @@ test('Quick Ask API: strict body (unknown fields, createdBy/fastPath rejected), 
   const h = await makeHarness();
   try {
     const asks = await svc(h);
-    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     const call = (m: string, p: string, b: any = {}) => api.handle(m, p, new URLSearchParams(), b);
     for (const bad of [{ question: 'q', createdBy: 'user' }, { question: 'q', fastPath: true }, { question: 'q', autoStart: true }, { question: 'q', allowChange: 'yes' }]) await assert.rejects(call('POST', '/api/ask', bad), (e: any) => e.status === 400);
     const r: any = await call('POST', '/api/ask', { question: 'What is this?' });

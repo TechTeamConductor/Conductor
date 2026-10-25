@@ -2,7 +2,7 @@
 
 **One dashboard for Claude Code and Cursor, with its own board.** Create a task → **Claude plans it** → **Cursor builds it** → **Claude independently verifies it** → bugs go back to Cursor, automatically, until it passes (or asks you).
 
-You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer. **The builder never pushes, and Conductor does not switch or merge branches.** When a card is Done, **Pushed** commits only that ticket’s files as you and pushes the branch already checked out. There is no external tracker: the board is built in and stored locally.
+You do the thinking; Conductor does the shuffling between the two tools. Everything runs on your computer. **The builder never pushes, and Conductor does not switch or merge branches.** **Ship** is the only code that pushes. Under **Complete auto**, once you have accepted the Complete auto confirmation (asked once), Ship pushes each finished card to the branch currently checked out in the repository, on that repository’s push remote (default `origin`), by commit id, as the git name and email you had configured before the build started, with the ticket key at the start of every commit subject. It never pushes to your default branch, a protected name (`main`, `master`, `develop`, `release…`), a detached HEAD, or by force; if the checked-out branch cannot be used (protected, default, detached, or the remote has moved on) it pushes to `conductor/<branch>` instead and the card says where it went. Only commits Conductor made are pushed, after the secret and protected-file scans. Outside Complete auto nothing is pushed until you click **Push** on a Done card, which goes through the same Ship checks. A card that cannot be pushed (no remote, a secret-looking value, a commit of your own below it, an agent name) stays **Done** and says why on the card; **Retry** tries the push again, and **Unblock dependants** lets waiting cards start anyway. To stop a repository from ever pushing, set its push remote to none. There is no external tracker: the board is built in and stored locally.
 
 > **Status.** Built: the native board (no Linear), versioned data with backups, side-by-side import of v1 data, roles and providers, model and effort per job, model discovery, task graphs, a project-context engine, Quick Ask / Deep Research, approval policies, several accounts per tool, run mode, "Design the work", one-command installers for macOS (supported) and Windows / Linux (experimental). Not built: signed desktop apps, Codex as a builder, sign-in for extra accounts. See the [README](../README.md) for the overview.
 
@@ -14,8 +14,8 @@ Task card (To do)
    ▼  Cursor — builds in an isolated worktree
    ▼  Gates (your tests/lint/typecheck) — deterministic ground truth
    ▼  Claude — independent verifier (read-only): acceptance criteria → evidence, bugs
-   │      └─ fail → bug cards on the board → back to Cursor (max 3 loops, then it asks you)
-   ▼  "Ready for review" — branch + worktree waiting for you to merge
+   │      └─ fail → bug cards on the board → back to Cursor (max 3 loops, then the Stuck resolver decides)
+   ▼  Done — then Pushed: Ship pushes the checked-out branch as you (Complete auto, after your one-time consent), or you click Push
 ```
 
 ## Quick start (about 5 minutes, once)
@@ -23,8 +23,8 @@ Task card (To do)
 1. **Install Conductor** (needs Node.js 22.18 or newer). macOS, in Terminal: `curl -fsSL https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.sh | bash`. Windows (experimental), in PowerShell: `irm https://github.com/TechTeamConductor/Conductor/releases/latest/download/install.ps1 | iex`. Update later with `conductor update` (or run the same command again); `conductor stop` / `conductor restart` stop and restart it. Details, uninstall and pinning a version: the [README](../README.md#install) and [`DESKTOP.md`](DESKTOP.md).
 2. **Install the two CLIs and sign in** (you probably already have them): Claude Code (`claude`) and the Cursor CLI (`agent login`).
 3. **Try it without any keys:** `conductor demo` — a dashboard with scripted agents so you can click around.
-4. **Start for real:** `conductor start` — the dashboard opens in your browser and walks you through two steps: check Claude + Cursor are signed in, then add a repo folder (tests/lint are auto-detected). Open it again any time with `conductor open`.
-5. **Press New task.** That's it. Cards live on the board (Backlog · To do · the working stages · Needs you · Ready for review).
+4. **Start for real:** `conductor start` — the dashboard opens in your browser and walks you through two steps: check Claude + Cursor are signed in, then add a repo folder (tests/lint are auto-detected).
+5. **Press New task.** That's it. Cards live on the board (Backlog · To do · Queued · Planning · Plan review · Building · Verifying · Stuck resolver · Done · Pushed).
 
 Zero runtime dependencies, nothing else to install. Data lives in `~/.conductor-v2` (override with `CONDUCTOR_HOME`); the default port is 4327.
 
@@ -41,7 +41,7 @@ conductor migrate            # dry run: shows exactly what would be imported, wr
 conductor migrate --apply    # creates ~/.conductor-v2 (built aside, then one rename) and a backup copy in ~/.conductor-backups (kept until YOU delete it; it holds your v1 run records and plan/verdict files)
 ```
 
-Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still active in v1 shows up as **Needs you** — v2 never starts the same work twice; press Retry to run it in v2. **Every imported card is treated as unverified text**: v1's approval is dropped, and when you press Retry (or move it to To do) it starts again at the **plan**, which waits for your approval before anything is built. The dry run also lists exactly what the imported settings will *run* on your machine (gate and setup commands, agent binaries, environment variables, copied files) — only migrate a folder you created. Files over 50 MB, symlinks and non-regular files in the v1 folder are skipped with a warning, never read. Nothing is ever written to Linear, and your old Linear key stays in the macOS Keychain until you delete it yourself.
+Every v1 run becomes a card (keys kept, e.g. `BAR-363`). Anything that was still active in v1 shows up in **Stuck resolver** — v2 never starts the same work twice; press Retry to run it in v2. **Every imported card is treated as unverified text**: v1's approval is dropped, and when you press Retry (or move it to To do) it starts again at the **plan**, which waits for your approval before anything is built. The dry run also lists exactly what the imported settings will *run* on your machine (gate and setup commands, agent binaries, environment variables, copied files) — only migrate a folder you created. Files over 50 MB, symlinks and non-regular files in the v1 folder are skipped with a warning, never read. Nothing is ever written to Linear, and your old Linear key stays in the macOS Keychain until you delete it yourself.
 
 ## Everyday use
 
@@ -80,7 +80,7 @@ Every job has a **role** (planning, review, verification, implementation, debugg
 
 ## Safety model (read this once)
 
-- **Local only.** The dashboard listens on `127.0.0.1` only and needs a one-time sign-in link (`conductor open`). The sign-in code never appears on a command line.
+- **Local only.** The dashboard listens on `127.0.0.1` only and has **no login**: any process or user on this machine can use it, including the Complete auto switch and the push remote (`confirm` is friction, not authentication). Websites in your browser are blocked by `Host`/`Origin` checks and a CSRF header. Do not run Conductor on a shared machine.
 - **Claude stages are locked down:** read-only (`Read`, `Grep`, `Glob`), no MCP servers, no skills/plugins, your global Claude rules are not loaded, credential files are denied. Conductor checks this on every run and refuses to continue if the session is not what it asked for.
 - **Cursor builds with `--force`** inside a dedicated git worktree in a **v2-only namespace** (`conductor-v2/<key>` branches, `refs/conductor-v2/…`, `.conductor-v2-worktrees`), so v1 and v2 can never touch each other's checkouts. It cannot push (deny rule + environment), but — like any coding agent — it can run commands as you. Only register repos you trust.
 - **The builder cannot leave things behind:** git hooks/config are snapshotted and restored around every build; the whole branch (including commits the agent made itself) is scanned for secrets and for changes to protected files (`.claude/`, `.cursor/`, `AGENTS.md`, CI config, …), which are held for you.
@@ -97,7 +97,6 @@ Settings → "Accounts and limits", or `conductor accounts list | add <claude|cu
 
 ```
 conductor start            run + open the dashboard   (--no-open, --port <n>)
-conductor open             open a fresh signed-in tab while it's running
 conductor stop             stop the running Conductor and free its port   (--port <n>: the Conductor on that port, --force)
 conductor restart          stop it and start it again on the same port
 conductor update           update to the latest release   (--check only reports; stop Conductor first)
@@ -119,3 +118,21 @@ npm run test:live          LIVE=1 tests against the real Cursor CLI (uses a litt
 ```
 
 More: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) · [`API.md`](API.md) · [`DESKTOP.md`](DESKTOP.md)
+
+## Stuck resolver, in short
+
+- Under **Complete auto**, a card that would stop (the verifier cannot pass because the repo was already red, a merge refused over untracked files, a test fixture flagged as a secret, an empty build, a loop limit) first goes to the **Stuck resolver**. It asks a read-only model what is wrong and applies **one action from a closed list**: retry a stage, replan, rebuild with named bugs, accept a red baseline, rewrite a flagged fixture to a placeholder, revert or exclude paths from the run's own diff, switch to another configured tool or account, extend a budget once, wait up to 60 minutes, or give up.
+- It is bounded: at most 3 resolver runs per card (1 per cause and stage, 2 per cause), 12 per hour across all cards, and a `give_up` leaves the card in the **Stuck resolver** column with the analysis until you act. Under **Per settings** the resolver never runs and the card stops as before.
+- It fixes the cause and never turns a safety check off. It cannot touch the scan, your git identity, the push target or any setting, cannot move a card to Done or Pushed, and never resumes a card you parked.
+- Things only you can supply (an expired sign-in, no git identity, no network) stay in the column with the exact reason and are retried automatically.
+
+## Pushing, in short
+
+- Complete auto is on by default for a new install: it approves and builds plans, including protected files and large changes, without asking. An install that already had a config file keeps Per settings until you switch. To use Per settings, choose it in the run-mode control at the top of the board.
+- Complete auto pushes finished work only after you accept the Complete auto confirmation once (an existing install in Complete auto asks again on upgrade because the text changed). Per settings never pushes by itself.
+- It pushes the branch checked out in the repository, as you, with the ticket key in the commit subject; to `conductor/<branch>` when that branch is protected, the default, detached, or has moved on. Never by force.
+- Cards that depend on another wait until it is **Pushed**. If the push is held (no remote, scan, identity), they start on the code already on your checkout instead of waiting forever.
+- A credential-looking string that only appears in a test or fixture file does not stop the build; the push scan catches it, the fixture is rewritten to a placeholder once, and the pushed commits never contain it.
+- Your own untracked files in the checkout are never deleted, stashed or pushed, and Conductor never resets or checks out your branch. Your local branch and the remote may differ afterwards.
+- A repository with no push remote (`pushRemote` set to none) never pushes: this is the per-repository kill switch.
+- Server-side branch protection on your default branch is still recommended: a secret shape the scan does not know cannot be recalled once pushed.

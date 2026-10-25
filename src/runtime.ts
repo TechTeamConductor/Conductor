@@ -11,7 +11,6 @@ import { Agents } from './agents/provider.ts';
 import { runCodexCanary } from './agents/providers/canary.ts';
 import { Engine } from './pipeline/engine.ts';
 import { Api } from './server/api.ts';
-import { Auth } from './server/auth.ts';
 import { DashboardServer } from './server/http.ts';
 import { agentHealth, probe as doProbe, runChecks } from './doctor.ts';
 import { defaultSecretStore, dropSecret, type SecretStore } from './secrets.ts';
@@ -20,6 +19,7 @@ import type { ExecFn } from './server/open.ts';
 import { ModelService, type ModelServiceDeps } from './models/service.ts';
 import { claudeEnv, cursorEnv } from './agents/env.ts';
 import { logger } from './log.ts';
+import { randomToken } from './util.ts';
 import { AccountService } from './accounts/service.ts';
 import { effectiveLimitRule } from './accounts/limit-rule.ts';
 import { DEFAULT_ACCOUNT } from './accounts/types.ts';
@@ -58,7 +58,6 @@ export interface Runtime {
   store: RunStore;
   board: Board;
   api: Api;
-  auth: Auth;
   server: DashboardServer;
   /** Model discovery (absent when `models: false`). */
   models: ModelService | null;
@@ -74,7 +73,7 @@ export interface Runtime {
 
 export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime> {
   ensureHome();
-  const cfgRef = { current: opts.config ?? (opts.ephemeral ? normalizeConfig(defaultConfig()) : loadConfig()) };
+  const cfgRef = { current: opts.config ?? (opts.ephemeral ? normalizeConfig({ ...defaultConfig(), pipeline: { ...defaultConfig().pipeline, runMode: 'per-settings' } }) : loadConfig()) };
   const getConfig = () => cfgRef.current;
   // M8-4 B1: persist FIRST, then swap memory. A failed write (assertNotNewer, pre-upgrade backup, disk) throws before the swap, so memory
   // and disk always agree and a refused save changes nothing (every writer: settings, roles, projects, run mode).
@@ -89,7 +88,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
   void secretStore;
   const agents = opts.agents ?? new Agents(getConfig);
   const persistent = opts.persistent ?? { load: loadState, save: saveState };
-  const auth = new Auth({ persistPath: opts.ephemeral ? undefined : join(paths.runtime(), 'sessions.json') });
+  const csrf = randomToken(24);
   let serverRef: DashboardServer | null = null;
   const notify = (t: string, m: string) => {
     (opts.notify ?? osNotify)(t, m);
@@ -196,7 +195,7 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     engine,
     store,
     board,
-    auth,
+    csrf,
     version: VERSION,
     getConfig,
     saveConfig: save,
@@ -207,10 +206,10 @@ export async function createRuntime(opts: RuntimeOptions = {}): Promise<Runtime>
     openExec: opts.openExec,
     ...(models ? { models } : {}),
   });
-  const server = new DashboardServer({ api: apiRef, auth, store, engine, uiDir: opts.uiDir ?? join(ROOT, 'ui') });
+  const server = new DashboardServer({ api: apiRef, csrf, store, engine, uiDir: opts.uiDir ?? join(ROOT, 'ui') });
   serverRef = server;
   return {
-    cfgRef, engine, store, board, api: apiRef, auth, server, models, accounts,
+    cfgRef, engine, store, board, api: apiRef, server, models, accounts,
     warmUp() {
       void readAgents()
         .then((v) => {

@@ -8,7 +8,7 @@
 ![Runtime dependencies](https://img.shields.io/badge/runtime%20deps-0-5eead4)
 ![TypeScript](https://img.shields.io/badge/TypeScript-type%20stripping-3178c6?logo=typescript&logoColor=white)
 ![Local only](https://img.shields.io/badge/runs-100%25%20local-6f72ff)
-![Never pushes](https://img.shields.io/badge/git-never%20pushes%20or%20merges-e5484d)
+![Builder never pushes](https://img.shields.io/badge/git-builder%20never%20pushes-e5484d)
 ![Platform](https://img.shields.io/badge/macOS-supported-black?logo=apple)
 ![Status](https://img.shields.io/badge/status-preview-f5a524)
 
@@ -34,7 +34,7 @@
 # Conductor
 
 > **Type one line. Claude plans it, Cursor builds it, Claude checks it, and you merge it.**
-> One local dashboard that runs your AI coding CLIs as a team, with its own board, and never touches `git push`.
+> One local dashboard that runs your AI coding CLIs as a team, with its own board. The builder never pushes; only Ship, after a one-time consent, pushes finished work.
 
 You do the thinking. Conductor does the shuffling between tools: it plans, splits work into dependent tasks, builds on the **branch the repository already has checked out**, runs **your** tests as ground truth, has a **second agent verify** the result, and sends bugs back automatically, up to three times, before it asks you.
 
@@ -46,16 +46,16 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
         ▼  Cursor   builds on the repository's current branch
         ▼  Gates    your tests · lint · typecheck — deterministic, not an opinion
         ▼  Claude   verifies every acceptance criterion against evidence
-        │              └─ bugs? → bug cards → back to Cursor (max 3 loops, then it asks you)
-        ▼  Ready for review — a branch waiting for you. Conductor never merges it.
+        │              └─ bugs? → bug cards → back to Cursor (max 3 loops, then the Stuck resolver decides)
+        ▼  Done → Pushed — Ship pushes the checked-out branch as you (Complete auto, after your consent). Conductor never merges.
 ```
 
 ## Why Conductor?
 
 - **A second pair of eyes.** The tool that writes the code is never the tool that signs it off.
 - **Your tests decide.** Gates run your repo's own checks; the verifier must cite evidence, not vibes.
-- **It stays on your machine.** Loopback only, one-time sign-in link, cookie + CSRF. No cloud, no tracker, no account.
-- **Safe by construction.** The builder stays on the current branch, cannot push, and that branch is scanned for secrets and protected files before you ever see it.
+- **It stays on your machine.** Loopback only, `Host`/`Origin` checks and a CSRF header on every change. There is no login, so anything running as a local user can use the dashboard (see Security). No cloud, no tracker, no account.
+- **Safe by construction.** The builder stays on the current branch and cannot push. Finished work is scanned for secrets and protected files, and only **Ship** (after you consent once to Complete auto pushing) pushes it, to the branch you have checked out, as you, never to your default branch and never by force.
 - **Bring your own tools.** Claude Code and Cursor today; roles, models and effort are configurable per job, discovered from the CLIs themselves, never hard-coded.
 - **Zero runtime dependencies.** Plain Node. Nothing to `npm install` to run it.
 
@@ -68,11 +68,11 @@ You do the thinking. Conductor does the shuffling between tools: it plans, split
 | ❓ | **Quick Ask** | Questions about your code, answered from a read-only snapshot with file citations. No task, no worktree. "Turn into a task" when you want a change. |
 | 🧭 | **Design the work** | One line → repo check → detailed brief → up to **8 ordered parts with dependencies** → untick what you don't want → **Send N tasks** as linked cards. Always waits for your approval. |
 | 🔎 | **Deep Research** | Web-only research in an empty folder: a short brief you review, Standard or Deep depth, and a report where every source is marked **Opened**, **Listed** or **Unverified**. |
-| 🗂️ | **Native board** | Backlog · To do · working stages · Needs you · Ready for review. Task graphs, dependencies, notes, retries. No Linear. |
+| 🗂️ | **Native board** | Backlog · To do · Queued · Planning · Plan review · Building · Verifying · Stuck resolver · Done · Pushed. Task graphs, dependencies, notes, retries. No Linear. |
 | 🎛️ | **Who does what** | Seven jobs, each with a **tool · model · effort**. A "Runs as …" line shows the exact command it becomes. |
 | 🔌 | **Model discovery** | Conductor asks each CLI which models it offers, per account. Stale lists are marked, never invented. |
 | 👥 | **Several accounts per tool** | At a usage limit it moves to the next account, then the next tool *in that job's list*, or waits. Pauses and resumes by itself. |
-| ⚡ | **Run mode** | **Per settings** or **Complete auto**. Complete auto approves and builds every plan without asking, including large, protected-path and designed work. After each build the checks still run on your machine (tests, protected-file and secret scans); nothing is pushed or merged. |
+| ⚡ | **Run mode** | **Complete auto** (the default for a new install) or **Per settings**. Complete auto is on by default and nothing is pushed until you accept its one-time push confirm; an install with an existing config keeps Per settings until you switch; to use Per settings, pick it in the run-mode control. Complete auto approves and builds every plan without asking, including large, protected-path and designed work. After each build the checks still run on your machine (tests, protected-file and secret scans). A card that gets stuck goes to the **Stuck resolver**, which fixes the cause itself (bounded, never by turning a safety check off). Finished cards are pushed by **Ship** to the branch you have checked out, as you, with the ticket key in the commit subject, once you have accepted the Complete auto confirmation (asked once; a repository with no push remote never pushes). Nothing is merged. |
 | 🧠 | **Project context** | A local, incremental index of your repo so agents don't rescan it every time. Works offline. |
 | 🛡️ | **Approval policies** | `full-auto` · `approve-plan` · `approve-risky` · `manual-stages`, per project, with forced holds no setting can remove. |
 
@@ -131,7 +131,6 @@ The dashboard checks that Claude and Cursor are signed in, asks you to add a rep
 | --- | --- |
 | Data | `~/.conductor-v2` (override with `CONDUCTOR_HOME`) |
 | Port | `4327` (loopback only, `conductor start --port <n>` to change) |
-| Reopen the dashboard | `conductor open` (a fresh signed-in tab while it is running) |
 | Coming from v1? | `conductor migrate` (dry run first). v1 and v2 run side by side and v2 never writes to v1's folder |
 | Running from a clone | Contributors: `git clone`, then `npm start` / `npm run demo` / `npm run open` do the same as `conductor start` / `demo` / `open` |
 | Desktop apps | Parked for a later phase (a macOS `.dmg` and Windows `.exe` can be built by hand, see [`docs/DESKTOP.md`](docs/DESKTOP.md)) |
@@ -169,7 +168,7 @@ flowchart LR
     W --> G[Your gates<br/>tests · lint · types]
     G --> V[Claude verifies<br/>criteria → evidence]
     V -->|bugs, ≤ 3 loops| W
-    V -->|pass| D([Ready for review<br/>you merge])
+    V -->|pass| D([Done<br/>Ship pushes the current branch])
 ```
 
 **Roles, not hard-wired tools.** Every job (planning, review, verification, implementation, debugging, documentation, requirements, context, architecture, research) has an ordered list of providers. Who may hold which job is decided by **code, not a setting**: a job that writes code accepts only a tool whose no-push isolation has been proven.
@@ -188,9 +187,9 @@ Conductor assumes the model can be wrong, and that text it writes can be hostile
 
 | Rule | How |
 | --- | --- |
-| **Local only** | Listens on `127.0.0.1`, one-time sign-in link, `HttpOnly` cookie, CSRF on every change. |
+| **Local only** | Listens on `127.0.0.1`, `Host` and `Origin` checks, CSRF on every change. **No login:** any local process or user can use the dashboard, including the Complete auto switch and the push remote (`confirm` is friction, not authentication). Do not run it on a shared machine. |
 | **Read-only stages stay read-only** | Claude runs with `Read`, `Grep`, `Glob` only: no MCP, skills or plugins; credential files denied. A **fail-closed startup check** refuses to continue if the session isn't what was asked for. |
-| **The builder cannot push** | Commits stay on the branch already checked out. Deny rule plus environment. Git hooks and config are snapshotted and restored around every build. |
+| **The builder cannot push** | Commits stay on the branch already checked out. Deny rule plus environment. Git hooks and config are snapshotted and restored around every build. `git push` exists in exactly one place, Ship (`src/git/ship.ts`), pinned by a static test. |
 | **Branches are scanned** | Secrets and changes to protected files (`.claude/`, `.cursor/`, `AGENTS.md`, CI config…) are **held for you**. |
 | **Model text is untrusted** | Briefs, research and answers are labelled as model-written. Cards made from them **always wait for your approval**, under every policy and mode. |
 | **Nothing leaks across accounts** | Each child process gets an allow-listed environment; credentials never reach another account's process, config, logs or UI. |
@@ -226,7 +225,6 @@ Tested with scripted fake agents and real git: **1,000+ tests, no network, no qu
 
 ```bash
 conductor start                # run + open the dashboard (--no-open, --port <n>)
-conductor open                 # open a fresh signed-in tab while it's running
 conductor stop                 # stop the running Conductor (frees its port); --port <n> stops the Conductor on that port, --force as a last resort
 conductor restart              # stop it and start it again (same port)
 conductor update [--check]     # update to the latest release (--check only reports)
@@ -273,6 +271,6 @@ Plain **Node ≥ 22.18** running **TypeScript by type stripping** (erasable synt
 
 **Local · reviewed · reversible**
 
-<sub>Nothing is pushed, opened as a PR, or merged unless you do it yourself.</sub>
+<sub>Conductor never opens a PR or merges. The only push is Ship's (Complete auto after your one-time consent, or your own Push click).</sub>
 
 </div>

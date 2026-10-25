@@ -277,6 +277,8 @@ fieldset { border: 0; padding: 0; margin: 0 0 14px; min-width: 0; }
   display: flex; align-items: flex-start; gap: 10px; padding: 9px 20px;
   background: var(--s-bg); border-bottom: 1px solid var(--s-bd); color: var(--text);
 }
+.banner.push-consent { align-items: center; justify-content: space-between; }
+.banner.push-consent[hidden] { display: none; }
 .banner > .icon { color: var(--s-fg); margin-top: 2px; width: 17px; height: 17px; }
 .banner-body { flex: 1 1 auto; min-width: 0; }
 .banner-body b { font-weight: 650; }
@@ -664,12 +666,6 @@ dialog::backdrop { background: var(--scrim); }
 .wiz-done { text-align: center; padding: 26px 18px; margin-top: 14px; background: var(--c-ready-bg); border: 1px solid var(--c-ready-bd); border-radius: var(--r-lg); }
 .wiz-done h2 { color: var(--c-ready-fg); font-size: 17px; margin-bottom: 4px; }
 .wiz-done p { color: var(--text); max-width: 56ch; margin: 0 auto 12px; }
-
-/* ───────────── skeleton / expired ───────────── */
-.expired { position: fixed; inset: 0; z-index: 200; background: var(--bg); display: grid; place-items: center; padding: 20px; overflow-y: auto; }
-.expired-card { width: min(520px, 100%); padding: 28px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow); display: grid; gap: 14px; }
-.expired-card p { color: var(--text-2); }
-.expired-card .cmd-row { display: flex; }
 
 /* ───────────── toasts ───────────── */
 .toast-stack { position: fixed; right: 16px; bottom: 16px; z-index: 300; width: min(400px, calc(100vw - 32px)); pointer-events: none; display: grid; gap: 8px; }
@@ -1113,3 +1109,9 @@ dialog::backdrop { background: var(--scrim); }
 .cmp-bar .menu-wrap + .menu-wrap { flex: 0 0 auto; }
 .cmp-bar .menu-wrap + .menu-wrap .chip-btn > span:not(.who-ic) { max-width: none; }
 .cmp-bar .menu-wrap:first-of-type { min-width: 64px; }
+
+/* Auto push (Settings + Board header hint) */
+.push-hint { font-weight: 560; color: var(--text-2); }
+.push-target { border: 0; padding: 0; margin: 0 0 8px; }
+.push-target > .legend { padding: 0; margin-bottom: 4px; }
+.check-row { display: flex; gap: 8px; align-items: center; font-weight: 560; cursor: pointer; }

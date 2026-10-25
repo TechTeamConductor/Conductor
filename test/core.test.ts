@@ -14,7 +14,6 @@ import { OpenError, openRun, terminalCommand, type ExecFn } from '../src/server/
 import { columnOf, activityOf, resumeCommand, toSummary } from '../src/pipeline/view.ts';
 import { fence, planToMarkdown, preamble, render, taskBlock } from '../src/pipeline/prompts.ts';
 import { shellQuote, slug, isUuid, fmtDuration } from '../src/util.ts';
-import { Auth } from '../src/server/auth.ts';
 import type { Plan, Run } from '../src/types.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'cond-core-'));
@@ -182,7 +181,7 @@ test('view: columns, activity wording, capabilities and resume commands', () => 
   assert.equal(columnOf(mk({ status: 'running', stage: 'build' })), 'building');
   assert.equal(columnOf(mk({ status: 'running', stage: 'plan_review' })), 'planning');
   assert.equal(columnOf(mk({ status: 'awaiting_approval' })), 'plan_ready');
-  assert.equal(columnOf(mk({ status: 'parked' })), 'paused');
+  assert.equal(columnOf(mk({ status: 'parked' })), 'needs_human');
   assert.equal(columnOf(mk({ status: 'aborted' })), 'closed');
   const now = 1_000_000;
   const running = mk({ status: 'running', stage: 'verify', next: 'verify', stageStartedAt: now - 134_000 });
@@ -222,33 +221,3 @@ test('util: slug/uuid/duration helpers', () => {
   assert.equal(fmtDuration(3_700_000), '1h 1m');
 });
 
-test('auth: OTP expires; sessions are random; revoke works', () => {
-  let t = 1000;
-  const a = new Auth({ otpTtlMs: 60_000, now: () => t });
-  const otp = a.mintOtp();
-  t += 61_000;
-  assert.equal(a.consumeOtp(otp), null, 'expired');
-  const s1 = a.consumeOtp(a.mintOtp())!;
-  const s2 = a.consumeOtp(a.mintOtp())!;
-  assert.notEqual(s1, s2);
-  assert.ok(s1.length >= 40);
-  assert.equal(a.validSession(s1), true);
-  a.revoke(s1);
-  assert.equal(a.validSession(s1), false);
-  assert.equal(a.validSession(undefined), false);
-});
-void chmodSync;
-
-test('auth: sessions can survive a restart (only hashes are stored, file is 0600)', () => {
-  const dir = tmp();
-  const f = join(dir, 'sessions.json');
-  const a1 = new Auth({ persistPath: f });
-  const sid = a1.consumeOtp(a1.mintOtp())!;
-  assert.equal((statSync(f).mode & 0o777).toString(8), '600');
-  assert.ok(!readFileSync(f, 'utf8').includes(sid), 'the session id itself is never written to disk');
-  const a2 = new Auth({ persistPath: f });
-  assert.equal(a2.validSession(sid), true, 'still signed in after a restart');
-  a2.revoke(sid);
-  assert.equal(new Auth({ persistPath: f }).validSession(sid), false, 'logout survives a restart too');
-  rmSync(dir, { recursive: true, force: true });
-});

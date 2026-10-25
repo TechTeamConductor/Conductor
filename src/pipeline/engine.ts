@@ -14,7 +14,15 @@ import { loadEnvSecrets, redact } from '../redact.ts';
 import { logger } from '../log.ts';
 import { notify as defaultNotify } from '../notify.ts';
 import * as W from '../git/worktree.ts';
-import { pushTicket } from '../git/push-ticket.ts';
+import { spawnSync } from 'node:child_process';
+import { ship } from '../git/ship.ts';
+import type { EnvEntry, FixtureEdits } from '../git/ship.ts';
+import { git } from '../git/exec.ts';
+import { diffGitMeta, revertGitMeta, snapshotGitMeta } from '../git/meta.ts';
+import { loadEnvEntries } from '../git/envvalues.ts';
+import { fixtureRewriteNote, testOrFixturePath } from '../git/fixture-hold.ts';
+import { pushRemoteOf } from '../config.ts';
+import { completeAutoOwnsPush, effectiveShip } from '../policy/policy.ts';
 import type { Board, Project, WorkItem } from '../board/index.ts';
 import { BoardError } from '../board/index.ts';
 import { TAINTED_ACTORS } from '../board/types.ts';
@@ -47,6 +55,8 @@ const PAUSE_CEILING_MS = 24 * 60 * 60_000;
 export const HUMAN_MOVES = ['backlog', 'todo', 'done', 'canceled'] as const;
 export type HumanMove = (typeof HUMAN_MOVES)[number];
 const TICK_MS = 5000;
+/** A held Ship is tried again after this long (a sibling card may have shipped, a remote may be back). Retry on the card runs it at once. */
+const SHIP_RETRY_MS = 2 * 60_000;
 
 export interface EngineDeps {
   getConfig: () => Config;
@@ -107,6 +117,11 @@ export class Engine {
   private failCounts = new Map<string, number>();
   private quotaMap = new Map<string, { utilization7d?: number; utilization5h?: number; resetsAt?: number; rejected?: boolean }>();
   private envSecretCache = new Map<string, { at: number; vals: string[] }>();
+  private envEntryCache = new Map<string, { at: number; vals: EnvEntry[] }>();
+  /** Ships run one at a time, oldest card first (an older card's commits sit below a newer card's). */
+  private shipWorker: Promise<void> | null = null;
+  /** Repositories Ship holds from just before its last check until the push ends: no job starts there meanwhile (the cards stay queued). */
+  private shipping = new Set<string>();
   private changeListeners = new Set<() => void>();
   private unsubBoard: (() => void) | null = null;
   /** The ONE cap on concurrent read-only analysis calls across all runs (task graphs). */
@@ -143,6 +158,8 @@ export class Engine {
       notify: (t, m) => (this.d.notify ?? defaultNotify)(t, m),
       persistent: this.persistentDeps,
       secretsFor: (r) => this.secretsFor(r),
+      scanEntriesFor: (r) => this.scanEntriesFor(r),
+      shipEffective: () => this.shipEffective(),
       signal: (key) => this.jobs.get(key)?.ac.signal ?? new AbortController().signal,
       emit: (key, ev) => this.emit(key, ev),
       hist: (key, text) => this.d.store.update(key, (r) => void r.history.push({ ts: this.clock.now(), text })),
@@ -153,6 +170,7 @@ export class Engine {
       limitRule: () => effectiveLimitRule(this.d.getConfig()),
       noteCandidate: (key, ref) => this.noteCandidate(key, ref),
       tickSoon: () => this.tickSoon(),
+      enginePaused: () => this.globalPaused,
       analysisSlot: (signal) => this.analysisSem.acquire(signal),
       buildSlot: (signal) => this.buildSem.acquire(signal),
       context: this.context,
@@ -348,6 +366,27 @@ export class Engine {
     return [...extra, ...vals];
   }
 
+  /** Pushing is in effect: Complete auto AND its push confirm accepted (`effectiveShip`; there is no separate switch). Everything Ship-related keys off this one function. */
+  shipEffective(): boolean {
+    return effectiveShip(this.d.getConfig());
+  }
+
+  /** The repo's .env, .env.local and copyFiles with their NAMES (autopilot C1: the scan only matches secret-like values). Read from the repo root, never a worktree. */
+  private envEntriesFor(repo: RepoConfig, fresh = false): EnvEntry[] {
+    const hit = this.envEntryCache.get(repo.name);
+    if (!fresh && hit && this.clock.now() - hit.at < 30_000) return hit.vals;
+    const files = [...new Set(['.env', '.env.local', ...(repo.copyFiles ?? [])])].map((f) => join(repo.path, f));
+    const vals = loadEnvEntries(files);
+    this.envEntryCache.set(repo.name, { at: this.clock.now(), vals });
+    return vals;
+  }
+
+  /** Branch-scan entries: every provider secret qualifies (no name known), plus the repo's .env entries with names. */
+  scanEntriesFor(run: Run): EnvEntry[] {
+    const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
+    return [...(this.d.secrets?.() ?? []).map((value) => ({ name: 'SECRET', value, multiline: false })), ...(repo ? this.envEntriesFor(repo) : [])];
+  }
+
   /** Drop caches after settings changes. */
   invalidate(): void {
     this.changed();
@@ -395,6 +434,7 @@ export class Engine {
     this.unsubBoard = null;
     for (const j of this.jobs.values()) j.ac.abort();
     await Promise.allSettled([...this.jobs.values()].map((j) => j.promise));
+    if (this.shipWorker) await this.shipWorker.catch(() => undefined);
   }
 
   /** Crash recovery: runs that were mid-flight when the process died go back to the queue. */
@@ -405,6 +445,11 @@ export class Engine {
       if (r.status === 'paused' && r.pauseKind === 'limit' && r.account && (r.pausedUntil ?? 0) > now && !this.pauses.has(accountKey(r.account))) {
         this.pauses.set(accountKey(r.account), { until: Math.min(r.pausedUntil!, now + PAUSE_CEILING_MS), reason: r.pauseReason ?? 'usage limit' });
       }
+    }
+    // Stuck resolver: a run caught mid-resolution is treated as stuck. The marker is cleared and the park write happens synchronously, here, BEFORE
+    // the running -> queued pass below; the counter was spent before the model call, so the resolver never runs twice for the same stop.
+    for (const r of this.d.store.list()) {
+      if (r.resolverActive) void this.stages.parkAfterResolverCrash(r.key).catch((e) => log.warn(`${r.key}: resolver crash recovery failed: ${errMsg(e)}`));
     }
     for (const r of this.d.store.list()) {
       if (r.status === 'running') {
@@ -423,7 +468,10 @@ export class Engine {
 
   /** Wait for all in-flight stage jobs (tests). */
   async idle(): Promise<void> {
-    while (this.jobs.size) await Promise.allSettled([...this.jobs.values()].map((j) => j.promise));
+    while (this.jobs.size || this.shipWorker) {
+      await Promise.allSettled([...this.jobs.values()].map((j) => j.promise));
+      if (this.shipWorker) await this.shipWorker.catch(() => undefined);
+    }
   }
 
   // ───────────────────────── each tick: flush → project → claim ─────────────────────────
@@ -486,11 +534,13 @@ export class Engine {
         ignored.push({ key: item.key, reason: `Cards of kind "${item.kind}" are not supported yet — create it as a work item.` });
         continue;
       }
-      if (!this.board.claimable().some((c) => c.id === item.id)) {
-        ignored.push({ key: item.key, reason: 'Waiting for the cards it depends on to be done.' });
+      if (!this.board.claimable(['work'], (dep, dependant) => this.dependencyShipped(dep, dependant)).some((c) => c.id === item.id)) {
+        ignored.push({ key: item.key, reason: this.shipEffective() ? 'Waiting for the cards it depends on to be done and pushed.' : 'Waiting for the cards it depends on to be done.' });
         continue;
       }
       if (this.globalPaused) continue; // paused from the dashboard: no new claims
+      const claimRepo = this.resolveRepo(this.board.project(item.projectId));
+      if (claimRepo && this.shipping.has(claimRepo.name)) continue; // Ship holds this repository for the moment; claimed on a later tick
       try {
         await this.maybeClaim(item);
       } catch (e) {
@@ -499,6 +549,7 @@ export class Engine {
     }
     for (const k of this.d.store.tombstoned()) ignored.push({ key: k, reason: 'This run\'s record was unreadable and has been set aside; the card will not be started again by itself. Check the data folder.' });
     this.ignored = ignored;
+    this.kickShip();
     this.changed();
   }
 
@@ -600,6 +651,8 @@ export class Engine {
         item.key,
         `I could not tell which repository this belongs to. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none yet)'}. Set the project's repository, then move the card back to To do.`,
         'plan',
+        undefined,
+        'no_repo',
       );
     }
     this.changed();
@@ -651,7 +704,7 @@ export class Engine {
     const recent = (run0.restartTimes ?? []).filter((t) => nowT - t < 3_600_000);
     if (recent.length >= 5) {
       this.d.store.update(key, (r) => void (r.restartTimes = recent));
-      await this.stages.toNeedsHuman(key, 'This run was restarted 5 times within an hour, so Conductor is pausing it to protect your quota. Wait a while (or fix the underlying problem), then move it to To do again.', run0.next);
+      await this.stages.toNeedsHuman(key, 'This run was restarted 5 times within an hour, so Conductor is pausing it to protect your quota. Wait a while (or fix the underlying problem), then move it to To do again.', run0.next, undefined, 'restart_guard');
       return;
     }
     const was = run0.status === 'parked' ? (run0.parkedFrom ?? 'running') : run0.status;
@@ -697,6 +750,11 @@ export class Engine {
       r.restartTimes = [...recent, nowT];
       r.offline = undefined; // a human restart is a fresh start for the offline caps
       r.agentRuns = 0; // a human restart is a fresh budget (otherwise the per-card cap becomes a dead end)
+      r.resolverUsed = 0; // ...and a fresh resolver budget: give_up is terminal only until a person acts (extensions stay once per card)
+      r.resolverRounds = undefined;
+      r.resolverCauseUsed = undefined;
+      r.resolverRuns = 0;
+      r.resolverActive = undefined;
       r.buildFails = 0;
       r.limitStreak = 0;
       r.limitEpisode = 0;
@@ -741,7 +799,14 @@ export class Engine {
         r.next = 'plan';
         r.loop = 1;
         r.loopBudget = cfg.pipeline.maxLoops;
-        if (!keepCommits) r.commitSha = undefined; // work was reset to base: the old commit no longer exists on the branch
+        if (!keepCommits) {
+          r.commitSha = undefined; // work was reset to base: the old commit no longer exists on the branch
+          r.landedShas = undefined;
+          r.shipSha = undefined;
+          r.shipBase = undefined;
+        }
+        r.shipHold = undefined;
+        r.shipUnblockedAt = undefined;
         r.planApproved = false;
         r.planReviewDone = false;
         r.planReviewRounds = 0;
@@ -761,7 +826,7 @@ export class Engine {
       for (const b of obsolete) await this.effects.close(key, `bugclose:${b.fp}:rerun${rev}`, b.itemId!, 'done');
     }
     if (!this.d.store.get(key)!.repo) {
-      await this.stages.toNeedsHuman(key, `Still no repository for this card. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none)'}. Set the project's repository and move it back to To do.`, 'plan');
+      await this.stages.toNeedsHuman(key, `Still no repository for this card. Registered: ${cfg.repos.map((r) => r.name).join(', ') || '(none)'}. Set the project's repository and move it back to To do.`, 'plan', undefined, 'no_repo');
       return;
     }
     await this.stages.applyStage(key, retryStage === 'build' ? 'building' : retryStage === 'verify' ? 'verifying' : 'planning');
@@ -832,6 +897,7 @@ export class Engine {
     for (const r of this.d.store.list().sort((a, b) => a.createdAt - b.createdAt)) {
       if (this.jobs.size >= cfg.pipeline.maxParallel) break;
       if (this.jobs.has(r.key)) continue;
+      if (this.shipping.has(r.repo)) continue; // Ship is between its last check and the push in this repository
       const limitPaused = Engine.limitPaused(r);
       // offline pauses keep their own timer; a LIMIT pause is re-routed on every tick regardless of pausedUntil (a reset, an added or signed-in
       // account, a reorder or a rule change resumes it at once — §2.3 auto-resume)
@@ -882,6 +948,7 @@ export class Engine {
   }
 
   private async runJob(key: string, ac: AbortController): Promise<void> {
+    await this.snapshotIdentity(key); // before any agent of this run starts
     for (let i = 0; ; i++) {
       const run = this.d.store.get(key);
       if (!run || ac.signal.aborted || run.status !== 'running') return;
@@ -904,7 +971,7 @@ export class Engine {
           return;
       }
     }
-    await this.stages.toNeedsHuman(key, 'The pipeline made no progress after many iterations — stopping to protect your quota.', this.d.store.get(key)?.next ?? 'none');
+    await this.stages.toNeedsHuman(key, 'The pipeline made no progress after many iterations — stopping to protect your quota.', this.d.store.get(key)?.next ?? 'none', undefined, 'human_hold');
   }
 
   private failRun(key: string, e: unknown): void {
@@ -914,7 +981,7 @@ export class Engine {
     log.error(`${key}: stage crashed: ${msg}`);
     this.emit(key, { agent: 'conductor', stage: 'engine', kind: 'error', text: `Internal error: ${msg}` });
     if (n >= 4) {
-      void this.stages.toNeedsHuman(key, `Conductor hit an internal error four times: ${msg}`, this.d.store.get(key)?.next ?? 'none');
+      void this.stages.toNeedsHuman(key, `Conductor hit an internal error four times: ${msg}`, this.d.store.get(key)?.next ?? 'none', undefined, 'human_hold');
       return;
     }
     this.d.store.update(key, (r) => {
@@ -1012,6 +1079,17 @@ export class Engine {
     if (run.status === 'parked') {
       throw new EngineError('bad_state', 'This card is parked in Backlog. Move it to To do to continue — Conductor never moves your cards out of Backlog itself.');
     }
+    if (run.status === 'ready' && run.shipHold && !run.pushedAt && this.shipEffective()) {
+      // Retry on a card Ship is holding runs Ship again; it does not re-plan finished work
+      await this.snapshotIdentity(key, true); // a person's own action: the identity is read now if none was recorded
+      this.d.store.update(key, (r) => {
+        r.shipHold = undefined;
+        r.history.push({ ts: this.clock.now(), text: 'Trying the push again (requested by you)' });
+      });
+      this.changed();
+      this.tickSoon();
+      return;
+    }
     if (run.status === 'failed') {
       // an internal hiccup: retry the same step, don't throw the work away
       this.d.store.update(key, (r) => {
@@ -1061,34 +1139,296 @@ export class Engine {
     this.changed();
   }
 
+  // ───────────────────────── Ship (Complete auto pushes) ─────────────────────────
+  private readonly remoteCache = new Map<string, { at: number; ok: boolean; remote: string }>();
   /**
-   * Push one done ticket. Stays on the branch already checked out: no checkout, no new branch, no merge.
-   * The commit contains only the files this ticket's commits changed, and its author is the person's git identity.
+   * The git identity of the person, read ONCE before the first agent runs for this run and stored on it. Ship signs with this snapshot and never
+   * with whatever the worktree's config says later. `force` is only for a person's own Retry on a card that has no snapshot yet.
+   */
+  private async snapshotIdentity(key: string, force = false): Promise<void> {
+    const run = this.d.store.get(key);
+    if (!run || run.shipIdentity || (!force && run.agentRuns > 0)) return;
+    const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
+    if (!repo) return;
+    try {
+      const name = (await git(repo.path, ['config', '--get', 'user.name'])).stdout.trim();
+      const email = (await git(repo.path, ['config', '--get', 'user.email'])).stdout.trim();
+      if (name && email && name.length <= 200 && email.length <= 200 && !/[\u0000-\u001f]/.test(name + email)) this.d.store.update(key, (r) => void (r.shipIdentity ??= { name, email }));
+    } catch (e) {
+      log.warn(`${key}: could not read the git identity: ${errMsg(e)}`);
+    }
+  }
+
+  /**
+   * Dependants wait for a card to be PUSHED, but only while that can actually happen: Ship is in effect, the dependency is a top-level card with a
+   * run in the dependant's repository that has commits to ship, and nobody (Ship hold, a person) has released it. Anything else is today's rule (Done).
+   */
+  private dependencyShipped(dep: WorkItem, dependant: WorkItem): boolean {
+    if (!this.shipEffective()) return true;
+    if (dep.parentId) return true;
+    const run = this.d.store.get(dep.key);
+    if (!run) return true;
+    const want = this.resolveRepo(this.board.project(dependant.projectId));
+    if (!want || run.repo !== want.name) return true;
+    if (run.status !== 'ready' || run.answered || !run.commitSha) return true; // marked done by a person, an answer, nothing to ship
+    if (run.pushedAt) return true;
+    if (run.shipHold || run.shipUnblockedAt) return true; // held (remote missing, scan, identity, ...) or released by a person: never a deadlock
+    if (!this.remoteUsable(want)) return true; // nowhere to push (no remote, or this repository never pushes): Done-gating, never a deadlock
+    return false;
+  }
+
+  /** The repository has a push remote that git can resolve. Cached for 30 s; a repository set to never push, or without that remote, is not usable. */
+  private remoteUsable(repo: RepoConfig): boolean {
+    const remote = pushRemoteOf(repo);
+    if (!remote) return false;
+    const hit = this.remoteCache.get(repo.name);
+    if (hit && hit.remote === remote && this.clock.now() - hit.at < 30_000) return hit.ok;
+    const r = spawnSync('git', ['remote', 'get-url', remote], { cwd: repo.path, timeout: 5000, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+    const ok = r.status === 0 && r.stdout.trim().length > 0;
+    this.remoteCache.set(repo.name, { at: this.clock.now(), ok, remote });
+    return ok;
+  }
+
+  /** A person lets the dependants of a finished, not-yet-pushed card start now. Recorded on the card. Nothing is pushed. */
+  async unblockDependants(key: string): Promise<void> {
+    const run = this.d.store.get(key);
+    if (!run) throw new EngineError('missing', 'Unknown run.');
+    if (!this.shipEffective()) throw new EngineError('bad_state', 'Auto push is not in effect, so dependants are not waiting for a push.');
+    if (run.status !== 'ready' || run.pushedAt || run.answered || !run.commitSha) throw new EngineError('bad_state', 'Only a finished card that has not been pushed holds its dependants.');
+    if (run.shipUnblockedAt) return;
+    const secrets = this.secretsFor(run);
+    this.d.store.update(key, (r) => {
+      r.shipUnblockedAt = this.clock.now();
+      r.history.push({ ts: this.clock.now(), text: 'Dependants released by you before this card was pushed' });
+      Effects.enqueue(r, 'ship-unblock', { kind: 'comment', payload: { body: '🤖 **Dependants released** — you let the cards that depend on this one start before it is pushed. They build on the code already on your checkout.' } }, secrets);
+    });
+    await this.effects.flush(key).catch(() => undefined);
+    this.changed();
+    this.tickSoon();
+  }
+
+  /** Start the single Ship worker if a finished card is waiting to be pushed. Level-triggered: cheap when nothing is due. */
+  private kickShip(): void {
+    if (this.shipWorker || this.globalPaused || !this.shipEffective()) return;
+    const now = this.clock.now();
+    const busy = this.busyRepos();
+    const pushing = new Set(this.d.getConfig().repos.filter((r) => pushRemoteOf(r) !== null).map((r) => r.name)); // a repository set to never push is never tried
+    const due = this.d.store
+      .list()
+      .filter((r) => pushing.has(r.repo) && r.status === 'ready' && !r.pushedAt && !r.answered && !!r.commitSha && !this.jobs.has(r.key) && !busy.has(r.repo) && (!r.shipHold || now - r.shipHold.at >= SHIP_RETRY_MS))
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((r) => r.key);
+    if (!due.length) return;
+    this.shipWorker = (async () => {
+      for (const key of due) {
+        try {
+          await this.shipOne(key);
+        } catch (e) {
+          log.warn(`${key}: ship failed: ${errMsg(e)}`);
+        }
+      }
+    })().finally(() => {
+      this.shipWorker = null;
+      this.changed();
+      this.tickSoon();
+    });
+  }
+
+  /** Repositories with an agent job running (an unknown job key counts as every repository). A builder shares .git/config and .git/hooks with Ship. */
+  private busyRepos(): Set<string> {
+    const out = new Set<string>();
+    for (const k of this.jobs.keys()) {
+      const r = this.d.store.get(k);
+      if (!r) return new Set(this.d.getConfig().repos.map((x) => x.name));
+      out.add(r.repo);
+    }
+    return out;
+  }
+
+  /** Record that Ship is holding a finished card. The card stays Ready (never failed); one board comment per distinct reason. */
+  private async shipHolds(key: string, reasonRaw: string): Promise<void> {
+    const run = this.d.store.get(key);
+    if (!run) return;
+    const secrets = this.secretsFor(run);
+    const reason = truncate(redact(reasonRaw, secrets), 600);
+    this.d.store.update(key, (r) => {
+      r.shipHold = { reason, at: this.clock.now() };
+      r.history.push({ ts: this.clock.now(), text: `Not pushed yet: ${truncate(reason, 200)}` });
+      Effects.enqueue(r, `ship-hold:${sha1(reason)}`, { kind: 'comment', payload: { body: `🤖 **Not pushed yet** — ${reason}\n\nThe card stays done and nothing was pushed. Conductor tries again in a few minutes; **Retry** tries now.` } }, secrets);
+    });
+    this.emit(key, { agent: 'conductor', stage: 'engine', kind: 'note', text: `Ship is holding the push: ${reason}` });
+    await this.effects.flush(key).catch(() => undefined);
+  }
+
+  /**
+   * Ready → Ship → Pushed for one card (Complete auto), or the manual Push click (`manual`: a done card, any mode). Both run the same Ship: scan, identity
+   * snapshot, target rules (the checked-out branch, else conductor/…), merge/foreign-commit holds. The ship() call persists the sha it scanned (and any
+   * author/message replacements) BEFORE it pushes, so a crash in between re-runs as a no-op and never re-amends. A hold never fails the card.
+   * Returns the hold reason (a manual click shows it; the automatic path also records it on the card), or null.
+   */
+  private async shipOne(key: string, manual = false): Promise<string | null> {
+    let run = this.d.store.get(key);
+    if (!run || (manual ? run.status !== 'ready' && run.status !== 'finished' : run.status !== 'ready') || run.pushedAt || run.answered || !run.commitSha || (!manual && !this.shipEffective())) return null;
+    const cfg = this.d.getConfig();
+    const hold = async (reason: string): Promise<string> => {
+      if (!manual) await this.shipHolds(key, reason);
+      return reason;
+    };
+    const repo = cfg.repos.find((r) => r.name === run!.repo);
+    if (!repo) return hold('This card’s repository is not registered, so nothing is pushed.');
+    const remote = pushRemoteOf(repo);
+    if (!remote) return manual ? hold('This repository is set to never push (no push remote).') : null; // per-repo kill switch
+    if (manual && !run.shipIdentity) {
+      await this.snapshotIdentity(key, true); // a person's own click: read the identity now if none was recorded
+      run = this.d.store.get(key) ?? run;
+    }
+    if (!run.shipIdentity) return hold('No git name and email were recorded before the build started. Set git user.name and user.email to your own name, then press Retry on this card.');
+    // A builder shares .git/config and .git/hooks with the push (they are only reverted after the agent ends). Never push while one runs; Ship runs again later.
+    if (this.busyRepos().has(run.repo)) return manual ? 'An agent is working in this repository right now. Try again when it has finished.' : null;
+    const metaBefore = await snapshotGitMeta(repo.path).catch(() => null);
+    if (!metaBefore) return hold('Could not read the repository’s git settings, so nothing is pushed.');
+
+    // Conductor-recorded commits of every card in this repository, and who owns each. Cards that are not finished (or were canceled) do not
+    // count: their commits can sit below this one, and then Ship says whose they are instead of pushing them.
+    const recorded: string[] = [];
+    const owners: Record<string, string> = {};
+    for (const r of this.d.store.list()) {
+      if (r.repo !== run.repo) continue;
+      const shas = [r.commitSha, r.shipSha, ...(r.graph?.items ?? []).map((i) => i.commitSha), ...(r.landedShas ?? [])].filter((x): x is string => typeof x === 'string' && /^[0-9a-f]{40}$/.test(x));
+      const handedOver = r.key === key || r.status === 'ready' || r.status === 'finished';
+      for (const sha of shas) {
+        owners[sha] ??= r.key;
+        if (handedOver) recorded.push(sha);
+      }
+    }
+
+    // a credential-shaped fixture is rewritten once: first by the builder (a normal build step), then folded into the commit that introduced it
+    let builderRewrite: string[] | null = null;
+    const fixtureRewrite = async (ctx: { repoRoot: string; commits: string[]; files: string[] }): Promise<FixtureEdits | null> => {
+      const paths = ctx.files.filter((f) => !f.startsWith('('));
+      if (!paths.length || paths.length !== ctx.files.length || !paths.every((f) => testOrFixturePath(f))) return null; // only credential shapes in test/fixture files
+      if ((this.d.store.get(key)?.shipFixtureRewrites ?? 0) < 1) {
+        builderRewrite = paths;
+        return null;
+      }
+      const tipSha = this.d.store.get(key)?.commitSha;
+      if (!tipSha) return null;
+      const edits: FixtureEdits = {};
+      for (const short of ctx.commits) {
+        const full = (await git(ctx.repoRoot, ['rev-parse', '--verify', '--quiet', `${short}^{commit}`])).stdout.trim();
+        if (!/^[0-9a-f]{40}$/.test(full)) continue;
+        for (const path of paths) {
+          const at = await git(ctx.repoRoot, ['show', `${full}:${path}`], { maxBytes: 4 * 1024 * 1024 });
+          if (at.code !== 0) continue; // the commit does not carry this file
+          const now = await git(ctx.repoRoot, ['show', `${tipSha}:${path}`], { maxBytes: 4 * 1024 * 1024 });
+          const content: string | null = now.code === 0 ? now.stdout : null;
+          if (content !== null && (content.includes('\0') || now.stdoutTruncated)) continue;
+          if (content === at.stdout) continue;
+          (edits[full] ??= {})[path] = content;
+        }
+      }
+      return Object.keys(edits).length ? edits : null;
+    };
+
+    const out = await ship({
+      repoRoot: repo.path,
+      remote,
+      key: run.key,
+      tip: run.shipSha && run.shipBase === run.commitSha ? run.shipSha : run.commitSha, // the scanned (possibly re-authored) commit, while the card's own commit is unchanged
+      recordedShas: recorded,
+      owners,
+      identity: run.shipIdentity,
+      developerIdentity: cfg.developerIdentity ?? null,
+      envEntries: [...(this.d.secrets?.() ?? []).map((value) => ({ name: 'SECRET', value, multiline: false })), ...this.envEntriesFor(repo, true)],
+      ...(manual ? {} : { fixtureRewrite }), // the builder-rewrite loop is Complete auto only
+      beforePush: async () => {
+        this.shipping.add(run!.repo); // synchronously before the busy re-check: nothing can start between the check and the push
+        if (this.busyRepos().has(run!.repo)) return 'An agent started working in this repository while Ship was checking, so nothing was pushed. Ship tries again later.';
+        const now = await snapshotGitMeta(repo.path);
+        const moved = diffGitMeta(metaBefore, now);
+        if (moved.length) await revertGitMeta(metaBefore).catch(() => []); // undo it, so the next attempt does not take the planted state as its baseline
+        return moved.length ? `The repository’s git settings or hooks changed while Ship was checking (${moved.slice(0, 4).join(', ')}), so nothing was pushed. Review them, then press Retry.` : null;
+      },
+      persist: (p) => {
+        const map = p.replacements;
+        const secretsNow = this.secretsFor(run!);
+        for (const r of this.d.store.list()) {
+          if (r.repo !== run!.repo) continue;
+          const touches = (sha?: string): boolean => !!sha && map[sha] !== undefined;
+          const mine = r.key === key;
+          const involved = mine || touches(r.commitSha) || (r.graph?.items ?? []).some((i) => touches(i.commitSha)) || (r.landedShas ?? []).some((x) => touches(x));
+          if (!involved) continue;
+          this.d.store.update(r.key, (x) => {
+            // commitSha / item commitSha stay the LOCAL commits (they are on the checkout; build, verify and graph recovery rely on that).
+            // Replacements live only in shipSha / landedShas, and the old commits stay recorded (a sibling's range replays through them to the same new commits).
+            const landed = new Set(x.landedShas ?? []);
+            for (const sha of [...Object.values(map), ...(mine ? p.range : [])]) landed.add(sha);
+            x.landedShas = [...landed].slice(-500);
+            if (mine) {
+              x.shipSha = p.sha;
+              x.shipBase = x.commitSha;
+              if (Object.keys(map).length) {
+                x.history.push({ ts: this.clock.now(), text: `Ship rewrote ${Object.keys(map).length} unpushed commit(s) so they carry your name and no agent trailers (your checkout is unchanged)` });
+                Effects.enqueue(x, `ship-rewrite:${p.sha}`, { kind: 'comment', payload: { body: `🤖 **Commits adjusted before pushing** — ${Object.keys(map).length} unpushed commit(s) now carry your git name, and agent trailers were removed from their messages. Your local branch was not changed.` } }, secretsNow);
+              }
+            }
+          });
+        }
+      },
+    }).finally(() => this.shipping.delete(run!.repo));
+
+    if (!out.ok) {
+      // a credential shape in a test/fixture file: one builder rewrite (Complete auto), which comes back through Verify to Ship
+      const rewritePaths = builderRewrite as string[] | null;
+      if (rewritePaths && (this.d.store.get(key)?.shipFixtureRewrites ?? 0) < 1) {
+        this.d.store.update(key, (r) => {
+          r.shipSha = undefined;
+          r.shipBase = undefined;
+          r.shipFixtureRewrites = (r.shipFixtureRewrites ?? 0) + 1;
+          r.fixtureRewriteNote = fixtureRewriteNote(rewritePaths);
+          r.next = 'build';
+          r.status = 'queued';
+          r.shipHold = undefined;
+          r.history.push({ ts: this.clock.now(), text: `Complete auto: the push scan found credential-shaped text in ${rewritePaths.slice(0, 6).join(', ')}; asking the builder once to replace it with placeholders (nothing is pushed)` });
+        });
+        this.emit(key, { agent: 'conductor', stage: 'engine', kind: 'note', text: `The push scan found credential-shaped text in ${rewritePaths.slice(0, 6).join(', ')}. Complete auto is rewriting it once; nothing is pushed.` });
+        await this.stages.applyStage(key, 'building');
+        this.tickSoon();
+        return null;
+      }
+      return hold(out.hold.reason);
+    }
+
+    const pushedSha = out.prepared.sha;
+    const secrets = this.secretsFor(this.d.store.get(key) ?? run);
+    this.d.store.update(key, (r) => {
+      r.pushedAt = this.clock.now();
+      r.pushedSha = pushedSha;
+      r.pushedBranch = out.prepared.target;
+      r.shipSha = pushedSha;
+      r.shipHold = undefined;
+      const where = `${remote}/${out.prepared.target}`;
+      r.history.push({ ts: this.clock.now(), text: out.pushed ? `Pushed ${pushedSha.slice(0, 7)} to ${where}` : `Already on ${where} (${pushedSha.slice(0, 7)}) — nothing to push` });
+      Effects.enqueue(r, `ship-pushed:${pushedSha}`, { kind: 'comment', payload: { body: `🤖 **Pushed** — ${out.pushed ? 'pushed' : 'already on'} \`${pushedSha.slice(0, 12)}\` ${out.pushed ? 'to' : 'at'} \`${where}\`. Cards that depend on this one can start.` } }, secrets);
+    });
+    await this.effects.flush(key).catch(() => undefined);
+    this.changed();
+    return null;
+  }
+
+  /**
+   * The manual Push click: a thin trigger for Ship (same scan, identity snapshot, target rules and holds). It never commits, amends or switches branches.
+   * In Complete auto Done → Pushed is automatic, so the click is refused. A hold comes back as the error text.
    */
   async push(key: string): Promise<void> {
     const run = this.d.store.get(key);
     if (!run) throw new EngineError('missing', 'Unknown run.');
     if (run.status !== 'ready' && run.status !== 'finished') throw new EngineError('bad_state', 'Only a done card can be pushed.');
     if (run.pushedAt && run.pushedSha) return;
-    const repo = this.d.getConfig().repos.find((r) => r.name === run.repo);
-    if (!repo) throw new EngineError('bad_repo', 'This card’s repository is not registered.');
-    const shas = new Set<string>();
-    if (run.commitSha) shas.add(run.commitSha);
-    for (const item of run.graph?.items ?? []) if (item.commitSha) shas.add(item.commitSha);
-    const pushed = await pushTicket({ repoPath: repo.path, key: run.key, title: run.title, shas: [...shas] });
-    if (!pushed.ok) throw new EngineError('push_failed', pushed.detail);
-    const { result } = pushed;
-    this.d.store.update(key, (r) => {
-      const map = result.replacements;
-      if (r.commitSha && map[r.commitSha]) r.commitSha = map[r.commitSha];
-      for (const item of r.graph?.items ?? []) if (item.commitSha && map[item.commitSha]) item.commitSha = map[item.commitSha];
-      r.pushedAt = this.clock.now();
-      r.pushedSha = result.sha;
-      r.history.push({
-        ts: this.clock.now(),
-        text: `Pushed ${result.branch} as you. The commit has only this ticket’s files (${result.files.length}). The branch was not changed.`,
-      });
-    });
+    if (completeAutoOwnsPush(this.d.getConfig())) throw new EngineError('bad_state', 'Complete auto pushes finished cards by itself. If a push is held, the card says why and Retry tries again.');
+    if (!this.d.getConfig().repos.some((r) => r.name === run.repo)) throw new EngineError('bad_repo', 'This card’s repository is not registered.');
+    const hold = await this.shipOne(key, true);
+    if (hold) throw new EngineError('push_failed', hold);
     this.changed();
   }
 

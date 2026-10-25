@@ -61,13 +61,13 @@ npm run dist:win       # Windows (run on Windows): writes desktop/dist/Conductor
 If you do run the unsigned `.dmg` on a Mac, remove the download mark once: `xattr -dr com.apple.quarantine /Applications/Conductor.app`, or use System Settings → Privacy & Security → Open Anyway.
 
 ### How the desktop app works
-- `desktop/main.cjs` (Electron main) starts the server as a **utilityProcess** (`src/desktop-sidecar.ts`, compiled), which binds `127.0.0.1` on **port 0** and sends `{port, otp}` to the main process over its message channel. The window signs in with a **POST** (the one-time code is never in a URL or history). No fixed port, no control socket, no files.
-- The window is hardened: `contextIsolation`, `sandbox`, no Node in the renderer, no webview, DevTools only in unpackaged builds, an in-memory session (the cookie never reaches disk), navigation/redirects restricted to the exact loopback origin, `window.open` denied (a user-clicked `https:` link opens in your browser), every permission request denied, every request outside the origin cancelled.
+- `desktop/main.cjs` (Electron main) starts the server as a **utilityProcess** (`src/desktop-sidecar.ts`, compiled), which binds `127.0.0.1` on **port 0** and sends `{port}` to the main process over its message channel. The window loads `http://127.0.0.1:<port>/` (there is no login). No fixed port, no control socket, no files.
+- The window is hardened: `contextIsolation`, `sandbox`, no Node in the renderer, no webview, DevTools only in unpackaged builds, an in-memory session (nothing the page stores reaches disk), navigation/redirects restricted to the exact loopback origin, `window.open` denied (a user-clicked `https:` link opens in your browser), every permission request denied, every request outside the origin cancelled.
 - Fuses flipped at pack time: `RunAsNode` off, `NODE_OPTIONS` off, inspect arguments off, cookie encryption on, `OnlyLoadAppFromAsar` on, asar integrity validation on.
 - The server runs with your login-shell `PATH` (a Finder-launched app has a minimal one) so the `claude` and `agent` CLIs are found. Data lives in `~/.conductor-v2`, shared with `conductor start`; only one of them can run at a time.
 
 ## Honest limits
 - **Unsigned**: macOS has an ad-hoc signature only; the Windows installer has none.
 - **Windows is experimental.** It is built by CI but has never been run on Windows by the maintainers. Secret storage (Keychain), notifications, the background service and the `open` command are macOS-only.
-- Verified on macOS (Apple Silicon) only: the packaged app launches, its server answers on a random loopback port (302 / 401 unauthenticated), and quitting stops it. The window contents have not been inspected visually; no automated UI test of the packaged app exists.
+- Verified on macOS (Apple Silicon) only: the packaged app launches, its server answers on a random loopback port (the dashboard answers without any sign-in), and quitting stops it. The window contents have not been inspected visually; no automated UI test of the packaged app exists.
 - macOS build is Apple Silicon only (arm64). No auto-update.

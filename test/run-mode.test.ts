@@ -75,15 +75,18 @@ test('T13 run-mode: exact equality — missing, empty, wrong case, padded, boole
       assert.equal(gate(c, inputOf('none', false), 0).auto, false, `still waits under ${JSON.stringify(v)}`);
     }
     // and the loader normalises it to the canonical safe value
-    const loaded = normalizeConfig({ ...defaultConfig(), pipeline: { ...defaultConfig().pipeline, runMode: v } } as any);
-    assert.equal(loaded.pipeline.runMode, 'per-settings', JSON.stringify(v));
+    // (Addendum C: an ABSENT value in a brand-new config is the Complete auto default, covered in default-run-mode.test.ts; a present invalid value is Per settings)
+    if (v !== undefined) {
+      const loaded = normalizeConfig({ ...defaultConfig(), pipeline: { ...defaultConfig().pipeline, runMode: v } } as any);
+      assert.equal(loaded.pipeline.runMode, 'per-settings', JSON.stringify(v));
+    }
   }
   assert.equal(normalizeConfig({ ...defaultConfig(), pipeline: { ...defaultConfig().pipeline, runMode: 'complete-auto' } } as any).pipeline.runMode, 'complete-auto');
   assert.equal(isCompleteAuto(undefined as any), false, 'a missing config is never Complete auto');
 });
 
 test('C3/C4 config + settings view: default per-settings; runModeChangedAt kept only when a positive number; overriddenByRunMode empty vs all three; stored fields reported as stored', () => {
-  assert.equal(defaultConfig().pipeline.runMode, 'per-settings');
+  assert.equal(defaultConfig().pipeline.runMode, 'complete-auto'); // Addendum C: the default for a brand-new config (the push consent stays unset)
   const base = defaultConfig().pipeline;
   assert.equal(normalizeConfig({ ...defaultConfig(), pipeline: { ...base, runModeChangedAt: 1_700_000_000_000 } } as any).pipeline.runModeChangedAt, 1_700_000_000_000);
   for (const bad of ['1', -1, 0, NaN, Infinity, null]) assert.equal('runModeChangedAt' in normalizeConfig({ ...defaultConfig(), pipeline: { ...base, runModeChangedAt: bad } } as any).pipeline, false, String(bad));
@@ -115,7 +118,7 @@ test('T9 static: the overlay is the only path — stages.ts reads no stored appr
   assert.match(stages, /effectiveFirstPlanHold\(cfg, approved\)/);
   assert.match(stages, /completeAuto: effectiveLiftsHolds\(cfg\)/);
   // N7: who may name the mode at all (api.ts joins in commit 2 for PUT /api/run-mode and the live view)
-  const allowed = new Set(['src/config.ts', 'src/types.ts', 'src/policy/policy.ts', 'src/accounts/limit-rule.ts', 'src/migrate.ts', 'src/server/api.ts']);
+  const allowed = new Set(['src/config.ts', 'src/types.ts', 'src/policy/policy.ts', 'src/accounts/limit-rule.ts', 'src/migrate.ts', 'src/server/api.ts', 'src/demo.ts', 'src/runtime.ts']); // demo and the ephemeral runtime pin Per settings (Addendum C)
   const readers = srcFiles(join(ROOT, 'src'))
     .filter((f) => /\brunMode\b|\bisCompleteAuto\b/.test(stripComments(readFileSync(f, 'utf8'))))
     .map((f) => relative(ROOT, f).split('\\').join('/'));
@@ -242,7 +245,7 @@ test('T4 run-mode API: strict body, confirm to turn on, idempotent same-mode, PU
     let cur = h.cfg;
     let saves = 0;
     let failSave = false;
-    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => cur, saveConfig: (c) => { if (failSave) throw new Error('disk full /secret/path'); saves++; cur = c; }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => cur, saveConfig: (c) => { if (failSave) throw new Error('disk full /secret/path'); saves++; cur = c; }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     const put = (b: any) => api.handle('PUT', '/api/run-mode', new URLSearchParams(), b) as Promise<any>;
     const bad = (b: any, code = 'bad_request') => assert.rejects(put(b), (e: any) => e.status === 400 && e.code === code, JSON.stringify(b));
     h.scenario({ claude: { '*': { plan: [{ json: {} }] } } });
@@ -306,7 +309,7 @@ test('T4/B1 engine: after a refused save, a harmless plan under stored approve-p
   const { Api } = await import('../src/server/api.ts');
   const h = await makeHarness({ config: (c) => void ((c.pipeline as any).policy = 'approve-plan') });
   try {
-    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => { throw new Error('refused'); }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => { throw new Error('refused'); }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     await assert.rejects(api.handle('PUT', '/api/run-mode', new URLSearchParams(), { runMode: 'complete-auto', confirm: true }) as Promise<unknown>, (e: any) => e.status === 500);
     assert.equal(h.cfg.pipeline.runMode, 'per-settings');
     h.scenario({ claude: { '*': { plan: [{ json: {} }] } } });
@@ -316,15 +319,15 @@ test('T4/B1 engine: after a refused save, a harmless plan under stored approve-p
   } finally { await h.cleanup(); }
 });
 
-// ───────────────────────── T4/T6/T7 over HTTP with a real (non-ephemeral) runtime: CSRF, cookie, AC3 on disk, /api/state, SSE ─────────────────────────
-test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; SSE state follows; AC3 the saved config.json differs only in runMode', async () => {
+// ───────────────────────── T4/T6/T7 over HTTP with a real (non-ephemeral) runtime: CSRF, AC3 on disk, /api/state, SSE ─────────────────────────
+test('T4/T6/T7 HTTP: 403 without CSRF; /api/state settings; SSE state follows; AC3 the saved config.json differs only in runMode', async () => {
   const http = await import('node:http');
   const { createRuntime } = await import('../src/runtime.ts');
   const { paths } = await import('../src/paths.ts');
   const home = mkdtempSync(join(tmpdir(), 'cond-rm-http-'));
   const prev = process.env.CONDUCTOR_HOME;
   process.env.CONDUCTOR_HOME = home;
-  const start = normalizeConfig({ ...defaultConfig(), projects: { ENG: { policy: 'approve-risky' } }, pipeline: { ...defaultConfig().pipeline, policy: 'approve-plan', planApproval: 'first', limitRule: 'wait' } } as any);
+  const start = normalizeConfig({ ...defaultConfig(), projects: { ENG: { policy: 'approve-risky' } }, pipeline: { ...defaultConfig().pipeline, runMode: 'per-settings', policy: 'approve-plan', planApproval: 'first', limitRule: 'wait' } } as any);
   const rt = await createRuntime({
     config: start,
     models: false,
@@ -345,10 +348,7 @@ test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; 
         if (o.body !== undefined) r.write(JSON.stringify(o.body));
         r.end();
       });
-    const u = new URL(rt.server.loginUrl());
-    const login = await new Promise<import('node:http').IncomingMessage>((res) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res));
-    const cookie = String(login.headers['set-cookie']?.[0]).split(';')[0]!;
-    const state = (await req('/api/state', { headers: { cookie } })).json;
+    const state = (await req('/api/state')).json;
     const csrf = state.csrf;
     // T6
     assert.equal(state.settings.runMode, 'per-settings');
@@ -357,19 +357,19 @@ test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; 
     assert.equal(state.engine.runMode, 'per-settings');
     assert.ok(state.waiting && typeof state.waiting.total === 'number', 'M8-5: waiting on GET /api/state');
     assert.deepEqual([state.waiting.total, state.waiting.bulkApprovable, state.waiting.eligible], [0, 0, []]);
-    const mut = { cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' };
+    const mut = { 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' };
     const on = { runMode: 'complete-auto', confirm: true };
-    assert.equal((await req('/api/run-mode', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: on })).status, 401);
+    assert.equal((await req('/api/run-mode', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: on })).status, 403, 'no CSRF header');
     const { 'x-conductor-csrf': _drop, ...noCsrf } = mut;
     assert.equal((await req('/api/run-mode', { method: 'PUT', headers: noCsrf, body: on })).status, 403);
     assert.equal((await req('/api/run-mode', { method: 'PUT', headers: { ...mut, 'x-conductor-csrf': 'wrong' }, body: on })).status, 403);
     assert.equal(rt.cfgRef.current.pipeline.runMode, 'per-settings');
     // AC3 baseline after one save (N6), then SSE (T7)
     assert.equal((await req('/api/settings', { method: 'PUT', headers: mut, body: { maxLoops: 3 } })).status, 200);
-    const strip = (o: any) => { const c = JSON.parse(JSON.stringify(o)); delete c.pipeline.runMode; delete c.pipeline.runModeChangedAt; return c; };
+    const strip = (o: any) => { const c = JSON.parse(JSON.stringify(o)); delete c.pipeline.runMode; delete c.pipeline.runModeChangedAt; delete c.pipeline.completeAutoPushAck; return c; };
     const baseline = strip(JSON.parse(readFileSync(paths.config(), 'utf8')));
     const sse = new Promise<string>((resolve, reject) => {
-      const r = http.request({ host: '127.0.0.1', port, path: '/api/events', headers: { cookie } }, (res) => {
+      const r = http.request({ host: '127.0.0.1', port, path: '/api/events' }, (res) => {
         let t = '';
         res.on('data', (c) => {
           t += c;
@@ -385,12 +385,12 @@ test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; 
     assert.deepEqual([res.json.changed, res.json.waiting.total], [true, 0]);
     const frame = await Promise.race([sse, new Promise<string>((_, rej) => setTimeout(() => rej(new Error('no SSE state with runMode')), 5000))]);
     assert.match(frame, /event: state/);
-    const after = (await req('/api/state', { headers: { cookie } })).json;
+    const after = (await req('/api/state')).json;
     assert.deepEqual(after.settings.overriddenByRunMode, ['planApproval', 'policy', 'limitRule']);
     assert.deepEqual([after.settings.limitRule, after.settings.limitRuleEffective, after.settings.planApproval], ['wait', 'switch', 'first'], 'stored values reported as stored');
     let disk = JSON.parse(readFileSync(paths.config(), 'utf8'));
     assert.equal(disk.pipeline.runMode, 'complete-auto');
-    assert.deepEqual(strip(disk), baseline, 'AC3: only pipeline.runMode (+ its timestamp) differs on disk');
+    assert.deepEqual(strip(disk), baseline, 'AC3: only pipeline.runMode (+ its timestamp and the push consent marker) differs on disk');
     assert.equal((await req('/api/run-mode', { method: 'PUT', headers: mut, body: { runMode: 'per-settings' } })).status, 200);
     disk = JSON.parse(readFileSync(paths.config(), 'utf8'));
     assert.equal(disk.pipeline.runMode, 'per-settings');
@@ -401,7 +401,7 @@ test('T4/T6/T7 HTTP: 401 without cookie, 403 without CSRF; /api/state settings; 
     const refused = await req('/api/run-mode', { method: 'PUT', headers: mut, body: on });
     assert.equal(refused.status, 500);
     assert.equal(rt.cfgRef.current.pipeline.runMode, 'per-settings');
-    assert.equal((await req('/api/state', { headers: { cookie } })).json.engine.runMode, 'per-settings');
+    assert.equal((await req('/api/state')).json.engine.runMode, 'per-settings');
   } finally {
     await rt.close();
     if (prev === undefined) delete process.env.CONDUCTOR_HOME;

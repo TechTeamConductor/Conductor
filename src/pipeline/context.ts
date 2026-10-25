@@ -11,6 +11,7 @@ import type { ContextLike } from '../context/service.ts';
 import type { AccountRef } from '../accounts/types.ts';
 import type { LimitRule } from '../accounts/limit-rule.ts';
 import type { Role } from '../agents/roles.ts';
+import type { ScanEnvEntry } from '../git/branchscan.ts';
 
 /** Everything stage logic needs from the engine. Keeps `stages.ts` testable and free of polling concerns. */
 export interface PipelineCtx {
@@ -24,6 +25,10 @@ export interface PipelineCtx {
   persistent: { load(): PersistentState; save(s: PersistentState): void };
   /** Redaction secrets for a run (provider keys, repo env-file values, …). */
   secretsFor(run: Run): string[];
+  /** The .env entries (name + value) the branch scan matches, plus provider secrets as always-qualifying values (autopilot C1). */
+  scanEntriesFor(run: Run): ScanEnvEntry[];
+  /** Pushing is in effect (Complete auto AND its push confirm accepted): Ship scans and pushes; fixtures wait for Ship's scan. */
+  shipEffective(): boolean;
   /** Abort signal of the job currently running for `key`. */
   signal(key: string): AbortSignal;
   emit(key: string, ev: EmitEvent): void;
@@ -54,6 +59,8 @@ export interface PipelineCtx {
   networkState(): Promise<'online' | 'offline' | 'unknown'>;
   /** The project context engine (M4): packs for prompts, refresh, outcome digests. Best-effort — it never fails or blocks a run. */
   context: ContextLike;
+  /** The dashboard's global pause is on (the Stuck resolver stands down while it is). Optional: absent = not paused. */
+  enginePaused?(): boolean;
   /** Ask the engine to run another poll/schedule pass soon. */
   tickSoon(): void;
   /** Latest provider quota/utilisation reported by an agent run (for the dashboard meter). */

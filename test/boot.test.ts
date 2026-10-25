@@ -32,21 +32,12 @@ test('AC1: clean copy (no node_modules) boots; loopback only; 401 without a sess
   try {
     for (let i = 0; i < 100 && !/is running/.test(out); i++) await new Promise((r) => setTimeout(r, 100));
     assert.match(out, /is running → http:\/\/127\.0\.0\.1:/, out);
-    assert.equal((await get(port, '/api/state')).status, 401);
-    assert.equal((await get(port, '/')).status, 302);
+    assert.equal((await get(port, '/api/state')).status, 200, 'no sign-in');
+    assert.equal((await get(port, '/')).status, 200);
     const listeners = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8' });
     assert.ok(listeners.includes('127.0.0.1:' + port) && !/\*:|0\.0\.0\.0|\[::\]/.test(listeners), `must listen on loopback only:\n${listeners}`);
-    // control socket (mode 0600) → one-time link → session → state
-    const otp: { url: string } = await new Promise((resolve, reject) => {
-      const rq = http.request({ socketPath: join(home, 'run', 'control.sock'), path: '/otp', method: 'POST' }, (r) => { let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve(JSON.parse(b))); });
-      rq.on('error', reject);
-      rq.end();
-    });
-    const u = new URL(otp.url);
-    const auth = await get(port, u.pathname + u.search);
-    assert.equal(auth.status, 302);
-    const cookie = String(auth.headers['set-cookie']?.[0]).split(';')[0]!;
-    const st = await get(port, '/api/state', { cookie });
+    // control socket (mode 0600); the dashboard needs no sign-in and hands the UI its CSRF token
+    const st = await get(port, '/api/state');
     assert.equal(st.status, 200);
     assert.ok(JSON.parse(st.body).csrf);
     assert.equal((execFileSync('stat', ['-f', '%Lp', join(home, 'run', 'control.sock')], { encoding: 'utf8' })).trim(), '600');

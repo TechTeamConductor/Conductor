@@ -62,3 +62,20 @@ test('risks are always computed and shown when a plan is held for another reason
   const a = decideApproval({ plan: plan({ testing: { commands: ['git push'], cases: [] } }), policy: 'full-auto', forced: { protectedPaths: false, untrusted: false, bigGraph: false }, firstPlanHold: false });
   assert.deepEqual([a.auto, a.risks.length], [true, 0]);
 });
+
+test('review M4 pin: self-heal (scope revert, empty retry, fixture rewrite), Ship is Complete-auto-only (and needs the push consent); the always-on safety fixes are not modes', async () => {
+  const { effectiveHeal, effectiveShip } = await import('../src/policy/policy.ts');
+  const { HEAL_BUDGET } = await import('../src/pipeline/selfheal.ts');
+  const cfg = (runMode: string, ack: boolean) => ({ pipeline: { runMode, ...(ack ? { completeAutoPushAck: 1700000000000 } : {}) } }) as any;
+  for (const cause of Object.keys(HEAL_BUDGET) as Array<keyof typeof HEAL_BUDGET>) {
+    assert.equal(effectiveHeal(cfg('per-settings', true), cause, 0), false, `${cause}: never in Per settings`);
+    assert.equal(effectiveHeal(cfg('complete-auto', true), cause, 0), true, `${cause}: once in Complete auto`);
+    assert.equal(effectiveHeal(cfg('complete-auto', true), cause, HEAL_BUDGET[cause]), false, `${cause}: only once`);
+  }
+  assert.equal(effectiveShip(cfg('per-settings', true)), false, 'the consent alone never ships in Per settings');
+  assert.equal(effectiveShip(cfg('complete-auto', false)), false, 'Complete auto without the push consent never ships');
+  assert.equal(effectiveShip(cfg('complete-auto', true)), true);
+  // the always-on fixes take NO mode: their entry points do not read the run mode
+  const { readFileSync } = await import('node:fs');
+  for (const f of ['../src/git/envvalues.ts', '../src/git/worktree.ts']) assert.doesNotMatch(readFileSync(new URL(f, import.meta.url), 'utf8'), /runMode|isCompleteAuto/, `${f} is mode-independent`);
+});

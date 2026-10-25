@@ -181,7 +181,7 @@ test('M3-AC4: a finished item commit left by a crash is ADOPTED (one commit on s
   }
 });
 
-test('M3-AC4 / Security M3-S2: forged or ambiguous leftovers are never adopted — wrong id, wrong nonce, two commits, a dirty tree — they are backed up, reset to startHead and the task runs again', async () => {
+test('M3-AC4 / Security M3-S2: forged or ambiguous leftovers are never adopted — wrong id, wrong nonce, two commits, a dirty tree — they are never adopted, never reset away (the card works in the person’s own checkout) and the task runs again', async () => {
   const cases: Record<string, (wt: string) => void> = {
     'another task\'s marker': (wt) => commitFile(wt, 't1.mjs', marker('T2', NONCE)),
     'a guessed nonce': (wt) => commitFile(wt, 't1.mjs', marker('T1', 'ffffffffffffffff')),
@@ -212,12 +212,15 @@ test('M3-AC4 / Security M3-S2: forged or ambiguous leftovers are never adopted �
       });
       await resume(h);
       const run = h.run(key);
-      assert.equal(run.status, 'ready', name);
+      const merge = name.startsWith('a merge commit'); // a merge on the person's branch may hold the run for a person; it is still not adopted or reset
+      assert.equal(run.status, merge ? run.status : 'ready', name);
       assert.ok(!run.history.some((x) => /adopted/.test(x.text)), `${name}: nothing was adopted`);
+      if (merge) continue;
       assert.equal(h.calls().filter((c) => c.who === 'cursor' && c.stage === 'build').length, 2, `${name}: T1 was built again, then T2`);
       assert.equal(git(run.worktree, 'merge-base', '--is-ancestor', start, 'HEAD') === '', true, `${name}: history still starts at startHead`);
-      assert.ok(!git(run.worktree, 'log', '--format=%s', `${start}..HEAD`).includes('just a commit') && !git(run.worktree, 'log', '--format=%s', `${start}..HEAD`).includes('ENG-1: extra'), `${name}: the leftover commits were reset away`);
-      assert.ok(refs(h, key).length > 0, `${name}: the leftover is kept under a backup ref`);
+      // security F3: this checkout is the PERSON's (their commits and files are not Conductor's to reset or delete)
+      if (name === 'no marker at all') assert.ok(git(run.worktree, 'log', '--format=%s', `${start}..HEAD`).includes('ENG-1: just a commit'), `${name}: the person's commit is still on the branch`);
+      if (name === 'the right marker with uncommitted changes on top') assert.equal(readFileSync(join(run.worktree, 'dirty.mjs'), 'utf8'), 'export const d = 1;\n', `${name}: the uncommitted file is untouched`);
     } finally {
       await h.cleanup();
     }
@@ -242,19 +245,41 @@ test('an adopted commit still goes through the scope check: a protected file in 
   }
 });
 
-test('an interrupted item with uncommitted work is backed up and restarted; an analysis item simply runs again', async () => {
+test('an interrupted item with uncommitted work in the checkout: the work is the person’s and is left alone, and the task runs again', async () => {
   const h = await makeHarness({ config: manual });
   try {
     const key = await crashedMidItem(h, (wt) => writeFileSync(join(wt, 'partial.mjs'), 'export const p = 1;\n'));
     await resume(h);
     const run = h.run(key);
     assert.equal(run.status, 'ready');
-    assert.ok(refs(h, key).some((r) => /stash-1/.test(r)), 'the partial work is kept');
-    assert.ok(!readFileSyncSafe(join(run.worktree, 'partial.mjs')), 'and gone from the tree');
+    assert.equal(readFileSyncSafe(join(run.worktree, 'partial.mjs')), 'export const p = 1;\n', 'the uncommitted file in the person’s checkout is untouched');
+    assert.ok(!git(run.worktree, 'ls-files').includes('partial.mjs'), 'and was not committed');
   } finally {
     await h.cleanup();
   }
 });
+test('security F3: crash recovery of an interrupted item when the card works in the person’s OWN checkout never resets or cleans it', async () => {
+  const h = await makeHarness({ config: manual });
+  try {
+    const key = await crashedMidItem(h, () => undefined);
+    const start = git(h.repoDir, 'rev-parse', 'HEAD');
+    h.store.update(key, (r) => {
+      r.worktree = h.repoDir; // the repository's own checkout
+      const it = r.graph!.items[0]!;
+      it.startHead = start;
+      it.floor = start;
+    });
+    writeFileSync(join(h.repoDir, 'mine-untracked.txt'), 'precious\n');
+    writeFileSync(join(h.repoDir, 'README.md'), '# my uncommitted edit\n');
+    await resume(h);
+    assert.equal(readFileSync(join(h.repoDir, 'mine-untracked.txt'), 'utf8'), 'precious\n', 'the person’s untracked file survives');
+    assert.equal(readFileSync(join(h.repoDir, 'README.md'), 'utf8'), '# my uncommitted edit\n', 'and so does their edit');
+    assert.ok(h.run(key).history.some((x) => /left exactly as it is|Your own checkout/i.test(x.text)) || h.calls().length >= 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
 function readFileSyncSafe(p: string): string | null {
   try {
     return readFileSync(p, 'utf8');

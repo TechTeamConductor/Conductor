@@ -1,8 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { randomToken } from '../util.ts';
 import type { RunStore } from '../store.ts';
 import type { Engine } from '../pipeline/engine.ts';
 import { logger } from '../log.ts';
@@ -10,7 +9,7 @@ import { errMsg } from '../util.ts';
 import { Api, ApiFail, accountRoute } from './api.ts';
 import { AccountError } from '../accounts/service.ts';
 
-/** M8-3 S11: control-socket account routes — an exact method + path allow-list, ≤ 16 KB JSON bodies, no login route. */
+/** M8-3 S11: control-socket account routes — an exact method + path allow-list, ≤ 16 KB JSON bodies. */
 export const CONTROL_BODY_MAX = 16 * 1024;
 const CONTROL_ID = '[a-z0-9][a-z0-9-]{0,31}';
 export const CONTROL_ROUTES: readonly { method: string; re: RegExp }[] = Object.freeze([
@@ -32,7 +31,7 @@ export function controlDirOk(dir: string): boolean {
     return false;
   }
 }
-import { Auth, COOKIE_NAME, clearCookie, parseCookies, sessionCookie } from './auth.ts';
+import { timingSafeEqual } from 'node:crypto';
 
 const log = logger('http');
 const MAX_BODY = 1024 * 1024;
@@ -48,40 +47,23 @@ const SECURITY_HEADERS: Record<string, string> = {
 };
 
 /** Exact static whitelist — there is no directory serving, so traversal is impossible by construction. */
-const STATIC: Record<string, { file: string; type: string; public: boolean }> = {
-  '/': { file: 'index.html', type: 'text/html; charset=utf-8', public: false },
-  '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8', public: false },
-  '/modes.js': { file: 'modes.js', type: 'text/javascript; charset=utf-8', public: false },
-  '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8', public: true },
-  '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml', public: true },
+const STATIC: Record<string, { file: string; type: string }> = {
+  '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
+  '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/modes.js': { file: 'modes.js', type: 'text/javascript; charset=utf-8' },
+  '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
+  '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
 };
-
-const LOGIN_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conductor — sign in</title><link rel="stylesheet" href="/style.css"><link rel="icon" href="/favicon.svg"></head><body><main><h1>Conductor</h1><p>This dashboard is private to your Mac. To open it, run this in a terminal:</p><pre><code>conductor open</code></pre><p>It opens a fresh signed-in tab — the link works once.</p></main></body></html>`;
-
 export interface ServerDeps {
   api: Api;
-  auth: Auth;
+  /** Per-process random CSRF token, handed only to the same-origin UI in the GET /api/state body. */
+  csrf: string;
   store: RunStore;
   engine: Engine;
   uiDir: string;
 }
 
 type Sse = { res: http.ServerResponse; alive: boolean };
-
-function safeList(dir: string): string[] {
-  try {
-    return readdirSync(dir);
-  } catch {
-    return [];
-  }
-}
-function rmQuiet(file: string): void {
-  try {
-    unlinkSync(file);
-  } catch {
-    /* already gone */
-  }
-}
 
 export class DashboardServer {
   readonly server: http.Server;
@@ -93,7 +75,6 @@ export class DashboardServer {
   private pingTimer: NodeJS.Timeout | null = null;
   private unsubs: (() => void)[] = [];
   private sockPath: string | null = null;
-  private bridgeDir: string | null = null;
 
   constructor(deps: ServerDeps) {
     this.d = deps;
@@ -126,7 +107,7 @@ export class DashboardServer {
     return this.port;
   }
 
-  /** Unix-socket control channel (0600): `conductor open` asks for a one-time sign-in link. */
+  /** Unix-socket control channel (0700 folder, 0600 socket): the CLI's account commands and `/status`. */
   async listenControl(sockPath: string): Promise<void> {
     const dir = dirname(sockPath);
     try {
@@ -145,9 +126,7 @@ export class DashboardServer {
     this.sockPath = sockPath;
     this.control = http.createServer((req, res) => {
       res.setHeader('Content-Type', 'application/json');
-      if (req.method === 'POST' && req.url === '/otp') {
-        res.end(JSON.stringify({ url: this.loginUrl(), file: this.loginFile(this.sockPath ? dirname(this.sockPath) : '') }));
-      } else if (req.method === 'GET' && req.url === '/status') {
+      if (req.method === 'GET' && req.url === '/status') {
         res.end(JSON.stringify({ pid: process.pid, port: this.port }));
       } else if (CONTROL_ROUTES.some((r) => r.method === req.method && r.re.test(req.url ?? ''))) {
         void this.controlAccounts(req, res);
@@ -206,27 +185,6 @@ export class DashboardServer {
     }
   }
 
-  loginUrl(): string {
-    return `http://127.0.0.1:${this.port}/auth?otp=${this.d.auth.mintOtp()}`;
-  }
-
-  /**
-   * H4: the one-time code must not appear on a command line (visible to every process of this user via `ps`).
-   * Write a private 0600 page that POSTs it to /auth and open THAT file instead.
-   */
-  loginFile(dir: string): string {
-    if (!dir) return '';
-    this.bridgeDir = dir;
-    for (const f of safeList(dir)) if (/^open-[a-f0-9]+\.html$/.test(f)) rmQuiet(join(dir, f));
-    const file = join(dir, `open-${randomToken(8).replace(/[^a-f0-9]/gi, 'a').toLowerCase()}.html`);
-    const otp = this.d.auth.mintOtp();
-    const page = `<!doctype html><meta charset="utf-8"><title>Opening Conductor…</title><body style="font:15px system-ui;margin:3em">Opening Conductor…<form id="f" method="post" action="http://127.0.0.1:${this.port}/auth"><input type="hidden" name="otp" value="${otp}"><noscript><button>Continue</button></noscript></form><script>document.getElementById('f').submit()</script></body>`;
-    writeFileSync(file, page, { mode: 0o600 });
-    const t = setTimeout(() => rmQuiet(file), 120_000);
-    t.unref();
-    return file;
-  }
-
   toast(level: 'info' | 'warn' | 'error', text: string): void {
     this.broadcast('toast', { level, text });
   }
@@ -282,6 +240,13 @@ export class DashboardServer {
     return host === `127.0.0.1:${this.port}` || host === `localhost:${this.port}`;
   }
 
+  private csrfOk(got: string | string[] | undefined): boolean {
+    if (typeof got !== 'string') return false;
+    const a = Buffer.from(got);
+    const b = Buffer.from(this.d.csrf);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
+
   private send(res: http.ServerResponse, status: number, body: string | Buffer, type = 'text/plain; charset=utf-8', extra: Record<string, string | string[]> = {}): void {
     res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Type': type, ...extra });
     res.end(body);
@@ -322,41 +287,7 @@ export class DashboardServer {
       const url = new URL(rawUrl, `http://${host}`);
       const method = (req.method ?? 'GET').toUpperCase();
       const path = url.pathname;
-      const sid = parseCookies(req.headers.cookie)[COOKIE_NAME];
-      const authed = this.d.auth.validSession(sid);
-
-      // ── public routes
-      if (method === 'GET' && path === '/login') return this.send(res, 200, LOGIN_PAGE, 'text/html; charset=utf-8');
-      if (method === 'GET' && path === '/auth') {
-        const s = this.d.auth.consumeOtp(url.searchParams.get('otp') ?? '');
-        if (!s) return this.send(res, 403, LOGIN_PAGE.replace('<p>This dashboard', '<p><strong>That sign-in link has expired or was already used.</strong></p><p>This dashboard'), 'text/html; charset=utf-8');
-        return this.send(res, 302, '', 'text/plain', { Location: '/', 'Set-Cookie': sessionCookie(s) });
-      }
-      if (method === 'POST' && path === '/auth') {
-        // form-encoded (the bridge page); one-time code only. A fresh session is returned with a 200 + meta refresh, because
-        // a redirect would stay a cross-site navigation and the SameSite=Strict cookie would not be sent with it.
-        const chunks: Buffer[] = [];
-        let n = 0;
-        for await (const c of req) {
-          n += (c as Buffer).length;
-          if (n > 4096) return this.fail(res, 413, 'too_large', 'Too large.');
-          chunks.push(c as Buffer);
-        }
-        const s = this.d.auth.consumeOtp(new URLSearchParams(Buffer.concat(chunks).toString('utf8')).get('otp') ?? '');
-        if (!s) return this.send(res, 403, LOGIN_PAGE.replace('<p>This dashboard', '<p><strong>That sign-in link has expired or was already used.</strong></p><p>This dashboard'), 'text/html; charset=utf-8');
-        const dir = this.bridgeDir ?? '';
-        if (dir) for (const f of safeList(dir)) if (/^open-[a-f0-9]+\.html$/.test(f)) rmQuiet(join(dir, f));
-        return this.send(res, 200, '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>Signed in</title><a href="/">Continue</a>', 'text/html; charset=utf-8', { 'Set-Cookie': sessionCookie(s) });
-      }
       const st = method === 'GET' || method === 'HEAD' ? STATIC[path] : undefined;
-      if (st && st.public) return this.serveStatic(res, st);
-
-      // ── everything else needs a session
-      if (!authed) {
-        if (path.startsWith('/api/')) return this.fail(res, 401, 'unauthorized', 'Session expired — run "conductor open" in a terminal.');
-        if (method === 'GET' && st) return this.send(res, 302, '', 'text/plain', { Location: '/login' });
-        return this.fail(res, 401, 'unauthorized', 'Sign in first.');
-      }
       if (st) return this.serveStatic(res, st);
       if (!path.startsWith('/api/')) return this.fail(res, 404, 'not_found', 'Not found.');
 
@@ -365,12 +296,12 @@ export class DashboardServer {
       if (method === 'GET' && typeof sfsGet === 'string' && sfsGet !== 'same-origin' && sfsGet !== 'none') return this.fail(res, 403, 'cross_site', 'Cross-site requests are not allowed.');
       if (method === 'GET' && path === '/api/events') return this.openStream(req, res);
 
-      if (method === 'GET') return this.runApi(res, method, path, url.searchParams, {}, sid);
+      if (method === 'GET') return this.runApi(res, method, path, url.searchParams, {});
 
       // ── mutations: JSON only, same-origin only, CSRF header
       if (method !== 'POST' && method !== 'PUT' && method !== 'DELETE') return this.fail(res, 405, 'method', 'Method not allowed.');
       if (!/^application\/json(;|$)/i.test(String(req.headers['content-type'] ?? ''))) return this.fail(res, 415, 'content_type', 'Use Content-Type: application/json.');
-      if (req.headers['x-conductor-csrf'] !== this.d.auth.csrf) return this.fail(res, 403, 'csrf', 'Missing or wrong CSRF token — reload the page.');
+      if (!this.csrfOk(req.headers['x-conductor-csrf'])) return this.fail(res, 403, 'csrf', 'Missing or wrong CSRF token — reload the page.');
       const sfs = req.headers['sec-fetch-site'];
       const origin = req.headers.origin;
       if (typeof sfs === 'string') {
@@ -380,7 +311,7 @@ export class DashboardServer {
       } else return this.fail(res, 403, 'cross_site', 'Requests must come from the dashboard.');
       const b = await this.readBody(req);
       if (!b.ok) return this.fail(res, b.status, b.code, b.message);
-      return this.runApi(res, method, path, url.searchParams, b.body, sid);
+      return this.runApi(res, method, path, url.searchParams, b.body);
     } catch (e) {
       log.error(`request failed: ${errMsg(e)}`);
       if (!res.headersSent) this.fail(res, 500, 'internal', 'Something went wrong inside Conductor (details are in the log).');
@@ -388,13 +319,9 @@ export class DashboardServer {
     }
   }
 
-  private async runApi(res: http.ServerResponse, method: string, path: string, q: URLSearchParams, body: unknown, sid: string | undefined): Promise<void> {
+  private async runApi(res: http.ServerResponse, method: string, path: string, q: URLSearchParams, body: unknown): Promise<void> {
     try {
       const r = await this.d.api.handle(method, path, q, body);
-      if (r.logout) {
-        this.d.auth.revoke(sid);
-        return this.json(res, r.status ?? 200, r.json ?? { ok: true }, { 'Set-Cookie': clearCookie() });
-      }
       return this.json(res, r.status ?? 200, r.json ?? { ok: true });
     } catch (e) {
       if (e instanceof ApiFail) return this.fail(res, e.status, e.code, e.message, e.field, e.extra);

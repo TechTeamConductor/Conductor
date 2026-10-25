@@ -5,6 +5,7 @@ import type {
 import type { RunStore } from '../store.ts';
 import { fmtDuration, isUuid, shellQuote, truncate } from '../util.ts';
 import { isReady, nextBuildRole } from './graph.ts';
+import { effectiveShip } from '../policy/policy.ts';
 
 export function columnOf(run: Run): BoardColumn {
   if (run.pushedAt && (run.status === 'ready' || run.status === 'finished')) return 'pushed';
@@ -12,15 +13,17 @@ export function columnOf(run: Run): BoardColumn {
     case 'queued':
       return 'queued';
     case 'running':
+      if (run.next === 'plan_review') return 'plan_ready';
       return run.stage === 'build' ? 'building' : run.stage === 'verify' ? 'verifying' : 'planning';
     case 'awaiting_approval':
       return 'plan_ready';
+    // The Stuck resolver column absorbs the old Paused column (internal id stays `needs_human`).
+    // A parked run shows here too, but its board lane stays `backlog` (the lane is stored, never derived from this).
     case 'needs_human':
-      return 'needs_human';
     case 'paused':
     case 'parked':
     case 'failed':
-      return 'paused';
+      return 'needs_human';
     case 'ready':
       return 'ready';
     default:
@@ -52,24 +55,24 @@ export function workingAgent(run: Run, cfg: Config): ProviderId | null {
 const STAGE_VERB: Record<string, string> = { plan: 'planning', plan_review: 'reviewing the plan', build: 'building', verify: 'verifying' };
 
 export function activityOf(run: Run, cfg: Config, now: number): string {
-  if (run.pushedAt && (run.status === 'ready' || run.status === 'finished')) return `Pushed to ${run.branch || 'the current branch'}`;
+  if (run.pushedAt && (run.status === 'ready' || run.status === 'finished')) return `Pushed to ${(run as { pushedBranch?: string }).pushedBranch || run.branch || 'the current branch'}`;
   const since = run.stageStartedAt ? ` · ${fmtDuration(now - run.stageStartedAt)}` : '';
   switch (run.status) {
     case 'queued':
       return 'Waiting for a free slot';
     case 'running': {
       const a = workingAgent(run, cfg);
-      const stage = run.stage ?? 'plan';
+      const stage = run.next === 'plan_review' ? 'plan_review' : run.stage ?? 'plan';
       return a ? `${providerLabel(a)} is ${STAGE_VERB[stage] ?? stage}${since}` : `Preparing the workspace${since}`;
     }
     case 'awaiting_approval':
-      return 'Plan ready — waiting for your approval';
+      return 'Plan review — needs your approval';
     case 'needs_human':
-      return run.needsHuman ? truncate(run.needsHuman.reason.replace(/\s+/g, ' '), 200) : 'Needs you';
+      return run.needsHuman ? truncate(run.needsHuman.reason.replace(/\s+/g, ' '), 200) : 'Stuck resolver';
     case 'paused':
-      return `Paused until ${new Date(run.pausedUntil ?? now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — ${truncate(run.pauseReason ?? 'usage limit', 120)}`;
+      return `Waiting for the usage limit — the resolver will resume it (${new Date(run.pausedUntil ?? now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${truncate(run.pauseReason ?? 'usage limit', 120)})`;
     case 'parked':
-      return 'Parked — move the issue to Todo to continue';
+      return 'Parked by you — move it to To do';
     case 'ready':
       return run.unverified ? 'Done — not verified by tests' : 'Done';
     case 'failed':
@@ -145,6 +148,9 @@ export function toSummary(run: Run, cfg: Config, now: number): ApiRunSummary {
     canPark: !['finished', 'aborted', 'parked'].includes(st),
     canFinish: !['finished', 'aborted'].includes(st),
     canPush: (st === 'ready' || st === 'finished') && !run.pushedAt,
+    shipHold: st === 'ready' && !run.pushedAt && run.shipHold ? { reason: run.shipHold.reason } : null,
+    shipUnblocked: !!run.shipUnblockedAt,
+    canUnblockDependants: st === 'ready' && !run.pushedAt && !run.answered && !!run.commitSha && !run.shipUnblockedAt && effectiveShip(cfg),
     ...(run.graph ? { taskProgress: graphProgress(run) } : {}),
     // M8-4 (C4/N3c/N3e): only meaningful while waiting. ABSENT on the run counts as forced (a run held before M8-4) — fail closed.
     forcedHold: st === 'awaiting_approval' ? run.forcedHold !== false : false,
@@ -182,6 +188,7 @@ export function toDetail(store: RunStore, run: Run, cfg: Config, now: number): A
     worktree: run.worktree,
     baseSha: run.baseSha,
     commitSha: run.commitSha ?? null,
+    landedShas: run.landedShas ?? [],
     complexity: run.complexity ?? null,
     sessions,
     plan,

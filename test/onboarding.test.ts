@@ -68,7 +68,7 @@ test('sample project: one constant location, idempotent, never adopts a folder w
   const h = await makeHarness();
   try {
     process.env.HOME = tmp();
-    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: (c) => { Object.assign(h.cfg, c); }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: (c) => { Object.assign(h.cfg, c); }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     const call = (m: string, p: string, b: any = {}) => api.handle(m, p, new URLSearchParams(), b) as Promise<any>;
     await assert.rejects(call('POST', '/api/setup/sample', { path: '/etc' }), (e: any) => e.status === 400);
     const r = await call('POST', '/api/setup/sample');

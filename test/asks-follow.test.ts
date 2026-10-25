@@ -207,7 +207,7 @@ test('follow-up API: `follow` is accepted for quick asks, rejected for research 
   try {
     h.scenario({ claude: { '*': { ask: [answer('one'), answer('two')] } } });
     const asks = await svc(h);
-    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, } as any);
+    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, } as any);
     const call = (m: string, p: string, b: any = {}) => api.handle(m, p, new URLSearchParams(), b);
     const first: any = await call('POST', '/api/ask', { question: 'one' });
     await asks.idle();

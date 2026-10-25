@@ -16,13 +16,12 @@ const clock = new ManualClock();
 const spawns: SpawnOpts[] = [];
 let rt: Runtime;
 let port = 0;
-let cookie = '';
 let csrf = '';
 
 function call(path: string, method = 'GET', body?: unknown, opts: { raw?: string; csrf?: boolean } = {}): Promise<{ status: number; json: any; ms: number }> {
   const t0 = Date.now();
   return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { cookie, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' };
+    const headers: Record<string, string> = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' };
     if (opts.csrf !== false) headers['x-conductor-csrf'] = csrf;
     const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
       let t = '';
@@ -66,9 +65,6 @@ before(async () => {
     },
   });
   port = await rt.server.listen(0);
-  const u = new URL(rt.server.loginUrl());
-  const r = await new Promise<http.IncomingMessage>((res) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res));
-  cookie = String(r.headers['set-cookie']?.[0]).split(';')[0]!;
   csrf = (await call('/api/state')).json.csrf;
 });
 after(async () => {

@@ -50,7 +50,7 @@ test('project settings API: strict body, full-auto needs an explicit confirmatio
   const h = await makeHarness();
   try {
     let saved: any = null;
-    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: (c) => { saved = c; }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: (c) => { saved = c; }, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     const put = (b: any) => api.handle('PUT', '/api/projects/ENG/settings', new URLSearchParams(), b) as Promise<any>;
     await assert.rejects(put({ policy: 'yolo' }), (e: any) => e.status === 400);
     await assert.rejects(put({ policy: 'approve-risky', limits: {} }), (e: any) => e.status === 400);
@@ -66,7 +66,7 @@ test('Security blocker: changing context settings never resets the project polic
   try {
     h.cfg.projects = { ENG: { policy: 'manual-stages' } } as any;
     // M8-4 N1 (persist then swap): the handler builds a NEW config and hands it to saveConfig, which swaps memory — the stand-in applies it
-    const api = new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: (c) => void Object.assign(h.cfg, c), persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+    const api = new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: (c) => void Object.assign(h.cfg, c), persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
     await api.handle('PUT', '/api/projects/ENG/context/settings', new URLSearchParams(), { staleDays: 30, summaries: true });
     assert.equal(h.cfg.projects.ENG!.policy, 'manual-stages');
     assert.equal(h.cfg.projects.ENG!.context!.staleDays, 30);

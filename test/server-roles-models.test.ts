@@ -428,7 +428,6 @@ test('PUT and preview share planRoles (same fitted output); preview output fed b
 // ───────────── over HTTP: CSRF and the body cap ─────────────
 let demo: DemoHandle;
 let port = 0;
-let cookie = '';
 let csrf = '';
 function raw(path: string, opts: { method?: string; headers?: Record<string, string>; body?: string; oversized?: true } = {}): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
@@ -443,14 +442,11 @@ function raw(path: string, opts: { method?: string; headers?: Record<string, str
     req.end();
   });
 }
-const mut = (extra: Record<string, string> = {}) => ({ cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
+const mut = (extra: Record<string, string> = {}) => ({ 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
 before(async () => {
   demo = await startDemo({ port: 0, pollMs: 150, delayMs: 15 });
   port = demo.rt.server.listeningPort;
-  const u = new URL(demo.rt.server.loginUrl());
-  const r = await new Promise<http.IncomingMessage>((res, rej) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res).on('error', rej));
-  cookie = String(r.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
-  csrf = JSON.parse((await raw('/api/state', { headers: { cookie } })).text).csrf;
+  csrf = JSON.parse((await raw('/api/state')).text).csrf;
 });
 after(async () => {
   await demo.close();
@@ -461,7 +457,7 @@ test('preview without CSRF ⇒ 403; cross-site ⇒ 403; same body cap as PUT; er
   const body = JSON.stringify({ roles: {} });
   for (const path of ['/api/roles/preview', '/api/roles']) {
     const method = path.endsWith('preview') ? 'POST' : 'PUT';
-    assert.equal((await raw(path, { method, headers: { cookie, 'content-type': 'application/json' }, body })).status, 403, `${path} missing csrf`);
+    assert.equal((await raw(path, { method, headers: { 'content-type': 'application/json' }, body })).status, 403, `${path} missing csrf`);
     assert.equal((await raw(path, { method, headers: mut({ 'sec-fetch-site': 'cross-site' }), body })).status, 403, `${path} cross-site`);
     const big = JSON.stringify({ roles: {}, pad: 'x'.repeat(1_100_000) });
     assert.equal((await raw(path, { method, headers: mut(), body: big, oversized: true })).status, 413, `${path} body cap`);

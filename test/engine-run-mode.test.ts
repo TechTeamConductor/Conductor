@@ -160,7 +160,7 @@ test('N3e: a run held before M8-4 (no forcedHold on disk) loads without one and 
 });
 
 // ───────────────────────── commit 3: "Approve waiting plans" (T10, AC8, S9b) ─────────────────────────
-const apiFor = (h: Harness) => new Api({ engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
+const apiFor = (h: Harness) => new Api({ engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, probe: async () => ({ ok: true, detail: '', durationMs: 1 }) });
 
 test('T10 approve-waiting: only listed, non-forced, no-risk, rev-matching runs are approved — every skip reason, pre-slice holds and design cards (S9b) skipped', async () => {
   const h = await makeHarness({ config: (c) => void ((c.pipeline as any).policy = 'approve-plan') });

@@ -256,7 +256,7 @@
         { t: 'Approve', d: approve },
         { t: 'Build', d: who('implementation', 'Cursor') + ' writes the code in a worktree' },
         { t: 'Verify', d: 'Gates and ' + who('verification', 'Claude') + ' check every criterion' },
-        { t: 'Push', d: 'You push the current branch as yourself. Conductor does not switch or merge branches' },
+        { t: 'Push', d: 'Done cards are pushed as you to the branch you have checked out, never to main or by force' },
       ],
       howTail: planApproval === 'auto' ? '' : ' or a plan needs approval',
     };
@@ -342,7 +342,7 @@
   };
   /** Must match `COMPLETE_AUTO_CONFIRM` in `src/server/api.ts` (M8-5 B2). */
   const COMPLETE_AUTO_CONFIRM =
-    'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. Nothing is pushed or merged, and the checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Commits stay on the local worktree. Send "confirm": true.';
+    'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. The checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Complete auto also pushes finished work without asking you: to the branch currently checked out in each repository, on that repository\'s push remote, as your own git identity with the ticket key in the commit subject. Only commits Conductor made are pushed, after the secret and protected-file scans pass. The builder agent itself never pushes, and nothing is pushed to the default branch, a protected name (main, master, develop, release...) or by force; if the checked-out branch cannot be used, Conductor pushes to its own conductor/ branch instead. Pushed work is visible to everyone with access to the remote. To turn pushing off, leave Complete auto. Complete auto is the default for new installs; you can switch to Per settings at any time. Accepting this confirm is the one-time push consent: nothing is pushed until you do. Send "confirm": true.';
   const SKIP_REASON_LABEL = Object.freeze({
     forced: 'Held for a safety reason',
     risky: 'Needs a per-card risk confirmation',
@@ -350,6 +350,12 @@
     not_waiting: 'No longer waiting for approval',
     missing: 'Card not found',
   });
+  /** Push: the card line when Ship is holding a push. Feature-detected (an older server sends no `shipHold`); text only, capped. */
+  const shipHoldText = (run) => {
+    const h = run && typeof run === 'object' ? run.shipHold : null;
+    const reason = h && typeof h === 'object' && typeof h.reason === 'string' ? h.reason.trim() : '';
+    return reason ? 'Not pushed yet: ' + reason.slice(0, 400) : '';
+  };
   const isCompleteAuto = (runMode) => runMode === 'complete-auto';
   const runModeOverridden = (overridden, key) => Array.isArray(overridden) && overridden.includes(key);
   /** Body for POST /api/runs/approve-waiting — only the server's eligible list (Security). */
@@ -462,7 +468,7 @@
     selFields, selOf, sameSel, withSel, moreNote,
     RESEARCH_COL, isAskId, boardExtras, partTip, waitNote, researchCounts,
     LIMIT_RULE_LABEL, LIMIT_RULE_HINT, movedChip,
-    COMPLETE_AUTO_CONFIRM, isCompleteAuto, runModeOverridden, approveWaitingBody, skipReasonLabel,
+    COMPLETE_AUTO_CONFIRM, shipHoldText, isCompleteAuto, runModeOverridden, approveWaitingBody, skipReasonLabel,
     followTarget, answerToText, reportToText, webAnswerToText, codeReportToText, modesFor, scopeOf,
   });
 })();

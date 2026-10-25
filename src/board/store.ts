@@ -548,13 +548,23 @@ export class Board {
   }
 
   /**
-   * Items the engine may start: top-level, in To do, auto-start, all dependencies done. Only `work` by default (K4: ask/research
+   * Items the engine may start: top-level, in To do, auto-start, all dependencies done (and, when the engine injects `dependencyShipped`, pushed). Only `work` by default (K4: ask/research
    * cards have no runner until M5 — otherwise they would run through the build pipeline). The engine also requires "no run yet".
    */
-  claimable(kinds: readonly ItemKind[] = ['work']): WorkItem[] {
+  claimable(kinds: readonly ItemKind[] = ['work'], dependencyShipped?: (dep: WorkItem, dependant: WorkItem) => boolean): WorkItem[] {
     return this.items({ lane: 'todo', parentId: null }).filter((i) => {
       if (!i.autoStart || !kinds.includes(i.kind) || !AUTO_START_KINDS.has(i.kind)) return false;
-      return i.dependsOn.every((d) => this.itemsById.get(d)?.lane === 'done');
+      // `dependencyShipped` is supplied by the engine and only ever ADDS a condition on a dependency that is already Done. Absent ⇒ today's rule.
+      return i.dependsOn.every((d) => {
+        const dep = this.itemsById.get(d);
+        if (dep?.lane !== 'done') return false;
+        if (!dependencyShipped) return true;
+        try {
+          return dependencyShipped(cloneItem(dep), cloneItem(i));
+        } catch {
+          return true; // a broken predicate never deadlocks the board: fall back to Done-gating
+        }
+      });
     });
   }
 

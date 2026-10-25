@@ -7,7 +7,6 @@ import { startDemo, type DemoHandle } from '../src/demo.ts';
 
 let demo: DemoHandle;
 let port = 0;
-let cookie = '';
 let csrf = '';
 
 function raw(path: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; text: string }> {
@@ -22,9 +21,9 @@ function raw(path: string, opts: { method?: string; headers?: Record<string, str
     req.end();
   });
 }
-const mut = (extra: Record<string, string> = {}) => ({ cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
+const mut = (extra: Record<string, string> = {}) => ({ 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
 const get = async (p: string) => {
-  const r = await raw(p, { headers: { cookie } });
+  const r = await raw(p);
   return { status: r.status, json: r.text ? JSON.parse(r.text) : null };
 };
 const send = async (method: string, p: string, body: unknown, headers = mut()) => {
@@ -41,9 +40,6 @@ const send = async (method: string, p: string, body: unknown, headers = mut()) =
 before(async () => {
   demo = await startDemo({ port: 0, pollMs: 150, delayMs: 15 });
   port = demo.rt.server.listeningPort;
-  const u = new URL(demo.rt.server.loginUrl());
-  const r = await new Promise<http.IncomingMessage>((res, rej) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res).on('error', rej));
-  cookie = String(r.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
   csrf = (await get('/api/state')).json.csrf;
 });
 after(async () => {
@@ -126,9 +122,8 @@ test('PUT /api/roles negatives: non-object bodies, prototype/unknown roles, bad 
 
 test('PUT /api/roles: CSRF and cross-site negatives', async () => {
   const body = { roles: { planning: { providers: ['claude'] } } };
-  assert.equal((await send('PUT', '/api/roles', body, { cookie, 'content-type': 'application/json' } as any)).status, 403, 'missing csrf');
+  assert.equal((await send('PUT', '/api/roles', body, { 'content-type': 'application/json' } as any)).status, 403, 'missing csrf');
   assert.equal((await send('PUT', '/api/roles', body, mut({ 'sec-fetch-site': 'cross-site' }))).status, 403, 'cross-site');
-  assert.equal((await send('PUT', '/api/roles', body, { 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' } as any)).status, 401, 'no cookie');
 });
 
 test('PUT /api/roles: a valid assignment is saved, validated again at load, reflected in the Settings compat fields, and announces where the text goes', async () => {
@@ -203,11 +198,8 @@ test('F-6: the canary cool-down starts BEFORE the run — a canary that throws c
   const d2 = await startDemo({ port: 0, pollMs: 150, delayMs: 15, canary: async () => { throw new Error('canary blew up'); } });
   try {
     const p2 = d2.rt.server.listeningPort;
-    const u = new URL(d2.rt.server.loginUrl());
-    const r0 = await new Promise<http.IncomingMessage>((res, rej) => http.get({ host: '127.0.0.1', port: p2, path: u.pathname + u.search }, res).on('error', rej));
-    const ck = String(r0.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
     const call = (path: string, method: string, body?: unknown, hdr: Record<string, string> = {}) => new Promise<{ status: number; text: string }>((resolve, reject) => {
-      const req = http.request({ host: '127.0.0.1', port: p2, path, method, headers: { cookie: ck, ...hdr } }, (res) => { let t = ''; res.on('data', (c) => (t += c)); res.on('end', () => resolve({ status: res.statusCode ?? 0, text: t })); });
+      const req = http.request({ host: '127.0.0.1', port: p2, path, method, headers: hdr }, (res) => { let t = ''; res.on('data', (c) => (t += c)); res.on('end', () => resolve({ status: res.statusCode ?? 0, text: t })); });
       req.on('error', reject);
       if (body !== undefined) req.write(JSON.stringify(body));
       req.end();

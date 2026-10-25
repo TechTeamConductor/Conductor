@@ -121,7 +121,7 @@ export async function makeHarness(opts: HarnessOpts = {}): Promise<Harness> {
       },
     ],
     agents: { claude: { bin: FAKE_CLAUDE, isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } }, cursor: { bin: FAKE_AGENT } },
-    pipeline: { ...defaultConfig().pipeline, planApproval: 'auto', planReview: 'off', timeoutsMin: { plan: 2, review: 2, build: 2, verify: 2, idle: 1, gate: 2 } },
+    pipeline: { ...defaultConfig().pipeline, runMode: 'per-settings', planApproval: 'auto', planReview: 'off', timeoutsMin: { plan: 2, review: 2, build: 2, verify: 2, idle: 1, gate: 2 } },
     worktreeRoot: join(root, 'worktrees'),
   });
   opts.config?.(cfg);

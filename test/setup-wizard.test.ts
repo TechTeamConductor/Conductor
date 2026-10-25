@@ -12,14 +12,13 @@ import { makeRepo } from './helpers/harness.ts';
 
 let rt: Runtime;
 let port = 0;
-let cookie = '';
 let csrf = '';
 let home = '';
 const secrets = new MemoryStore();
 
 function call(path: string, method = 'GET', body?: unknown): Promise<{ status: number; json: any; text: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path, method, headers: { cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' } }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers: { 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin' } }, (res) => {
       let t = '';
       res.on('data', (c) => (t += c));
       res.on('end', () => {
@@ -51,9 +50,6 @@ before(async () => {
     notify: () => undefined,
   });
   port = await rt.server.listen(0);
-  const u = new URL(rt.server.loginUrl());
-  const r = await new Promise<http.IncomingMessage>((res) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res));
-  cookie = String(r.headers['set-cookie']?.[0]).split(';')[0]!;
   csrf = (await call('/api/state')).json.csrf;
   makeRepo(join(home, 'app'), {});
 });

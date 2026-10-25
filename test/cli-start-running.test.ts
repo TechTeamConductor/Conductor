@@ -1,7 +1,7 @@
-// `conductor start` while another Conductor already runs: it must say so, open the dashboard through the running server's control socket
-// (like `conductor open`), never launch a browser when told not to, and never touch the data folder it does not own.
+// `conductor start` while another Conductor already runs: it must say so, open the running dashboard at its plain URL,
+// never launch a browser when told not to, and never touch the data folder it does not own.
 // Throw-away CONDUCTOR_HOME, free ports, CONDUCTOR_NO_OPEN=1 so no real browser ever starts. Child output is only asserted on, never logged
-// (the printed link carries a one-time sign-in token).
+// (the printed link is the plain loopback URL).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -59,13 +59,13 @@ test('a second `start --no-open` says it is already running, opens nothing and e
     const r = second(env, ['--no-open']);
     assert.equal(r.status, 0);
     assert.match(r.out, /already running/);
-    assert.match(r.out, /conductor open/);
+    assert.doesNotMatch(r.out, /conductor open/);
     assert.doesNotMatch(r.out, /Opened the dashboard/);
     assert.doesNotMatch(r.out, /Open this link/);
   });
 });
 
-test('a second `start` opens the running dashboard through the control socket, and leaves a corrupt config.json and the data folder untouched', { skip }, async () => {
+test('a second `start` opens the running dashboard, and leaves a corrupt config.json and the data folder untouched', { skip }, async () => {
   await withRunningConductor((home, env) => {
     const cfg = join(home, 'config.json');
     writeFileSync(cfg, '{ this is not json');
@@ -74,7 +74,7 @@ test('a second `start` opens the running dashboard through the control socket, a
     const r = second(env, []);
     assert.equal(r.status, 0);
     assert.match(r.out, /already running/);
-    assert.match(r.out, /Open this link: /, 'a link was produced through the open path');
+    assert.match(r.out, /Open this link: http:\/\/127\.0\.0\.1:\d+\/\s/, 'the plain link was produced through the open path');
     assert.deepEqual(readFileSync(cfg), before, 'config.json must not be rewritten or renamed');
     assert.deepEqual(readdirSync(home).sort(), listing, 'no quarantine or temp file may appear in the data folder');
   });

@@ -23,8 +23,9 @@ import { git, gitOk } from '../git/exec.ts';
 import { redact } from '../redact.ts';
 import { truncate } from '../util.ts';
 import type { PipelineCtx } from './context.ts';
-import { exemptPaths, postBuildChecks, runBuild } from './envelope.ts';
-import { effectiveFixtureRewrite } from '../policy/policy.ts';
+import { exemptPaths, postBuildChecks, runBuild, type BuildInput } from './envelope.ts';
+import { EMPTY_ATTEMPT_NOTE } from './selfheal.ts';
+import { effectiveFixtureRewrite, effectiveHeal } from '../policy/policy.ts';
 import { ANALYSIS_ROLES, ancestorsOf, itemMarker, newNonce, parseItemMarker, pickReadyBuilds, propagateBlocked, readySet, sanitizeLine, stripInvisible } from './graph.ts';
 import type { Hold } from './stages.ts';
 import { fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
@@ -51,7 +52,8 @@ export interface GraphHost {
   repo(run: Run): RepoConfig;
   patch(key: string, fn: (r: Run) => void): Run;
   note(key: string, stage: StageName | 'engine', text: string): void;
-  toNeedsHuman(key: string, reason: string, origin: NextStep, comment?: string): Promise<void>;
+  /** The ONE stop choke point (the Stuck resolver looks first in Complete auto; callers `return` its result and never continue their own flow). */
+  toNeedsHuman(key: string, reason: string, origin: NextStep, comment?: string, cause?: string): Promise<void>;
   /** M8-3 `onLimitHit`: the account's pause, then a re-route under the limit rule (restart on the next account, or pause). */
   pauseForLimit(key: string, limit: LimitInfo, role?: Role): Promise<void>;
   finishSession(key: string, res: AgentResult): void;
@@ -62,6 +64,10 @@ export interface GraphHost {
   hasUncommitted(worktree: string): Promise<boolean>;
   writePromptAudit(key: string, name: string, text: string): void;
   runsLimit(run: Run): number;
+  /** C2: the envelope's scope-revert permission for this run (Complete auto, reviewed plan, once). */
+  scopeRevertHook(key: string, listed: string[]): NonNullable<BuildInput['scopeRevert']>;
+  /** `mergeOntoCurrent` that also records the commits it lands (Ship's Conductor-recorded set). */
+  land(key: string, repoPath: string, sha: string): Promise<Awaited<ReturnType<typeof W.mergeOntoCurrent>>>;
   /**
    * A read-only agent call for an analysis item (validated; never moves the run itself — a call that cannot continue returns the hold it
    * wants, so that concurrent calls make ONE transition).
@@ -175,9 +181,9 @@ export class GraphBuilder {
       'Retry runs the failed and blocked tasks again; the finished tasks and their commits are kept. Moving the card to To do does the same as Retry; to start over with a new plan, edit the card description (or stop the run, then Retry).',
     ].filter(Boolean);
     if (!failed.length && !blocked.length) {
-      return this.h.toNeedsHuman(key, 'The task graph has no task that can run, but it is not complete. Move the card to To do to plan it again.', 'build');
+      return this.h.toNeedsHuman(key, 'The task graph has no task that can run, but it is not complete. Move the card to To do to plan it again.', 'build', undefined, 'graph_failed');
     }
-    return this.h.toNeedsHuman(key, lines.join('\n'), 'build');
+    return this.h.toNeedsHuman(key, lines.join('\n'), 'build', undefined, 'graph_failed');
   }
 
   // ───────────────────────── recovery (crash, restart, abort) ─────────────────────────
@@ -239,6 +245,12 @@ export class GraphBuilder {
     if (await this.resetWouldDropDone(key, target)) {
       this.setItem(key, id, (x) => void (x.state = 'pending'));
       h.note(key, 'build', `${id} was interrupted. Its private directory is gone, and the current branch already has other finished tasks, so those commits stay.`);
+      return 'ok';
+    }
+    if (await W.isMainCheckout(wt)) {
+      // the person's own checkout: whatever is uncommitted there is theirs. Never reset or clean it; the item runs again in its own build directory.
+      this.setItem(key, id, (x) => void (x.state = 'pending'));
+      h.note(key, 'build', `${id} was interrupted. Your own checkout is left exactly as it is (nothing was reset or deleted); the task will run again.`);
       return 'ok';
     }
     await W.resetToCommit(wt, target);
@@ -479,6 +491,9 @@ export class GraphBuilder {
       signal: h.c.signal(key),
       secrets,
       planPaths: exemptPaths(run, plan),
+      scopeRevert: h.scopeRevertHook(key, plan.filesToChange.map((f) => f.path)),
+      scanEntries: h.c.scanEntriesFor(run),
+      deferFixtureShapes: h.c.shipEffective(),
       onPrepared: (prep) => {
         h.patch(key, (r) => {
           r.guardSha = prep.guardSha ?? undefined;
@@ -545,6 +560,10 @@ export class GraphBuilder {
           h.note(key, 'build', `The builder committed ${id} by itself — keeping it after the usual checks.`);
           return void (await this.finishItem(key, id, headNow, files, plan, 'self', startHead, wt));
         }
+        if (effectiveHeal(h.c.cfg(), 'empty_attempt', this.item(key, id).emptyRetries) && this.item(key, id).loop < this.item(key, id).loopBudget) {
+          this.setItem(key, id, (x) => void (x.emptyRetries = (x.emptyRetries ?? 0) + 1));
+          return this.retryOrFail(key, id, 'The builder changed nothing', EMPTY_ATTEMPT_NOTE, wt);
+        }
         return this.failItem(key, id, 'The builder finished without changing any files. The task may need to be clarified.', wt);
       }
       case 'committed':
@@ -570,7 +589,7 @@ export class GraphBuilder {
     const repo = h.repo(run);
     const dir = wt ?? run.worktree;
     if (how !== 'built') {
-      const problem = await postBuildChecks(dir, run.baseSha, exemptPaths(run, plan), h.c.secretsFor(run), scopeSince);
+      const problem = await postBuildChecks(dir, run.baseSha, exemptPaths(run, plan), h.c.scanEntriesFor(run), scopeSince, { deferFixtureShapes: h.c.shipEffective() });
       if (problem) {
         if (this.queueFixtureRewrite(key, id, problem, dir === run.worktree ? sha : undefined)) return 'stop';
         this.setItem(key, id, (x) => {
@@ -606,7 +625,7 @@ export class GraphBuilder {
       const lower = [...peers.keys()].filter((i) => (Number(i.replace(/\D/g, '')) || 0) < n);
       await Promise.all(lower.map((i) => peers.get(i)!));
     }
-    const landed = await W.mergeOntoCurrent(repo.path, sha);
+    const landed = await h.land(key, repo.path, sha);
     if (!landed.ok) {
       let kept = '';
       try {
@@ -677,7 +696,7 @@ export class GraphBuilder {
       const dirty = await h.hasUncommitted(wt);
       if (it.floor && SHA_RE.test(it.floor) && (head !== it.floor || dirty)) {
         const refs = await W.backupRefs(wt, run.key, run.rev);
-        if (onBranch && !(await this.resetWouldDropDone(key, it.floor))) await W.resetToCommit(wt, it.floor);
+        if (onBranch && !(await W.isMainCheckout(wt)) && !(await this.resetWouldDropDone(key, it.floor))) await W.resetToCommit(wt, it.floor);
         backup = ` Its work is kept as ${refs.headRef}${refs.stashRef ? ` and ${refs.stashRef}` : ''} in the repository.`;
       }
     } catch (e) {

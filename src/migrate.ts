@@ -234,6 +234,9 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
   // M8-4 N2: imported data is untrusted input — a hand-edited file never arrives with Complete auto on (turning it on needs PUT /api/run-mode + confirm)
   cfg.pipeline.runMode = 'per-settings';
   delete cfg.pipeline.runModeChangedAt;
+  // Pushing is likewise person-only: an imported file never carries the push confirm (completeAutoPushAck) or a developer-identity override
+  delete cfg.pipeline.completeAutoPushAck;
+  delete cfg.developerIdentity;
   report.repos = cfg.repos.map((r) => r.name);
   report.willRun = willRun(cfg.repos, cfg.agents);
   let v1State: any = {};
@@ -356,6 +359,9 @@ export async function migrate(opts: MigrateOptions): Promise<MigrateReport> {
           worktree: '',
           baseSha: '',
           commitSha: undefined,
+          landedShas: undefined,
+          shipSha: undefined,
+          shipBase: undefined,
           branch: `${BRANCH_PREFIX}${slug(e.newKey)}`,
           effects: {},
           restartTimes: [],

@@ -14,7 +14,7 @@ import { MODEL_ID_BASE_RE, modelIdOk } from './models/sanitize.ts';
 import { PROVIDER_LABEL } from './agents/providers/types.ts';
 import { defaultAccounts, normalizeAccounts } from './accounts/store.ts';
 import { effectiveLimitRule, isLimitRule, type LimitRule } from './accounts/limit-rule.ts';
-import { isCompleteAuto } from './policy/policy.ts';
+import { effectiveShip, isCompleteAuto, pushConsentGiven } from './policy/policy.ts';
 
 const log = logger('config');
 /** The config shape this build reads/writes. v1 → v2 defaults upgrade stays inside normalizeConfig (inert in M1a). */
@@ -138,7 +138,7 @@ export function migrateConfigV6ToV7(raw: any): any {
   };
 }
 export const CONFIG_SPEC: VersionSpec = { kind: 'config', field: 'version', current: 7, assumeWhenMissing: 1, migrations: { 2: migrateConfigV2ToV3, 3: migrateConfigV3ToV4, 4: migrateConfigV4ToV5, 5: migrateConfigV5ToV6, 6: migrateConfigV6ToV7 } };
-const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'toolModels', 'accounts', 'pipeline', 'projects', 'worktreeRoot', 'extra', 'legacy']);
+const KNOWN_CONFIG_KEYS = new Set(['version', 'ui', 'repos', 'agents', 'stages', 'roles', 'toolModels', 'accounts', 'pipeline', 'projects', 'worktreeRoot', 'developerIdentity', 'extra', 'legacy']);
 /** Board project keys (also the context store directory names): 2–6 capital letters. */
 export const PROJECT_SETTINGS_KEY_RE = /^[A-Z]{2,6}$/;
 
@@ -175,7 +175,9 @@ export function defaultConfig(): Config {
       policy: 'full-auto',
       verifyEachItem: false,
       limitRule: 'switch',
-      runMode: 'per-settings',
+      // Addendum C: Complete auto is the DEFAULT for a brand-new config. It never sets completeAutoPushAck: nothing is pushed until the one-time confirm.
+      runMode: 'complete-auto',
+      planReviewRounds: 3,
       timeoutsMin: { plan: 20, review: 10, build: 90, verify: 30, idle: 15, gate: 15 },
     },
   };
@@ -249,9 +251,13 @@ export function normalizeConfig(input: unknown): Config {
       policy: oneOf(pl.policy, ['full-auto', 'approve-plan', 'approve-risky', 'manual-stages'] as const, d.pipeline.policy),
       verifyEachItem: pl.verifyEachItem === true,
       limitRule: oneOf<LimitRule>(pl.limitRule, ['switch', 'same', 'wait'] as const, d.pipeline.limitRule),
-      // M8-4 C3: exact values only; anything else (missing, wrong case, padded, non-string) is Per settings, the safe side
-      runMode: oneOf(pl.runMode, ['per-settings', 'complete-auto'] as const, d.pipeline.runMode),
+      // Addendum C: an ABSENT value is the default (Complete auto, new configs only: loadConfig pins pre-existing files to Per settings);
+      // a present value must be exact ('per-settings' | 'complete-auto'); anything else (wrong case, padded, non-string) is Per settings
+      runMode: pl.runMode === undefined ? d.pipeline.runMode : oneOf(pl.runMode, ['per-settings', 'complete-auto'] as const, 'per-settings'),
       ...(typeof pl.runModeChangedAt === 'number' && Number.isFinite(pl.runModeChangedAt) && pl.runModeChangedAt > 0 ? { runModeChangedAt: pl.runModeChangedAt } : {}),
+      planReviewRounds: clamp(pl.planReviewRounds, 1, 5, d.pipeline.planReviewRounds),
+      // DEPRECATED autoPush in an old config is ignored (dropped here). The push confirm marker is kept only as a positive finite number.
+      ...(typeof pl.completeAutoPushAck === 'number' && Number.isFinite(pl.completeAutoPushAck) && pl.completeAutoPushAck > 0 ? { completeAutoPushAck: pl.completeAutoPushAck } : {}),
       timeoutsMin: {
         plan: clamp(to.plan, 1, 240, d.pipeline.timeoutsMin.plan),
         review: clamp(to.review, 1, 120, d.pipeline.timeoutsMin.review),
@@ -262,6 +268,7 @@ export function normalizeConfig(input: unknown): Config {
       },
     },
     worktreeRoot: typeof i.worktreeRoot === 'string' && i.worktreeRoot ? i.worktreeRoot : undefined,
+    ...identityField((i as any).developerIdentity),
   };
   // keys this build does not know (written by a newer build or by hand) are carried through untouched
   const extra: Record<string, unknown> = Object.create(null); // no prototype: assigning "__proto__" below can never rewrite one
@@ -312,8 +319,36 @@ function normRepo(r: RepoConfig): RepoConfig {
     setup: typeof r.setup === 'string' && r.setup ? r.setup : undefined,
     copyFiles: Array.isArray(r.copyFiles) ? r.copyFiles.filter((f) => typeof f === 'string') : ['.env', '.env.local'],
     envPassthrough: Array.isArray(r.envPassthrough) ? r.envPassthrough.filter((f) => typeof f === 'string') : [],
+    // null = this repository never pushes (kill switch); a bad or missing value is the default remote
+    pushRemote: r.pushRemote === null ? null : validatePushRemote(r.pushRemote).ok ? (r.pushRemote as string) : DEFAULT_PUSH_REMOTE,
   };
 }
+
+export const DEFAULT_PUSH_REMOTE = 'origin';
+type Checked<T> = { ok: true; value: T } | { ok: false; why: string };
+/** The remote a repository pushes to, or null when it never pushes (per-repo kill switch). */
+export const pushRemoteOf = (r: { pushRemote?: string | null }): string | null => (r.pushRemote === null ? null : r.pushRemote ?? DEFAULT_PUSH_REMOTE);
+/** Push remote: a remote NAME only. A URL (or anything with ":" or "/") is refused so nothing here can redirect a push. */
+export function validatePushRemote(v: unknown): Checked<string> {
+  if (typeof v !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(v) || v.startsWith('-') || v.startsWith('.')) return { ok: false, why: 'The push remote must be a remote name such as "origin" (letters, digits, ".", "_", "-"), never a URL.' };
+  return { ok: true, value: v };
+}
+/** Person-set developer identity: both fields, plain text, no control characters or angle brackets. */
+export function validateIdentity(v: unknown): Checked<{ name: string; email: string }> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return { ok: false, why: 'The developer identity must be { name, email }.' };
+  const o = v as Record<string, unknown>;
+  const name = Object.hasOwn(o, 'name') && typeof o.name === 'string' ? o.name.trim() : '';
+  const email = Object.hasOwn(o, 'email') && typeof o.email === 'string' ? o.email.trim() : '';
+  if (!name || name.length > 100 || /[\x00-\x1f\x7f<>]/.test(name)) return { ok: false, why: 'The developer name must be 1-100 characters without control characters or angle brackets.' };
+  if (!email || email.length > 200 || !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email) || /[\x00-\x1f\x7f]/.test(email)) return { ok: false, why: 'The developer email must look like name@example.com.' };
+  return { ok: true, value: { name, email } };
+}
+const identityField = (v: unknown): { developerIdentity?: { name: string; email: string } } => {
+  const r = validateIdentity(v);
+  return r.ok ? { developerIdentity: r.value } : {};
+};
+/** `a***@example.com` — the dashboard never needs the full address back. */
+export const maskEmail = (e: string): string => e.replace(/^(.).*(@.*)$/, '$1***$2');
 
 /**
  * Reads the config under the version contract. A config written by a NEWER build throws NewerVersionError (the caller must
@@ -329,12 +364,18 @@ export function loadConfig(): Config {
     const l = loadVersioned<Record<string, any>>(paths.config(), CONFIG_SPEC, () => ({}));
     backupBeforeNextSave = l.existed && l.fromVersion < CONFIG_SPEC.current; // an older file is rewritten in the new shape on the next save → keep the original first
     loadedCleanly = l.existed && l.fromVersion === CONFIG_SPEC.current;
-    return normalizeConfig(l.data);
+    // Addendum C: only a brand-new config gets the Complete auto default. A file that already exists without a run mode stays on Per settings
+    // (never silently flipped); it is persisted with the next save.
+    const data = l.data && typeof l.data === 'object' ? l.data : {};
+    if (l.existed && (data.pipeline === undefined || data.pipeline === null || typeof data.pipeline !== 'object' || data.pipeline.runMode === undefined)) {
+      data.pipeline = { ...(data.pipeline && typeof data.pipeline === 'object' ? data.pipeline : {}), runMode: 'per-settings' };
+    }
+    return normalizeConfig(data);
   } catch (e) {
     if (e instanceof CorruptFileError) {
       const kept = quarantine(paths.config());
       log.warn(`config.json was unreadable — kept as ${kept ?? paths.config()}; starting from defaults`);
-      return normalizeConfig({});
+      return normalizeConfig({ pipeline: { runMode: 'per-settings' } }); // an existing (corrupt) file is not a new install: Per settings
     }
     throw e;
   }
@@ -377,6 +418,10 @@ export function toSettings(cfg: Config): Settings {
     // M8-4 (C4): stored mode, and what it overrides right now (the stored fields above are always reported as stored)
     runMode: cfg.pipeline.runMode,
     overriddenByRunMode: isCompleteAuto(cfg) ? ['planApproval', 'policy', 'limitRule'] : [],
+    pushEffective: effectiveShip(cfg),
+    pushConsentNeeded: isCompleteAuto(cfg) && !pushConsentGiven(cfg),
+    pushTargets: cfg.repos.map((r) => ({ repo: r.name, pushRemote: pushRemoteOf(r) })),
+    developerIdentity: cfg.developerIdentity ? { name: cfg.developerIdentity.name, email: maskEmail(cfg.developerIdentity.email) } : null,
   };
 }
 

@@ -8,14 +8,14 @@ import type { Engine } from '../pipeline/engine.ts';
 import { EngineError } from '../pipeline/engine.ts';
 import type { RunStore } from '../store.ts';
 import type { PersistentState } from '../config.ts';
-import { applySettings, legacyModelNotices, normalizeConfig, toSettings } from '../config.ts';
+import { applySettings, legacyModelNotices, normalizeConfig, pushRemoteOf, toSettings, validateIdentity, validatePushRemote } from '../config.ts';
 import { ROLE_ROWS, modelsView, roleViews, toolDefaultSelection } from '../models/select.ts';
 import { RolesPlanError, apiRolesForm, apiToolModels, planRoles } from './roles-plan.ts';
 import { PROVIDER_IDS, isProviderId, providerLabel } from '../agents/providers/registry.ts';
 import { COMPLEXITIES, ROLES, ROLE_NEEDS, isComplexity, isRole, type RoleConfig, type Roles } from '../agents/roles.ts';
 import { validatePairing, type ProviderState } from '../agents/routing.ts';
 import { redact } from '../redact.ts';
-import { isCompleteAuto } from '../policy/policy.ts';
+import { effectiveShip, isCompleteAuto, pushConsentGiven } from '../policy/policy.ts';
 import { addRecord, buildVerificationInfo, canaryValidated, loadRecords } from '../agents/providers/verification.ts';
 import type { CanaryReport } from '../agents/providers/canary.ts';
 import { toDetail, toGraph, toSummary } from '../pipeline/view.ts';
@@ -37,7 +37,6 @@ import { logger } from '../log.ts';
 import { TAINTED_ACTORS } from '../board/types.ts';
 import type { Run } from '../types.ts';
 import { OpenError, openRun, type ExecFn } from './open.ts';
-import type { Auth } from './auth.ts';
 import type { CatalogView } from '../models/types.ts';
 import { AccountError, AccountService } from '../accounts/service.ts';
 
@@ -61,8 +60,6 @@ export class ApiFail extends Error {
 export interface ApiResult {
   status?: number;
   json?: unknown;
-  /** Set to clear the session cookie. */
-  logout?: boolean;
 }
 
 export interface ApiDeps {
@@ -75,7 +72,8 @@ export interface ApiDeps {
   engine: Engine;
   store: RunStore;
   board: Board;
-  auth: Auth;
+  /** Per-process random CSRF token; served only in the GET /api/state body. */
+  csrf: string;
   version: string;
   getConfig(): Config;
   saveConfig(cfg: Config): void;
@@ -98,7 +96,10 @@ const KEY_RE = /^[A-Za-z][A-Za-z0-9]{0,15}-\d{1,9}$/;
 const log = logger('api');
 /** M8-4 §2.3/N8: the static confirmation text for turning Complete auto on (names every forced hold). */
 const COMPLETE_AUTO_CONFIRM =
-  'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. Nothing is pushed or merged, and the checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Commits stay on the local worktree. Send "confirm": true.';
+  'Complete auto approves and builds plans without asking you and moves work to the next account, then the next tool in the job\'s list, at a usage limit. This includes large changes, protected files, plans with more than 8 tasks, imports, Ask and research results, and designed work. Plans already waiting stay waiting until you use Approve waiting plans. The checks (tests, protected-file and secret scans) run on this machine after every build. A credential-shaped string that appears only in a test or fixture file is rewritten once automatically; secret file names and secrets in other files still stop for you. Complete auto also pushes finished work without asking you: to the branch currently checked out in each repository, on that repository\'s push remote, as your own git identity with the ticket key in the commit subject. Only commits Conductor made are pushed, after the secret and protected-file scans pass. The builder agent itself never pushes, and nothing is pushed to the default branch, a protected name (main, master, develop, release...) or by force; if the checked-out branch cannot be used, Conductor pushes to its own conductor/ branch instead. Pushed work is visible to everyone with access to the remote. To turn pushing off, leave Complete auto. Complete auto is the default for new installs; you can switch to Per settings at any time. Accepting this confirm is the one-time push consent: nothing is pushed until you do. Send "confirm": true.';
+/** Static confirmation for changing where or as whom Conductor pushes (the push remote, the developer identity). */
+const AUTO_PUSH_CONFIRM =
+  'This changes where or as whom Conductor pushes finished work while Complete auto is on: the remote it pushes to, or the git name and email it signs with. Only commits Conductor made are pushed, after the secret and protected-file scans pass; the builder agent itself never pushes, and nothing is pushed to the default branch. Pushed work can be seen by everyone with access to that remote. Send "confirm": true.';
 // L5: a name is used as a path segment — it must start with a letter/digit (no `.`, `..`, `-x`)
 const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -217,6 +218,8 @@ export class Api {
         storageProblem: st.storageProblem,
         runMode: cfg.pipeline.runMode,
         runModeChangedAt: cfg.pipeline.runModeChangedAt ?? null,
+        pushEffective: effectiveShip(cfg),
+        pushConsentNeeded: isCompleteAuto(cfg) && !pushConsentGiven(cfg),
       },
       quota: st.quota,
       cards: this.cards(st.ignored),
@@ -245,7 +248,7 @@ export class Api {
     return {
       now: live.now,
       version: this.d.version,
-      csrf: this.d.auth.csrf,
+      csrf: this.d.csrf,
       // Agent health is a banner, not a gate: a Claude sign-out must not send a configured user back to the wizard.
       setup: { complete: steps.filter((s) => s.id !== 'agents').every((s) => s.ok), steps },
       health,
@@ -609,7 +612,6 @@ export class Api {
       this.asksSvc().remove(id);
       return { json: { ok: true } };
     }
-    if (method === 'POST' && path === '/api/auth/logout') return { json: { ok: true }, logout: true };
     if (method === 'POST' && path === '/api/models/refresh') {
       // S13: strict — a plain object whose only own key may be `provider`, a registry id; an empty body means every provider
       const svc = this.modelsSvc();
@@ -672,7 +674,7 @@ export class Api {
       return { json: { approved, skipped } };
     }
 
-    if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open|push)$/.exec(path)) && method === 'POST') {
+    if ((m = /^\/api\/runs\/([^/]+)\/(approve|retry|resume|abort|cleanup|open|push|unblock)$/.exec(path)) && method === 'POST') {
       const key = safeDecode(m[1]!);
       if (!KEY_RE.test(key) || !this.d.store.get(key)) throw new ApiFail(404, 'not_found', 'Unknown run.');
       switch (m[2]) {
@@ -694,6 +696,9 @@ export class Api {
           break;
         case 'push':
           await this.d.engine.push(key);
+          break;
+        case 'unblock':
+          await this.d.engine.unblockDependants(key);
           break;
         case 'open': {
           const r = await openRun(this.d.store.get(key)!, this.d.getConfig(), String(body.target ?? ''), this.d.openExec);
@@ -789,12 +794,15 @@ export class Api {
       if (Object.hasOwn(body, 'confirm') && typeof body.confirm !== 'boolean') throw new ApiFail(400, 'bad_request', '"confirm" must be true or false.');
       const cfg = this.d.getConfig();
       const from = cfg.pipeline.runMode;
-      if (from === runMode) return { json: { ok: true, runMode, changed: false, waiting: this.waiting() } };
+      // Re-confirming Complete auto while it is already on records the push consent once (a config that was in Complete auto before pushing existed).
+      const needsAck = runMode === 'complete-auto' && !pushConsentGiven(cfg);
+      if (from === runMode && !(needsAck && body.confirm === true)) return { json: { ok: true, runMode, changed: false, waiting: this.waiting(), settings: toSettings(cfg) } };
       if (runMode === 'complete-auto' && body.confirm !== true) throw new ApiFail(400, 'confirm_required', COMPLETE_AUTO_CONFIRM);
       // B1: build a NEW config (the live one is never mutated); saveConfig persists first and only then swaps memory — a refused save changes nothing
       const next = deepClone(cfg);
       next.pipeline.runMode = runMode;
-      next.pipeline.runModeChangedAt = Date.now();
+      if (from !== runMode) next.pipeline.runModeChangedAt = Date.now();
+      if (runMode === 'complete-auto') next.pipeline.completeAutoPushAck ??= Date.now(); // the confirm above states that Complete auto also pushes
       try {
         this.d.saveConfig(next);
       } catch (e) {
@@ -804,11 +812,56 @@ export class Api {
       const waiting = this.waiting();
       log.info(`run mode: ${from} → ${runMode} (waiting: ${waiting.total})`); // counts only: no titles, no keys
       this.d.engine.invalidate(); // SSE state carries engine.runMode
-      return { json: { ok: true, runMode, changed: true, waiting, settings: toSettings(this.d.getConfig()) } };
+      return { json: { ok: true, runMode, changed: from !== runMode, waiting, settings: toSettings(this.d.getConfig()) } };
+    }
+
+    // ───────── Push settings: ONE writer of repos[].pushRemote and developerIdentity (strict; CSRF via http.ts; confirm). Pushing itself follows Complete auto. ─────────
+    if (method === 'PUT' && path === '/api/auto-push') {
+      if (!isPlain(body) || Object.getPrototypeOf(body) !== Object.prototype) throw new ApiFail(400, 'bad_request', 'The request body must be an object.');
+      const allowed = new Set(['confirm', 'repo', 'pushRemote', 'developerIdentity']);
+      for (const k of Object.getOwnPropertyNames(body)) if (!allowed.has(k)) throw new ApiFail(400, 'bad_request', `Unknown field "${k.slice(0, 40)}".`);
+      if (!['pushRemote', 'developerIdentity'].some((k) => Object.hasOwn(body, k))) throw new ApiFail(400, 'bad_request', 'Nothing to change: send "pushRemote" or "developerIdentity".');
+      if (Object.hasOwn(body, 'confirm') && typeof body.confirm !== 'boolean') throw new ApiFail(400, 'bad_request', '"confirm" must be true or false.');
+      const cfg = this.d.getConfig();
+      const next = deepClone(cfg);
+      let sensitive = false; // changes where / as whom it pushes
+      if (Object.hasOwn(body, 'pushRemote')) {
+        if (typeof body.repo !== 'string') throw new ApiFail(400, 'bad_request', '"repo" (the repository name) is required to change its push remote.');
+        const repo = next.repos.find((r) => r.name === body.repo);
+        if (!repo) throw new ApiFail(404, 'not_found', 'No such repository.');
+        if (body.pushRemote === null) repo.pushRemote = null; // this repository never pushes (turning pushing off needs no confirm)
+        else {
+          const v = validatePushRemote(body.pushRemote);
+          if (!v.ok) throw new ApiFail(400, 'bad_request', v.why);
+          if (v.value !== pushRemoteOf(repo)) sensitive = true;
+          repo.pushRemote = v.value;
+        }
+      } else if (Object.hasOwn(body, 'repo')) throw new ApiFail(400, 'bad_request', '"repo" is only used with "pushRemote".');
+      if (Object.hasOwn(body, 'developerIdentity')) {
+        if (body.developerIdentity === null) delete next.developerIdentity;
+        else {
+          const v = validateIdentity(body.developerIdentity);
+          if (!v.ok) throw new ApiFail(400, 'bad_request', v.why);
+          next.developerIdentity = v.value;
+        }
+        sensitive = true; // it can switch the agent-identity check off for one person
+      }
+      if (JSON.stringify(next) === JSON.stringify(cfg)) return { json: { ok: true, changed: false, settings: toSettings(cfg) } };
+      if (sensitive && body.confirm !== true) throw new ApiFail(400, 'confirm_required', AUTO_PUSH_CONFIRM);
+      try {
+        this.d.saveConfig(next);
+      } catch (e) {
+        log.error(`push setting change not saved: ${errMsg(e)}`);
+        throw new ApiFail(500, 'save_failed', 'The push setting could not be saved, so nothing changed. Details are in the log.');
+      }
+      log.info('push settings changed'); // never remotes from input or identities
+      this.d.engine.invalidate();
+      return { json: { ok: true, changed: true, settings: toSettings(this.d.getConfig()) } };
     }
 
     if (method === 'PUT' && path === '/api/settings') {
       if (isPlain(body) && (Object.hasOwn(body, 'runMode') || Object.hasOwn(body, 'runModeChangedAt'))) throw new ApiFail(400, 'bad_request', 'Change the run mode with PUT /api/run-mode.');
+      if (isPlain(body) && ['pushEffective', 'pushConsentNeeded', 'pushTargets', 'developerIdentity', 'pushRemote', 'completeAutoPushAck'].some((k) => Object.hasOwn(body, k))) throw new ApiFail(400, 'bad_request', 'Change the push remote or developer identity with PUT /api/auto-push.');
       if (isPlain(body) && Object.hasOwn(body, 'limitRule')) AccountService.checkLimitRule(body.limitRule); // M8-3: strict ⇒ 400
       if (isPlain(body) && Object.hasOwn(body, 'limitRuleEffective')) throw new ApiFail(400, 'bad_request', 'limitRuleEffective is read-only.');
       const next = applySettings(this.d.getConfig(), body as Partial<Settings>);

@@ -114,6 +114,8 @@ export interface ItemRun {
   note?: string;
   /** Complete-auto rewrites already used for credential-shaped text in this item's tests or fixtures (one). */
   fixtureRewrites?: number;
+  /** Complete-auto re-runs already used after an attempt that changed nothing (one per task). */
+  emptyRetries?: number;
 }
 export interface TaskGraphRun {
   items: ItemRun[];
@@ -251,6 +253,8 @@ export interface Run {
   pushedAt?: number;
   /** HEAD after that push. */
   pushedSha?: string;
+  /** The remote branch the push actually used (the checked-out branch, or the conductor/ fallback). Shown as "Pushed to <branch>". */
+  pushedBranch?: string;
   status: RunStatus;
   next: NextStep;
   stage: StageName | null; // current or last stage
@@ -321,7 +325,7 @@ export interface Run {
   /** M8-3: the last automatic move (static wording + labels + the real skip reason, N5). */
   moved?: RunMove;
   /** M8-3 (B3c): why a `paused` run waits. Absent on records written before M8-3 (treated as a limit unless the reason is `offline`). */
-  pauseKind?: 'limit' | 'offline';
+  pauseKind?: 'limit' | 'offline' | 'resolver';
   /** M8-3 (B3b): limit episodes that ENDED IN A PAUSE (successful switches never count); > 6 ⇒ needs_human. */
   limitPauses?: number;
   /** The episode already counted in `limitPauses` (an episode is counted once). */
@@ -330,6 +334,40 @@ export interface Run {
   secretFixtureRewrites?: number;
   /** Instruction for the next build: rewrite those test/fixture strings. Cleared once the prompt is built. Keeps the dirty worktree. */
   fixtureRewriteNote?: string;
+  /** Complete-auto reverts of out-of-scope protected files already used (one per run). */
+  scopeRevertsUsed?: number;
+  /** Complete-auto re-runs already used after a build that changed nothing (one per run, single-task path). */
+  emptyRetries?: number;
+  /** Commits Conductor landed on the checkout for this run (Ship's "Conductor-recorded" set). */
+  landedShas?: string[];
+  /** The sha Ship decided to push (persisted BEFORE the push). */
+  shipSha?: string;
+  /** The `commitSha` that `shipSha` was derived from. `shipSha` is only the push tip while this still equals `commitSha`. */
+  shipBase?: string;
+  /** The developer identity snapshot taken before any agent ran for this run. */
+  shipIdentity?: { name: string; email: string };
+  /** Why Ship is holding this card (it stays Ready). */
+  shipHold?: { reason: string; at: number };
+  /** A person pressed "Unblock dependants" on a Ship-held card (epoch ms): dependants fall back to Done-gating for this card. */
+  shipUnblockedAt?: number;
+  /** Complete-auto Ship-time fixture rewrites already used (one): the builder is asked once to replace credential-shaped test text. */
+  shipFixtureRewrites?: number;
+  /** Static clarifying note for the next build after an empty attempt. Cleared once the prompt is built. */
+  emptyRetryNote?: string;
+  /** Stuck resolver (Complete auto): invocations spent on this card. Written BEFORE the model call, so a crash can never re-run the resolver for the same event. Absent = 0. */
+  resolverUsed?: number;
+  /** Set while a resolver call is in flight (cleared in the same write that applies, or declines, its action). A run found with it after a restart is treated as stuck. */
+  resolverActive?: { at: number; round: number; origin: NextStep; cause: string };
+  /** `cause:origin` pairs the resolver has already worked on (one round per pair). */
+  resolverRounds?: string[];
+  /** Per-cause invocation counters. */
+  resolverCauseUsed?: Record<string, number>;
+  /** `extend_budget` records: each kind may be extended once per card (the amounts are code constants). */
+  resolverExtended?: { runs?: number; loops?: number };
+  /** Agent runs the resolver itself spent on this card (per-card quota cap). */
+  resolverRuns?: number;
+  /** `rewrite_to_placeholder` rounds used (one per card). */
+  resolverRewrites?: number;
 }
 
 export interface RunMove {
@@ -351,6 +389,8 @@ export interface RepoConfig {
   setup?: string; // dependency install command (auto-detected if absent)
   copyFiles: string[]; // git-ignored env files to copy into worktrees (e.g. ".env.local")
   envPassthrough: string[]; // extra env var names that gates/deps may receive
+  /** Push remote NAME (validated by `validatePushRemote`; never a URL; default `origin`). `null` = this repository never pushes (kill switch). */
+  pushRemote?: string | null;
 }
 export interface Config {
   version: number;
@@ -412,11 +452,19 @@ export interface Config {
     runMode: 'per-settings' | 'complete-auto';
     /** M8-4 N11: when the run mode last changed (epoch ms); written only by `PUT /api/run-mode`. */
     runModeChangedAt?: number;
+    /** DEPRECATED and IGNORED: there is no separate Auto push switch any more (Complete auto pushes). Kept optional so old configs and backups still load. */
+    autoPush?: boolean;
+    /** Epoch ms when the person accepted the Complete auto confirm that states it also pushes. Written only by `PUT /api/run-mode` with confirm. Without it Ship never runs. */
+    completeAutoPushAck?: number;
+    /** Plan review rounds before the plan proceeds with concerns noted (default 3, clamp 1-5). */
+    planReviewRounds: number;
     timeoutsMin: { plan: number; review: number; build: number; verify: number; idle: number; gate: number };
   };
   /** Per-project settings keyed by board project key (config v5). */
   projects: Record<string, ProjectSettings>;
   worktreeRoot?: string;
+  /** Person-only override of the agent-identity check; written only by `PUT /api/auto-push`. Never from run/agent text. */
+  developerIdentity?: { name: string; email: string };
 }
 /** Per-project settings (config v5). One record per board project key; M6 adds `policy` and `limits` here. */
 export interface ProjectContextSettings {
@@ -450,6 +498,11 @@ export interface Settings {
   runMode: Config['pipeline']['runMode'];
   /** M8-4 (C4): the settings the run mode currently overrides: empty under Per settings, all three under Complete auto. */
   overriddenByRunMode: Array<'planApproval' | 'policy' | 'limitRule'>;
+  /** Pushing follows Complete auto. `pushConsentNeeded`: Complete auto is on but its push confirm has not been accepted yet (nothing is pushed). `pushTargets`: per-repo remote (null = never pushes). */
+  pushEffective: boolean;
+  pushConsentNeeded: boolean;
+  pushTargets: Array<{ repo: string; pushRemote: string | null }>;
+  developerIdentity: { name: string; email: string } | null;
 }
 
 // ───────────────────────────── agents ─────────────────────────────
@@ -615,6 +668,12 @@ export interface ApiRunSummary {
   canPark: boolean; // move the card to Backlog
   canFinish: boolean; // mark it done
   canPush: boolean; // commit this ticket's files as the person and push the current branch
+  /** Auto push: why Ship is holding this finished card (redacted text, never a URL), or null. The card stays Ready. */
+  shipHold: { reason: string } | null;
+  /** Auto push: a held card whose dependants a person has let start anyway. */
+  shipUnblocked: boolean;
+  /** Auto push: the card is finished but not pushed, and its dependants (waiting for it to be pushed) have not been released by a person yet. */
+  canUnblockDependants: boolean;
   /** Progress of the task graph, when the run has one. */
   taskProgress?: ApiGraphProgress;
   /** M8-3: the account of the current/last stage, and the last automatic move. */
@@ -652,6 +711,8 @@ export interface ApiRunDetail extends ApiRunSummary {
   worktree: string;
   baseSha: string;
   commitSha: string | null;
+  /** Commits Conductor landed (and Ship's replacements) for this run, newest last. Read-only. */
+  landedShas: string[];
   complexity: Complexity | null;
   sessions: ApiSession[];
   plan: Plan | null;
@@ -680,6 +741,8 @@ export interface ApiEngine {
   /** M8-4 (C4): the global run mode, live over SSE so a second tab's board header follows; and when it last changed (N11). */
   runMode: Config['pipeline']['runMode'];
   runModeChangedAt: number | null;
+  pushEffective: boolean;
+  pushConsentNeeded: boolean;
   /** Cards Conductor deliberately does not run (e.g. in a Conductor-owned lane without a run), with the reason. */
   ignored?: { key: string; reason: string }[];
   /** Set when the board cannot be written (disk full, journal refused): effects stop retrying every tick until it recovers. */

@@ -19,7 +19,7 @@ export interface BackupResult {
 }
 
 /** Never copied by default: credentials stored in the home, volatile runtime state, logs (security review S-7). */
-export const DEFAULT_EXCLUDE = new Set(['secrets.json', 'run', 'logs', 'sessions.json']);
+export const DEFAULT_EXCLUDE = new Set(['secrets.json', 'run', 'logs']);
 
 const safeLabel = (s: string): string => s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+/, '').slice(0, 60);
 

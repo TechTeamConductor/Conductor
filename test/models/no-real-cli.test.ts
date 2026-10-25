@@ -34,9 +34,6 @@ test('setup-wizard-style runtime (real default bins, injected health): health re
   try {
     assert.ok(rt.models, 'the service exists by default');
     const port = await rt.server.listen(0);
-    const u = new URL(rt.server.loginUrl());
-    const r = await new Promise<http.IncomingMessage>((res) => http.get({ host: '127.0.0.1', port, path: u.pathname + u.search }, res));
-    assert.ok(r.headers['set-cookie']);
     for (let i = 0; i < 5; i++) {
       await rt.api.handle('GET', '/api/state', new URLSearchParams(), {});
       await rt.api.handle('GET', '/api/providers', new URLSearchParams(), {});

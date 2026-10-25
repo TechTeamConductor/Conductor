@@ -27,7 +27,6 @@ const VIEW_KEYS = new Set(['provider', 'id', 'name', 'order', 'isDefault', 'stat
 
 let demo: DemoHandle;
 let port = 0;
-let cookie = '';
 let csrf = '';
 async function raw(path: string, opts: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; json: any; text: string }> {
   return new Promise((resolve, reject) => {
@@ -50,21 +49,13 @@ async function raw(path: string, opts: { method?: string; headers?: Record<strin
     req.end();
   });
 }
-const mut = (extra: Record<string, string> = {}) => ({ cookie, 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
-const call = (method: string, path: string, body?: unknown) => raw(path, { method, headers: method === 'GET' ? { cookie } : mut(), body: body === undefined ? undefined : JSON.stringify(body) });
+const mut = (extra: Record<string, string> = {}) => ({ 'content-type': 'application/json', 'x-conductor-csrf': csrf, 'sec-fetch-site': 'same-origin', ...extra });
+const call = (method: string, path: string, body?: unknown) => raw(path, { method, headers: method === 'GET' ? {} : mut(), body: body === undefined ? undefined : JSON.stringify(body) });
 
 before(async () => {
   demo = await startDemo({ port: 0, pollMs: 150, delayMs: 15 });
   port = demo.rt.server.listeningPort;
-  const url = new URL(demo.rt.server.loginUrl());
-  await new Promise<void>((resolve) => {
-    http.get({ host: '127.0.0.1', port, path: url.pathname + url.search }, (res) => {
-      cookie = String(res.headers['set-cookie']?.[0] ?? '').split(';')[0]!;
-      res.resume();
-      resolve();
-    });
-  });
-  csrf = (await raw('/api/state', { headers: { cookie } })).json.csrf;
+  csrf = (await raw('/api/state', {})).json.csrf;
 });
 after(async () => {
   await demo.close();
@@ -81,11 +72,11 @@ test('AC8 HTTP: GET lists the allow-listed views (no path/email), state carries 
     for (const k of Object.keys(v)) assert.ok(VIEW_KEYS.has(k), k);
     assert.match(v.signInCommand, SIGNIN_COMMAND_RE);
   }
-  const st = (await raw('/api/state', { headers: { cookie } })).json;
+  const st = (await raw('/api/state', {})).json;
   assert.ok(Array.isArray(st.accounts));
   assert.equal(st.settings.limitRule, 'switch');
   assert.equal(st.settings.limitRuleEffective, 'switch');
-  assert.equal((await raw('/api/accounts', { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ provider: 'claude', name: 'X' }) })).status, 403);
+  assert.equal((await raw('/api/accounts', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ provider: 'claude', name: 'X' }) })).status, 403);
   assert.equal((await raw('/api/accounts', { method: 'POST', headers: mut({ 'sec-fetch-site': 'cross-site' }), body: JSON.stringify({ provider: 'claude', name: 'X' }) })).status, 403);
 });
 
@@ -144,6 +135,8 @@ test('S11 control socket: the same strict handlers on the 0600 socket in a 0700 
   assert.equal((await c('POST', '/accounts', { provider: 'claude', name: 'Sock', apiKey: 'x' })).status, 400);
   assert.equal((await c('POST', '/accounts/login', {})).status, 404);
   assert.equal((await c('GET', '/accounts/../../otp')).status, 404);
+  assert.equal((await c('POST', '/otp')).status, 404, 'the control socket mints no sign-in link any more');
+  assert.equal((await c('GET', '/otp')).status, 404);
   const big = await new Promise<number>((resolve) => {
     const data = JSON.stringify({ provider: 'claude', name: 'x'.repeat(CONTROL_BODY_MAX) });
     const req = http.request({ socketPath: sock, path: '/accounts', method: 'POST', headers: { 'content-type': 'application/json' } }, (res) => (res.resume(), resolve(res.statusCode ?? 0)));

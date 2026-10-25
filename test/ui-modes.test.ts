@@ -230,7 +230,7 @@ test('wording from roles: default roles give today\'s exact strings', () => {
   const f = M.flowText(r, 'first', label);
   assert.deepEqual(j(f.steps.map((s) => s.d)), [
     'Claude reads the card and writes a plan', 'You confirm the first plan per repo', 'Cursor writes the code in a worktree',
-    'Gates and Claude check every criterion', 'You push the current branch as yourself. Conductor does not switch or merge branches',
+    'Gates and Claude check every criterion', 'Done cards are pushed as you to the branch you have checked out, never to main or by force',
   ]);
   assert.equal(f.howTail, ' or a plan needs approval');
   assert.equal(M.flowText(r, 'auto', label).howTail, '');

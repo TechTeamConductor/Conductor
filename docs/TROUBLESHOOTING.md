@@ -22,7 +22,7 @@
 
 **Windows: repositories cannot be added, gates or agents do not run.** Native Windows is experimental: only the installer and the dashboard work. Use WSL2 (open Ubuntu, install Node, run the macOS install command inside it) or a Mac.
 
-**The browser did not open.** Conductor prints a link; open it yourself, or run `conductor open` (macOS/Linux) once it is running. The plain `http://127.0.0.1:4327` address needs the one-time sign-in link to work. On a headless machine or in CI set `CONDUCTOR_NO_OPEN=1` (exactly `1`): Conductor then never launches a browser and only prints the link.
+**The browser did not open.** Conductor prints a link; open it yourself (the plain `http://127.0.0.1:4327` address works, there is no sign-in). On a headless machine or in CI set `CONDUCTOR_NO_OPEN=1` (exactly `1`): Conductor then never launches a browser and only prints the link.
 
 ## Using Conductor
 
@@ -30,7 +30,7 @@
 
 **"Which Claude is this?"** The `claude` command-line tool, not the desktop app — they can be signed into different plans. `conductor doctor` prints the account (e.g. `Signed in as you@company.com · Org · team plan`). Switch: `claude auth logout` then `claude auth login`.
 
-**"Paused — Claude usage limit".** Normal on Claude Pro. Runs resume by themselves after the reset time shown. To keep working meanwhile: Settings → *When Claude hits its limit* → "use Cursor for read-only stages".
+**"Waiting for the usage limit" (in Stuck resolver).** Normal on Claude Pro. There is no separate Paused column: a card waiting for a limit shows in **Stuck resolver** and resumes by itself after the reset time shown. To keep working meanwhile: Settings → *When Claude hits its limit* → "use Cursor for read-only stages".
 
 **"The board cannot be saved right now" (red banner).** Conductor could not write its board (disk full? permissions on the data folder?). Nothing is lost: pending updates stay queued and are retried. Free space / fix permissions, then restart Conductor (a board that hit a write error refuses further writes until restarted, so it can never corrupt itself).
 
@@ -46,9 +46,7 @@
 
 **"…was written by a newer Conductor".** A file in the data folder has a data version this build does not understand. Nothing was changed. Upgrade Conductor, or restore a backup from `~/.conductor-backups`.
 
-**"Session expired" in the dashboard.** Run `conductor open` (one-time sign-in link).
-
-**"Conductor is already running".** Only one instance runs per data folder. `conductor start` then opens the running dashboard for you (a fresh one-time sign-in link, same as `conductor open`; use `conductor start --no-open` to just see the message). (v1 and v2 can run at the same time: they use different data folders, ports, cookies and launchd labels.)
+**"Conductor is already running".** Only one instance runs per data folder. `conductor start` then opens the running dashboard for you (use `conductor start --no-open` to just see the message). (v1 and v2 can run at the same time: they use different data folders, ports and launchd labels.)
 
 **The page says `UI file index.html is missing` (or looks broken) although you just installed.** An older Conductor is still running from a folder that has since been moved, deleted or replaced, and it is holding the port. Run `conductor stop --port 4327` (use the port from the "already running" message). It stops that process only if it really is a Conductor server of yours, and leaves anything else alone. Then run `conductor start` again. (If you prefer, `ps -p <pid> -o command=` shows what a pid is, and `kill <pid>` stops it.)
 
@@ -58,7 +56,11 @@
 
 
 
-**Cursor CLI hangs / prints nothing.** Conductor kills silent agents after 15 minutes and retries once; run `agent update`. A run that still fails goes to **Needs you** with the reason.
+**A card sits in "Stuck resolver".** Complete auto is the default run mode for a new install, but an install whose config already existed stays on Per settings until you switch, and the resolver runs only under Complete auto: check the run-mode control first. Under Complete auto the resolver already tried (the card shows its analysis). It is bounded (3 runs per card, 12 per hour) and never turns a safety check off, so what remains needs you or an outside change: fix the cause, then press **Retry** (a person restart gives it a fresh resolver budget). Under Per settings the resolver does not run.
+
+**A Done card does not become Pushed.** Open the card: it says why it was not pushed. Common causes: Complete auto consent not accepted yet (accept the confirmation once), no push remote or `pushRemote` set to none, your git name looks like an agent, a commit of your own below it, or a secret-looking value. **Retry** runs Ship again; **Unblock dependants** lets waiting cards start. It was pushed to a `conductor/…` branch? Your checked-out branch was protected, the remote default, detached, or had moved on.
+
+**Cursor CLI hangs / prints nothing.** Conductor kills silent agents after 15 minutes and retries once; run `agent update`. A run that still fails goes to **Stuck resolver** with the reason.
 
 **"Isolation check failed".** The Claude session had tools/MCP servers it should not have (a CLI update changed flags?). Run `conductor doctor --isolation` and share the output.
 

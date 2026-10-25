@@ -1,4 +1,3 @@
-import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,7 +38,6 @@ const HELP = `Conductor ${VERSION} — a board → Claude plans → Cursor build
 Usage: conductor <command>
 
   start              run Conductor and open the dashboard (default)
-  open               open a fresh signed-in dashboard tab (when it is already running)
   stop               stop the running Conductor   [--port <n> stops the Conductor listening on that port] [--force]
   restart            stop it and start it again   [--no-open] [--port <n>]
   update             update to the latest release   [--check only reports]
@@ -78,25 +76,6 @@ function openBrowser(url: string): void {
 const WINDOWS_NOTICE = `Windows support is EXPERIMENTAL. The dashboard runs, but registering repositories, running gates and launching the claude / agent CLIs are not ported yet.
 For the full product use WSL2 (install and run Conductor inside it) or a Mac.\n`;
 
-function controlRequest(path: string, method: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ socketPath: paths.control(), path, method, timeout: 5000 }, (res) => {
-      let b = '';
-      res.on('data', (c) => (b += c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(b));
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.end();
-  });
-}
-
 const mark = (l: 'ok' | 'warn' | 'fail') => (l === 'ok' ? '✓' : l === 'warn' ? '!' : '✗');
 
 async function main(): Promise<void> {
@@ -110,8 +89,6 @@ async function main(): Promise<void> {
       return void console.log(VERSION);
     case 'start':
       return start();
-    case 'open':
-      return openCmd();
     case 'stop':
       return stopCmd();
     case 'restart':
@@ -180,8 +157,7 @@ async function start(): Promise<void> {
   } catch (e) {
     if (e instanceof LockHeldError) {
       console.log(e.message);
-      if (!flag('--no-open') && openBrowserSetting()) await openRunning();
-      console.log('Open the dashboard with:  conductor open');
+      if (!flag('--no-open') && openBrowserSetting() && e.info.port) openBrowser(`http://127.0.0.1:${e.info.port}/`);
       process.exit(0);
     }
     throw e;
@@ -208,15 +184,14 @@ async function start(): Promise<void> {
     // S11 / code review N2: a run folder that is not private ⇒ NO control socket (the dashboard still starts); `conductor accounts` then refuses
     // (its direct mode cannot take the lock this server holds), so there is never a second config writer
     log.warn(`control socket not opened: ${errMsg(e)}`);
-    console.error(`Note: the control socket was not opened (${errMsg(e)}). \`conductor open\` and \`conductor accounts\` cannot reach this server until the folder is fixed.`);
+    console.error(`Note: the control socket was not opened (${errMsg(e)}). \`conductor accounts\` cannot reach this server until the folder is fixed.`);
   }
   rt.engine.start();
   rt.warmUp(); // R2-N1: one background zero-quota health read, so a headless start discovers models too
-  const loginTarget = rt.server.loginFile(paths.runtime()) || rt.server.loginUrl();
-  const url = `http://127.0.0.1:${port}`;
-  console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C. Reopen the dashboard any time with:  conductor open\n`);
+  const url = `http://127.0.0.1:${port}/`;
+  console.log(`\nConductor ${VERSION} is running → http://127.0.0.1:${port}\nHome: ${paths.home()}\nStop with Ctrl+C.\n`);
   if (process.platform === 'win32') console.log(WINDOWS_NOTICE);
-  if (!flag('--no-open') && cfg.ui.openBrowser) openBrowser(loginTarget);
+  if (!flag('--no-open') && cfg.ui.openBrowser) openBrowser(url);
   const shutdown = async (sig: string) => {
     log.info(`${sig}: shutting down`);
     try {
@@ -308,21 +283,6 @@ function openBrowserSetting(): boolean {
   }
 }
 
-/** Another Conductor is already running: ask it for a fresh one-time sign-in link and open it, like `conductor open`. Never throws. */
-async function openRunning(): Promise<void> {
-  try {
-    if (!existsSync(paths.control())) {
-      console.log('Its control socket is not available here, so a fresh sign-in link cannot be made. Use the link printed when it started.');
-      return;
-    }
-    const r = await controlRequest('/otp', 'POST');
-    openBrowser(r.file || r.url);
-    if (process.env.CONDUCTOR_NO_OPEN !== '1') console.log('Opened the dashboard in your browser (the sign-in link works once).');
-  } catch (e) {
-    console.log(`Could not reach the running Conductor: ${errMsg(e)}`);
-  }
-}
-
 function portOption(): number | null | undefined {
   const raw = opt('--port');
   if (raw === undefined) return undefined;
@@ -357,22 +317,6 @@ async function updateCmd(): Promise<void> {
   const r = await runUpdate({ check: flag('--check') }, { appDir: ROOT_DIR, version: VERSION, env: process.env }, realUpdateDeps());
   for (const l of r.lines) console.log(l);
   process.exit(r.code);
-}
-
-async function openCmd(): Promise<void> {
-  const info = readLock();
-  if (!info || !existsSync(paths.control())) {
-    console.error('Conductor is not running. Start it with:  conductor start');
-    process.exit(1);
-  }
-  try {
-    const r = await controlRequest('/otp', 'POST');
-    openBrowser(r.file || r.url);
-    console.log('Opened the dashboard in your browser (the sign-in link works once).');
-  } catch (e) {
-    console.error(`Could not reach the running Conductor: ${errMsg(e)}`);
-    process.exit(1);
-  }
 }
 
 async function demo(): Promise<void> {
@@ -471,7 +415,7 @@ async function service(): Promise<void> {
     const r = await installService(cfg, { dryRun: flag('--dry-run') });
     if (flag('--dry-run')) {
       console.log(`# Would write ${r.path}\n${r.plist}`);
-    } else console.log(`Installed ${r.path}. Conductor now starts at login and restarts if it stops.\nDashboard: conductor open`);
+    } else console.log(`Installed ${r.path}. Conductor now starts at login and restarts if it stops.`);
     for (const n of r.notes) console.log(` ! ${n}`);
     return;
   }

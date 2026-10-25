@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, makeHarness, makeRepo, TestClock } from './helpers/harness.ts';
 import { Effects } from '../src/pipeline/effects.ts';
@@ -190,8 +190,11 @@ test('crash recovery: a run that was mid-build restarts cleanly without duplicat
     await h.settle();
     const after = h.run(key);
     assert.equal(after.status, 'ready');
-    assert.ok(!git(after.worktree, 'ls-files').includes('partial.mjs'), 'partial work was discarded (and backed up)');
-    assert.ok(git(after.worktree, 'for-each-ref', '--format=%(refname)', `refs/conductor-v2/${key}/`).includes('stash-'), 'partial work is recoverable');
+    // Builds run in their own detached directories, so uncommitted files in the repository's own checkout belong to the PERSON: they are never
+    // discarded, stashed or cleaned (the run still completes; the merge only refuses a path the incoming commit also changes)
+    assert.ok(!git(after.worktree, 'ls-files').includes('partial.mjs'), 'the untracked file was not committed');
+    assert.ok(existsSync(join(after.worktree, 'partial.mjs')), 'the person\'s untracked file is still in the checkout');
+    assert.equal(readFileSync(join(after.worktree, 'partial.mjs'), 'utf8'), 'half-written\n');
     const plans = (await comments(h, key)).filter((c) => c.includes('Conductor plan'));
     assert.equal(plans.length, 1);
   } finally {

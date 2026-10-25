@@ -19,11 +19,12 @@ import { scanBranchForSecrets } from '../git/branchscan.ts';
 import type { StageKey } from '../board/lanes.ts';
 import type { WorkItem } from '../board/index.ts';
 import { Effects } from './effects.ts';
-import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectiveFixtureRewrite, effectivePolicy, effectiveLiftsHolds } from '../policy/policy.ts';
+import { EMPTY_ATTEMPT_NOTE } from './selfheal.ts';
+import { decideApproval, decidedByRunMode, effectiveFirstPlanHold, effectiveFixtureRewrite, effectiveHeal, effectivePolicy, effectiveLiftsHolds } from '../policy/policy.ts';
 import { projectKeyOf } from '../context/service.ts';
 import { buildGraph, graphBudgets, isGraphPlan, itemsOf, sanitizeLine, topoOrder, validateTaskGraph } from './graph.ts';
 import { GraphBuilder } from './graph-build.ts';
-import { exemptPaths, postBuildChecks, runBuild } from './envelope.ts';
+import { exemptPaths, postBuildChecks, runBuild, type BuildInput } from './envelope.ts';
 import { providerLabel } from '../agents/providers/registry.ts';
 import type { ProviderId } from '../agents/providers/types.ts';
 import type { Role } from '../agents/roles.ts';
@@ -34,6 +35,8 @@ import { DEFAULT_ACCOUNT, type AccountRef } from '../accounts/types.ts';
 import type { PipelineCtx } from './context.ts';
 import { ITEM_NOTE_SCHEMA, PLAN_REVIEW_SCHEMA, PLAN_SCHEMA, VERDICT_SCHEMA } from './schemas.ts';
 import { conventionsBlock, fence, loadTemplate, planToMarkdown, preamble, render, taskBlock } from './prompts.ts';
+import { resolve as resolveStuck, type ResolverHost } from './resolver.ts';
+import { RESOLVER_SCHEMA } from './schemas.ts';
 
 const log = logger('stages');
 const PROTECTED = '.claude/**, .cursor/**, .codex/**, .agents/**, .mcp.json, AGENTS.md, agents.override.md, CLAUDE.md, GEMINI.md, .github/**, .husky/**, .git*, .techteam/**, .conductor/**';
@@ -106,7 +109,7 @@ export class Stages {
       repo: (r) => this.repo(r),
       patch: (k, fn) => this.patch(k, fn),
       note: (k, st, t) => this.note(k, st, t),
-      toNeedsHuman: (k, reason, origin, comment) => this.toNeedsHuman(k, reason, origin, comment),
+      toNeedsHuman: (k, reason, origin, comment, cause) => this.toNeedsHuman(k, reason, origin, comment, cause),
       pauseForLimit: (k, l, role) => this.onLimitHit(k, l, role),
       finishSession: (k, res) => this.finishSession(k, res),
       refundIfLimit: (k, res) => this.refundIfLimit(k, res),
@@ -116,6 +119,8 @@ export class Stages {
       hasUncommitted: (wt) => this.hasUncommitted(wt),
       writePromptAudit: (k, name, text) => this.writePromptAudit(k, name, text),
       runsLimit: (r) => this.runsLimit(r),
+      scopeRevertHook: (k, listed) => this.scopeRevertHook(k, listed),
+      land: (k, repoPath, sha) => this.land(k, repoPath, sha),
       callAnalysis: async (k, prompt, role, label) => {
         const called = await this.callReadOnly(k, 'plan', prompt, ITEM_NOTE_SCHEMA, this.run(k).worktree, (j) => validateSchema(ITEM_NOTE_SCHEMA, j), { role, label, defer: true });
         return called.kind === 'ok' ? { kind: 'ok', json: called.json } : { kind: 'stop', hold: called.hold };
@@ -160,10 +165,60 @@ export class Stages {
     return extra.length ? `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. Review them (they are committed on the branch), then continue.` : null;
   }
 
+  /**
+   * C2: what the envelope may do when a build touched protected files the plan did not list. Complete auto only, a reviewed (non
+   * fast-path) plan only, once per run. `allow` reserves the budget at once (parallel graph items share it); a failed revert still parks.
+   */
+  scopeRevertHook(key: string, listed: string[]): NonNullable<BuildInput['scopeRevert']> {
+    return {
+      key,
+      listed,
+      allow: () => {
+        const r = this.run(key);
+        if (r.fastPath || !effectiveHeal(this.c.cfg(), 'scope_revert', r.scopeRevertsUsed)) return false;
+        this.patch(key, (x) => void (x.scopeRevertsUsed = (x.scopeRevertsUsed ?? 0) + 1));
+        return true;
+      },
+      onReverted: ({ paths, backupRef, originalSha }) => {
+        this.recordLanded(key, [originalSha]);
+        const secrets = this.c.secretsFor(this.run(key));
+        const list = redact(paths.slice(0, 6).join(', '), secrets);
+        const text = `Complete auto reverted files the plan did not list (${list}). The build's original commit is kept as ${backupRef} in the repository.`;
+        this.patch(key, (r) => {
+          r.history.push({ ts: this.c.clock.now(), text });
+          Effects.enqueue(r, `scope-revert:${r.scopeRevertsUsed ?? 1}`, { kind: 'comment', payload: { body: `🤖 **Out-of-scope files reverted** — ${text}` } }, secrets);
+        });
+        this.note(key, 'build', text);
+        void this.c.effects.flush(key).catch(() => undefined);
+      },
+    };
+  }
+
+  /** Remember commits Conductor itself put on the checkout: Ship pushes only commits it can find here (anything else is somebody's own work). */
+  recordLanded(key: string, shas: readonly string[]): void {
+    const ok = shas.filter((x) => /^[0-9a-f]{40}$/.test(x));
+    if (!ok.length) return;
+    this.patch(key, (r) => {
+      const set = new Set(r.landedShas ?? []);
+      for (const x of ok) set.add(x);
+      r.landedShas = [...set].slice(-500);
+    });
+  }
+
+  /** `mergeOntoCurrent`, remembering every commit it lands (the chain it fast-forwards over, the commit itself, and the resulting tip). */
+  async land(key: string, repoPath: string, sha: string): Promise<Awaited<ReturnType<typeof W.mergeOntoCurrent>>> {
+    const pending = (await gitOk(repoPath, ['rev-list', '--max-count=200', sha, '--not', 'HEAD']).catch(() => '')).split('\n').map((x) => x.trim()).filter(Boolean);
+    const landed = await W.mergeOntoCurrent(repoPath, sha);
+    // `landed.sha` is the commit this build became (itself, or its cherry-pick) and never the checkout's HEAD, which may be the person's own commit
+    if (landed.ok) this.recordLanded(key, [...pending, sha, landed.sha]);
+    return landed;
+  }
+
   /** The agent-run budget of a run: a task graph scales it with the amount of work (never past the hard ceiling). */
   runsLimit(run: Run): number {
     const base = this.c.cfg().pipeline.maxAgentRunsPerIssue;
-    return run.graph ? graphBudgets(run.graph.items.length, base).runsLimit : base;
+    const extra = run.resolverExtended?.runs ?? 0; // the resolver's one bounded extension (a code constant, once per card)
+    return (run.graph ? graphBudgets(run.graph.items.length, base).runsLimit : base) + extra;
   }
 
   // ───────────────────────── helpers ─────────────────────────
@@ -209,11 +264,26 @@ export class Stages {
     this.c.notify(`${key} answered`, truncate(run.title, 80));
   }
 
-  async toNeedsHuman(key: string, reasonRaw: string, origin: NextStep, commentRaw?: string): Promise<void> {
+  /**
+   * THE choke point for every stop. Complete auto only, the Stuck resolver gets one look first (resolver.ts): an applied action leaves the
+   * run running/queued with `next` set and returns here WITHOUT any stuck card, comment or notification (callers `return` this call, so
+   * they do not continue their own flow). Anything else (not eligible, give_up, invalid, model failure) parks exactly as before, with the
+   * resolver's analysis appended. `cause` names what stopped the run when the caller knows it; otherwise it is recognised from the wording.
+   */
+  async toNeedsHuman(key: string, reasonRaw: string, origin: NextStep, commentRaw?: string, cause?: string): Promise<void> {
+    let analysis = '';
+    try {
+      const out = await resolveStuck(this.resolverHost(), key, { reason: reasonRaw, origin, ...(cause ? { cause } : {}) });
+      if (out.kind === 'applied' || out.kind === 'handled') return;
+      if (out.kind === 'declined') analysis = out.analysis;
+    } catch (e) {
+      log.warn(`${key}: resolver failed: ${errMsg(e)}`); // never blocks the park below
+    }
     const now = this.c.clock.now();
     const secrets = this.c.secretsFor(this.run(key));
     const reason = redact(reasonRaw, secrets); // agent/gate text can carry secrets into the UI, notifications and the board (H3)
-    const comment = commentRaw === undefined ? undefined : redact(commentRaw, secrets);
+    const comment0 = commentRaw === undefined ? undefined : redact(commentRaw, secrets);
+    const comment = analysis ? `${comment0 ?? reason}\n\n**Resolver analysis:** ${truncate(redact(analysis, secrets), 600)}` : comment0;
     const body = `🤖 **Conductor needs you**\n\n${comment ?? reason}\n\n_To retry: move this card back to **To do** (or use Retry in the dashboard). Anything you add as a comment is included in the next attempt._`;
     const run = this.patch(key, (r) => {
       r.status = 'needs_human';
@@ -226,6 +296,71 @@ export class Stages {
     });
     this.c.emit(key, { agent: 'conductor', stage: run.stage ?? 'engine', kind: 'error', text: `Needs human: ${reason}` });
     await this.c.effects.flush(key);
+    this.c.notify(`${key} needs you`, truncate(reason, 160));
+  }
+
+  /** Resolver calls across all cards in the last hour (in memory). */
+  private resolverHits: number[] = [];
+
+  /** The narrow view of the stage runner the resolver gets: no config writers, lanes, identity or push. */
+  private resolverHost(): ResolverHost {
+    const hits = this.resolverHits;
+    return {
+      cfg: () => this.c.cfg(),
+      run: (k) => this.run(k),
+      patch: (k, fn) => this.patch(k, fn),
+      now: () => this.c.clock.now(),
+      secrets: (r) => this.c.secretsFor(r),
+      scanEntries: (r) => this.c.scanEntriesFor(r),
+      repoPath: (r) => this.c.cfg().repos.find((x) => x.name === r.repo)?.path ?? null,
+      readArtifact: (k, name, fallback) => this.c.store.readArtifact(k, name, fallback),
+      call: async (k, prompt) => {
+        const run = this.run(k);
+        const called = await this.callReadOnly(k, 'plan', prompt, RESOLVER_SCHEMA, run.worktree, (j) => validateSchema(RESOLVER_SCHEMA, j), { role: 'planning', label: 'resolver', defer: true });
+        if (called.kind === 'ok') return { kind: 'ok', json: called.json };
+        const hold = called.hold;
+        if (!hold) return { kind: 'handled' }; // aborted
+        if (hold.type === 'human') return { kind: 'failed', reason: hold.reason };
+        await this.applyHold(k, hold); // a usage limit or a lost network is a real pause, not a stuck card
+        return { kind: 'handled' };
+      },
+      enginePaused: () => this.c.enginePaused?.() ?? false,
+      hourly: {
+        count: (now) => {
+          while (hits.length && now - hits[0]! >= 3_600_000) hits.shift();
+          return hits.length;
+        },
+        record: (now) => void hits.push(now),
+      },
+      pauseAccount: (ref, until, reason) => this.c.providerPause({ provider: ref.provider as ProviderId, id: ref.id }, until, reason),
+      runsLimit: (r) => this.runsLimit(r),
+      aborted: (k) => this.c.signal(k).aborted,
+      note: (k, text) => this.note(k, 'engine', text),
+    };
+  }
+
+  /**
+   * Crash recovery (`Engine.recover`): a run found with the resolver marker set was stopped mid-resolution. The counter is already spent,
+   * so the resolver does NOT run again for that event: the marker is cleared and the run parks as stuck, in one synchronous write.
+   */
+  async parkAfterResolverCrash(key: string): Promise<void> {
+    const r0 = this.c.store.get(key);
+    const marker = r0?.resolverActive;
+    if (!r0 || !marker) return;
+    const now = this.c.clock.now();
+    const secrets = this.c.secretsFor(r0);
+    const reason = 'Conductor stopped while the Stuck resolver was working on this card. The resolver does not run twice for the same stop, so it needs a person.';
+    const body = `🤖 **Conductor needs you**\n\n${reason}\n\n_To retry: move this card back to **To do** (or use Retry in the dashboard). Anything you add as a comment is included in the next attempt._`;
+    this.patch(key, (r) => {
+      r.resolverActive = undefined;
+      r.status = 'needs_human';
+      r.needsHuman = { reason, origin: marker.origin, at: now };
+      r.next = 'none';
+      r.history.push({ ts: now, text: `Needs you: ${reason}` });
+      Effects.enqueue(r, 'state', { kind: 'state', payload: { stage: 'needs_human' } }, secrets);
+      Effects.enqueue(r, `needs:${now}`, { kind: 'comment', payload: { body } }, secrets);
+    });
+    await this.c.effects.flush(key).catch(() => undefined);
     this.c.notify(`${key} needs you`, truncate(reason, 160));
   }
 
@@ -784,7 +919,7 @@ export class Stages {
     const review = called.json as PlanReview;
     this.c.store.writeArtifact(key, `review-${run.rev}.json`, review);
     const blocking = review.issues.filter((i) => i.severity === 'blocking');
-    const maxRounds = 1;
+    const maxRounds = Math.min(5, Math.max(1, Math.floor(Number((this.c.cfg().pipeline as { planReviewRounds?: number }).planReviewRounds ?? 3)) || 3));
     if (review.decision === 'changes_requested' && blocking.length && run.planReviewRounds < maxRounds) {
       const fb = blocking.map((i, n) => `${n + 1}. ${i.text}`).join('\n');
       this.patch(key, (r) => {
@@ -794,7 +929,7 @@ export class Stages {
         r.next = 'plan';
         r.history.push({ ts: this.c.clock.now(), text: `Plan review requested ${blocking.length} change(s); revising` });
       });
-      this.note(key, 'plan_review', `Plan review requested changes (${blocking.length}) — re-planning once.`);
+      this.note(key, 'plan_review', `Plan review requested changes (${blocking.length}) — re-planning (round ${run.planReviewRounds + 1} of ${maxRounds}).`);
       return;
     }
     this.patch(key, (r) => {
@@ -896,7 +1031,7 @@ export class Stages {
     if (head && head !== known && head !== run.baseSha && !(await this.hasUncommitted(run.worktree))) {
       const scope = await this.fastPathScopeProblem(run, plan, head);
       if (scope) return this.toNeedsHuman(key, scope, 'build');
-      const secretProblem = await postBuildChecks(run.worktree, run.baseSha, exemptPaths(run, plan), this.c.secretsFor(run), known);
+      const secretProblem = await postBuildChecks(run.worktree, run.baseSha, exemptPaths(run, plan), this.c.scanEntriesFor(run), known, { deferFixtureShapes: this.c.shipEffective() });
       if (secretProblem) {
         if (this.scheduleFixtureRewrite(key, secretProblem, head)) return;
         return this.toNeedsHuman(key, secretProblem, 'build');
@@ -908,7 +1043,9 @@ export class Stages {
       });
       return;
     }
-    if ((await this.hasUncommitted(run.worktree)) && !run.commitNote && !run.fixtureRewriteNote) {
+    // Builds run in their own detached directories, never in the person's checkout, so uncommitted changes in the repository's own checkout are
+    // the PERSON's. They are never backed up, reset or cleaned (the `reset --hard` + `clean -fd` below would delete their untracked files).
+    if ((await this.hasUncommitted(run.worktree)) && !run.commitNote && !run.fixtureRewriteNote && !(await W.isRepoCheckout(repo.path, run.worktree))) {
       // leftover partial work from an interrupted build: keep a recoverable copy, then start clean.
       // (A commit rejected by a repo hook leaves the previous build's files in place ON PURPOSE — fixed in place.)
       let refs: Awaited<ReturnType<typeof W.backupRefs>> | null = null;
@@ -925,6 +1062,8 @@ export class Stages {
     const baselineFailing = baseline ? baseline.results.filter((g) => g.exitCode !== 0).map((g) => g.name).join(', ') : '';
     const rewriteNote = run.fixtureRewriteNote;
     if (rewriteNote) this.patch(key, (r) => void (r.fixtureRewriteNote = undefined));
+    const emptyNote = run.emptyRetryNote;
+    if (emptyNote) this.patch(key, (r) => void (r.emptyRetryNote = undefined));
     const isFix = run.loop > 1 || run.bugs.some((b) => b.status === 'open') || !!rewriteNote;
     const commonVars = {
       ...(await this.projectBlocks(key, 'builder', plan.filesToChange.map((f) => f.path))),
@@ -938,7 +1077,7 @@ export class Stages {
     };
     let prompt: string;
     if (!isFix) {
-      prompt = render(loadTemplate('build'), { ...commonVars, feedback: '', baselineFailing });
+      prompt = render(loadTemplate('build'), { ...commonVars, feedback: emptyNote ? fence('retry-note', emptyNote, 600) : '', baselineFailing });
     } else {
       const prevLoop = run.loop - 1;
       const cmp = this.c.store.readArtifact<{ comparison: GateComparison } | null>(key, `gates-${prevLoop}.json`, null)?.comparison;
@@ -1008,6 +1147,9 @@ export class Stages {
       signal: this.c.signal(key),
       secrets,
       planPaths: exemptPaths(run, plan),
+      scopeRevert: this.scopeRevertHook(key, plan.filesToChange.map((f) => f.path)),
+      scanEntries: this.c.scanEntriesFor(run),
+      deferFixtureShapes: this.c.shipEffective(),
       onPrepared: (prep) => {
         this.patch(key, (r) => {
           r.guardSha = prep.guardSha ?? undefined;
@@ -1039,14 +1181,14 @@ export class Stages {
         // the builder may have committed by itself: accept real work instead of calling it "no changes"
         const headNow = await gitOk(buildWt, ['rev-parse', 'HEAD']).catch(() => '');
         if (headNow && headNow !== tip) {
-          const selfProblem = await postBuildChecks(buildWt, run.baseSha, exemptPaths(run, plan), secrets, tip);
+          const selfProblem = await postBuildChecks(buildWt, run.baseSha, exemptPaths(run, plan), this.c.scanEntriesFor(run), tip, { deferFixtureShapes: this.c.shipEffective() });
           if (selfProblem) {
             if (this.scheduleFixtureRewrite(key, selfProblem)) return;
             return this.toNeedsHuman(key, selfProblem, 'build');
           }
           const selfScope = await this.fastPathScopeProblem(run, plan, headNow);
           if (selfScope) return this.toNeedsHuman(key, selfScope, 'build');
-          const landed = await W.mergeOntoCurrent(repo.path, headNow);
+          const landed = await this.land(key, repo.path, headNow);
           if (!landed.ok) return this.toNeedsHuman(key, landed.detail, 'build');
           this.note(key, 'build', 'The builder committed its own work — keeping it and moving on to verification.');
           this.patch(key, (r) => {
@@ -1064,6 +1206,16 @@ export class Stages {
             await this.deliverAnswer(key, run.rev, answerText);
             return;
           }
+          if (effectiveHeal(this.c.cfg(), 'empty_attempt', run.emptyRetries)) {
+            this.patch(key, (r) => {
+              r.emptyRetries = (r.emptyRetries ?? 0) + 1;
+              r.emptyRetryNote = EMPTY_ATTEMPT_NOTE;
+              r.next = 'build';
+              r.history.push({ ts: this.c.clock.now(), text: 'Complete auto: the build changed nothing — running it once more with a clarifying note' });
+            });
+            this.note(key, 'build', 'The builder changed nothing. Complete auto is running it once more with a clarifying note.');
+            return;
+          }
           return this.toNeedsHuman(key, 'The builder finished without changing any files. The task may need to be clarified.', 'build');
         }
         return this.toNeedsHuman(key, 'The builder made no changes in response to the reported problems.', 'build');
@@ -1075,7 +1227,7 @@ export class Stages {
           const extra = out.files.filter((f) => !planSet.has(f));
           if (extra.length) return this.toNeedsHuman(key, `This fast-path change touched files the plan did not list: ${extra.slice(0, 6).join(', ')}. They were not merged onto the current branch.`, 'build');
         }
-        const landed = await W.mergeOntoCurrent(repo.path, out.sha);
+        const landed = await this.land(key, repo.path, out.sha);
         if (!landed.ok) return this.toNeedsHuman(key, landed.detail, 'build');
         this.patch(key, (r) => {
           r.commitSha = landed.sha;
@@ -1189,7 +1341,8 @@ export class Stages {
 
   private bugList(run: Run): string {
     const failOn = new Set(this.c.cfg().pipeline.failOn);
-    const open = run.bugs.filter((b) => b.status === 'open' && failOn.has(b.severity));
+    let open = run.bugs.filter((b) => b.status === 'open' && failOn.has(b.severity));
+    if (!open.length) open = run.bugs.filter((b) => b.status === 'open');
     if (!open.length) return '(none recorded — see the verifier summary)';
     return fence(
       'verifier-findings',
@@ -1244,6 +1397,17 @@ export class Stages {
     // 2) the diff the verifier reads
     const diff = await W.diffAgainst(run.worktree, run.baseSha);
     if (diff.files.length === 0) {
+      if (effectiveHeal(cfg, 'empty_attempt', run.emptyRetries)) {
+        // the empty-attempt budget is shared with the build stage: one more build, then stuck
+        this.patch(key, (r) => {
+          r.emptyRetries = (r.emptyRetries ?? 0) + 1;
+          r.emptyRetryNote = EMPTY_ATTEMPT_NOTE;
+          r.next = 'build';
+          r.history.push({ ts: this.c.clock.now(), text: 'Complete auto: there was nothing to verify — running the build once more with a clarifying note' });
+        });
+        this.note(key, 'verify', 'There was nothing to verify. Complete auto is running the build once more.');
+        return;
+      }
       return this.toNeedsHuman(key, 'There is nothing to verify: the branch has no changes compared with its base. The build may not have run — move the card back to To do to try again.', 'build');
     }
     this.c.store.writeArtifact(key, 'diffstat.txt', diff.stat);
@@ -1303,6 +1467,22 @@ export class Stages {
     if (!bugs.some((b) => failOn.has(b.severity))) {
       for (const a of verdict.acceptance) {
         if (a.status === 'not_met') bugs.push({ title: `Acceptance criterion not met: ${a.id}`, severity: 'major', evidence: a.evidence });
+      }
+    }
+    // A `fail` verdict whose only substance is unverifiable criteria or minor/nit findings: hand them to the builder as major bugs.
+    // Titles/files are kept (or derived only from the criterion id), so bugFingerprint is stable across loops and no card is duplicated.
+    if (verdict.verdict === 'fail' && !bugs.some((b) => failOn.has(b.severity))) {
+      const promoted = bugs.map((b) => (failOn.has(b.severity) ? b : { ...b, severity: 'major' as const }));
+      bugs.splice(0, bugs.length, ...promoted);
+      for (const a of verdict.acceptance) {
+        if (a.status === 'unverifiable') {
+          bugs.push({
+            title: `Acceptance criterion could not be verified: ${a.id}`,
+            severity: 'major',
+            evidence: a.evidence,
+            suggestedFix: 'Make the behaviour demonstrable (add or adjust a test, or make it observable) so the verifier can confirm it.',
+          });
+        }
       }
     }
     const failing = bugs.filter((b) => failOn.has(b.severity));

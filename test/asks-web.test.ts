@@ -120,7 +120,7 @@ test('web-ask API: a strict body (no repo, allowChange, brief, depth), code-rese
   try {
     h.scenario({ claude: { '*': { ask: [web('ok')] } } });
     const asks = await svc(h);
-    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, auth: {} as any, version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, } as any);
+    const api = new Api({ asks, engine: h.engine, store: h.store, board: h.board, csrf: 'x', version: 't', getConfig: () => h.cfg, saveConfig: () => undefined, persistent: () => ({ repos: {} }) as any, health: async () => ({}) as any, } as any);
     const call = (m: string, p: string, b: any = {}) => api.handle(m, p, new URLSearchParams(), b);
     for (const bad of [{ repo: 'x' }, { allowChange: true }, { brief: {} }, { depth: 'deep' }, { createdBy: 'user' }, { history: 'text' }]) await assert.rejects(call('POST', '/api/ask', { question: 'q', mode: 'web-ask', ...bad }), (e: any) => e.status === 400, JSON.stringify(bad));
     for (const bad of [{ follow: newAskId() }, { allowChange: true }, { brief: {} }, { depth: 'deep' }]) await assert.rejects(call('POST', '/api/ask', { question: 'q', mode: 'code-research', ...bad }), (e: any) => e.status === 400, JSON.stringify(bad));

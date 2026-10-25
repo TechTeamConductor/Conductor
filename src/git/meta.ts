@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { git, gitOk } from './exec.ts';
 
 /** Repo-local git settings that cause code execution or redirect pushes. Everything else in .git/config is ignored. */
-const DANGEROUS_KEY = /^(core\.(hookspath|fsmonitor|sshcommand|pager|editor|askpass|gitproxy|attributesfile|excludesfile)|alias\.|credential\.|url\.|include\.|includeif\.|filter\.|remote\..*\.(pushurl|url|proxy|receivepack|uploadpack)|diff\..*\.(command|textconv)|merge\..*\.driver|http\.|gpg\.|sequence\.editor|protocol\.|safe\.)/i;
+const DANGEROUS_KEY = /^(core\.(hookspath|fsmonitor|sshcommand|pager|editor|askpass|gitproxy|attributesfile|excludesfile)|alias\.|credential\.|url\.|include\.|includeif\.|filter\.|remote\..*\.(pushurl|url|proxy|receivepack|uploadpack|vcs|push)|push\.|diff\..*\.(command|textconv)|merge\..*\.driver|http\.|gpg\.|sequence\.editor|protocol\.|safe\.|user\.)/i;
 
 export interface GitMeta {
   gitDir: string;
@@ -48,6 +48,18 @@ async function readHooks(gitDir: string): Promise<Map<string, Buffer>> {
 export async function snapshotGitMeta(repo: string): Promise<GitMeta> {
   const gitDir = await gitOk(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
   return { gitDir, repo, config: await readConfig(repo), hooks: await readHooks(gitDir) };
+}
+
+/** Names what differs between two snapshots (nothing changed or restored). Read-only: Ship uses it to refuse a push when something moved. */
+export function diffGitMeta(a: GitMeta, b: GitMeta): string[] {
+  const out: string[] = [];
+  for (const k of new Set([...a.config.keys(), ...b.config.keys()])) if ((a.config.get(k) ?? []).join('\0') !== (b.config.get(k) ?? []).join('\0')) out.push(`git config ${k}`);
+  for (const f of new Set([...a.hooks.keys(), ...b.hooks.keys()])) {
+    const x = a.hooks.get(f);
+    const y = b.hooks.get(f);
+    if (!x || !y || !x.equals(y)) out.push(`.git/hooks/${f}`);
+  }
+  return out;
 }
 
 /** Compare to the snapshot, UNDO every difference, and return what was changed (empty = nothing happened). */

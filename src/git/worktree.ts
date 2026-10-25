@@ -14,6 +14,7 @@ import { conductorHome } from '../paths.ts';
 import { looksSecret, loadEnvSecrets, redact } from '../redact.ts';
 import { sha256, tail } from '../util.ts';
 import { git, gitOk, GitError, run, safeEnv } from './exec.ts';
+import { testOrFixturePath } from './fixture-hold.ts';
 
 // ───────────────────────────── small helpers ─────────────────────────────
 
@@ -467,15 +468,76 @@ export async function removeDetachedBuild(repoRoot: string, dest: string): Promi
   await withRepoLock(root, () => removeDetachedUnlocked(root, dest));
 }
 
-/** Porcelain lines that are only Conductor replacing a tracked `.conductor` link, or its own `.cursor` guard, do not block a merge. */
-function checkoutDirtBlocksMerge(porcelain: string): boolean {
-  for (const line of porcelain.split('\n')) {
-    if (!line.trim()) continue;
-    const path = line.slice(3).replace(/^"|"$/g, '');
-    if (path === '.conductor' || path.startsWith('.conductor/') || path === '.cursor' || path.startsWith('.cursor/')) continue;
-    return true;
+export interface DirtyEntry {
+  /** Index column (staged state) and work-tree column of `git status --porcelain`. */
+  x: string;
+  y: string;
+  path: string;
+  /** Rename/copy source. */
+  from?: string;
+}
+
+/** Parse `git status --porcelain -z` (renames carry the source as the next field). Never trims or unquotes: paths are raw. */
+export function parsePorcelainZ(out: string): DirtyEntry[] {
+  const f = out.split('\0');
+  const entries: DirtyEntry[] = [];
+  for (let i = 0; i < f.length; i++) {
+    const rec = f[i]!;
+    if (rec.length < 4) continue;
+    const x = rec[0]!;
+    const y = rec[1]!;
+    const path = rec.slice(3);
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') {
+      entries.push({ x, y, path, from: f[i + 1] ?? '' });
+      i++;
+    } else entries.push({ x, y, path });
   }
-  return false;
+  return entries;
+}
+
+function conductorOwned(path: string): boolean {
+  return path === '.conductor' || path.startsWith('.conductor/') || path === '.cursor' || path.startsWith('.cursor/');
+}
+
+const foldPath = (p: string): string => p.normalize('NFC').toLowerCase().replace(/\/+$/, '');
+
+/**
+ * The first dirty path of the checkout that the incoming commits would touch, or null when the merge cannot collide.
+ * Only Conductor's own `.conductor`/`.cursor` entries are exempt. A STAGED change (index column) always blocks: an index
+ * entry can make a fast-forward or cherry-pick refuse or fold unrelated state into the result. Work-tree-only edits and
+ * untracked files block only when they are the same path as, inside, or a parent directory of an incoming path
+ * (NFC-normalised, case-insensitive). Conductor never stashes, resets or deletes the user's files.
+ */
+export function dirtCollides(entries: readonly DirtyEntry[], incoming: ReadonlySet<string>): string | null {
+  const inc = [...incoming].map(foldPath);
+  const hits = (p: string): boolean => {
+    const d = foldPath(p);
+    return inc.some((i) => i === d || i.startsWith(d + '/') || d.startsWith(i + '/'));
+  };
+  for (const e of entries) {
+    const paths = [e.path, ...(e.from ? [e.from] : [])];
+    if (paths.every(conductorOwned)) continue;
+    if (e.x === '!' ) continue;
+    const staged = e.x !== ' ' && e.x !== '?';
+    if (staged || e.x === 'U' || e.y === 'U') return e.path;
+    for (const p of paths) if (!conductorOwned(p) && hits(p)) return p;
+  }
+  return null;
+}
+
+/** Every path any commit in `merge-base(HEAD, sha)..sha` changes, deletions and both sides of renames included. Null = could not tell. */
+async function incomingPaths(root: string, sha: string): Promise<Set<string> | null> {
+  const mb = await git(root, ['merge-base', 'HEAD', sha]);
+  const range = mb.code === 0 && mb.stdout.trim() ? [`${mb.stdout.trim()}..${sha}`] : [sha];
+  const list = await git(root, ['rev-list', '--reverse', ...range]);
+  if (list.code !== 0) return null;
+  const out = new Set<string>();
+  for (const c of list.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
+    const d = await git(root, ['diff-tree', '-r', '-m', '--root', '--no-commit-id', '--name-only', '--no-renames', '-z', c], { maxBytes: 16 * 1024 * 1024 });
+    if (d.code !== 0 || d.stdoutTruncated) return null;
+    for (const p of d.stdout.split('\0')) if (p) out.add(p);
+  }
+  return out;
 }
 
 /**
@@ -491,9 +553,16 @@ export async function mergeOntoCurrent(repoRoot: string, sha: string): Promise<{
     if (branch.code !== 0 || !branch.stdout.trim()) return { ok: false, detail: 'the checkout is not on a branch, so this build was not merged' };
     const name = branch.stdout.trim();
     const anc = await git(root, ['merge-base', '--is-ancestor', sha, 'HEAD']);
-    if (anc.code === 0) return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
-    const dirty = (await gitOk(root, ['status', '--porcelain'])).trim();
-    if (checkoutDirtBlocksMerge(dirty)) return { ok: false, detail: `the current checkout has uncommitted changes, so this build was not merged onto ${name}` };
+    if (anc.code === 0) return { ok: true, sha }; // already there: report THE COMMIT, never HEAD (HEAD may be a commit the person made on top)
+    const st = await git(root, ['status', '--porcelain', '-z', '--untracked-files=all'], { maxBytes: 16 * 1024 * 1024 });
+    if (st.code !== 0 || st.stdoutTruncated) return { ok: false, detail: `the current checkout's state could not be read, so this build was not merged onto ${name}` };
+    const entries = parsePorcelainZ(st.stdout);
+    if (entries.some((e) => !(conductorOwned(e.path) && (!e.from || conductorOwned(e.from))))) {
+      const incoming = await incomingPaths(root, sha);
+      if (!incoming) return { ok: false, detail: `the changes in this build could not be listed, so it was not merged onto ${name}` };
+      const hit = dirtCollides(entries, incoming);
+      if (hit) return { ok: false, detail: `the current checkout has uncommitted changes to ${JSON.stringify(hit)}, which this build also changes, so it was not merged onto ${name}` };
+    }
     const cfg = ['-c', 'commit.gpgsign=false'];
     const nm = await git(root, ['config', '--get', 'user.name']);
     const em = await git(root, ['config', '--get', 'user.email']);
@@ -506,7 +575,7 @@ export async function mergeOntoCurrent(repoRoot: string, sha: string): Promise<{
     if (picked.code !== 0) {
       const text = `${picked.stdout}\n${picked.stderr}`;
       await git(root, ['cherry-pick', '--abort']);
-      if (/empty/i.test(text)) return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
+      if (/empty/i.test(text)) return { ok: true, sha }; // the changes are already on the branch; again the build's own commit, not HEAD
       return { ok: false, detail: `merging this build onto ${name} conflicted; the other files on that branch were left as they are` };
     }
     return { ok: true, sha: (await gitOk(root, ['rev-parse', 'HEAD'])).trim() };
@@ -650,6 +719,8 @@ export async function commitAll(o: {
   secrets?: string[];
   /** Additive: commit (hook) timeout; default 5 minutes. */
   commitTimeoutMs?: number;
+  /** Auto push in effect: credential-shaped text in test/fixture paths does not refuse the LOCAL commit (Ship's scan catches it). Nothing else changes. */
+  deferFixtureShapes?: boolean;
 }): Promise<CommitResult> {
   const wt = o.worktree;
   const maxFileBytes = o.maxFileBytes ?? 5 * 1024 * 1024;
@@ -705,7 +776,7 @@ export async function commitAll(o: {
         for (const p of files) bad.add(p);
       } else {
         for (const [path, added] of addedTextByFile(patch.stdout)) {
-          if (looksSecret(added)) {
+          if (looksSecret(added) && !(o.deferFixtureShapes && testOrFixturePath(path))) {
             problems.push(`secret-looking content in added lines: ${path}`);
             bad.add(path);
           }
@@ -874,6 +945,96 @@ export function diffScopeViolations(files: string[], allowedPaths: string[]): st
   return out;
 }
 
+// ───────────────────────────── C2: revert out-of-scope paths ─────────────────────────────
+
+interface RawEntry {
+  status: string;
+  srcMode: string;
+  dstMode: string;
+  paths: string[];
+}
+
+/** `git diff --raw -z -M` records: `:src dst srcsha dstsha STATUS\0path[\0path2]\0`. */
+function parseRawZ(out: string): RawEntry[] {
+  const f = out.split('\0');
+  const res: RawEntry[] = [];
+  for (let i = 0; i < f.length; i++) {
+    const head = f[i]!;
+    if (!head.startsWith(':')) continue;
+    const m = /^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])\d*$/.exec(head);
+    if (!m) continue;
+    const two = m[3] === 'R' || m[3] === 'C';
+    res.push({ status: m[3]!, srcMode: m[1]!, dstMode: m[2]!, paths: two ? [f[i + 1] ?? '', f[i + 2] ?? ''] : [f[i + 1] ?? ''] });
+    i += two ? 2 : 1;
+  }
+  return res;
+}
+
+function revertablePath(p: string): boolean {
+  if (!p || p.startsWith('/') || p.includes('\0') || p.includes('\\')) return false;
+  const segs = p.split('/');
+  return !segs.some((s) => s === '' || s === '.' || s === '..' || s.toLowerCase() === '.git');
+}
+
+/**
+ * Put `paths` (and the other side of any rename that involves one of them) back to what `base` had, in `worktree`, and stage the
+ * result. Added paths are removed, modified/deleted ones are restored, a rename source is restored and its target removed. Nothing
+ * is committed here. Refuses (changes nothing) for symlinks, submodule links, type changes, odd paths, a worktree that is the
+ * repository's own checkout, or a path that escapes the worktree.
+ */
+export async function revertPathsTo(
+  worktree: string,
+  base: string,
+  paths: readonly string[],
+  opts: { repoRoot: string },
+): Promise<{ ok: true; reverted: string[] } | { ok: false; detail: string }> {
+  assertRev(base, 'base');
+  const top = await realpath(await topLevel(worktree));
+  if (top === (await realpath(opts.repoRoot))) return { ok: false, detail: 'refusing to revert files in the repository checkout itself' };
+  const raw = await git(top, ['diff', '--raw', '-z', '-M', '--no-color', '--no-ext-diff', base, 'HEAD'], { maxBytes: 16 * 1024 * 1024 });
+  if (raw.code !== 0 || raw.stdoutTruncated) return { ok: false, detail: 'the changed files could not be listed' };
+  const want = new Set(paths);
+  const todo: { op: 'remove' | 'restore'; path: string }[] = [];
+  const seen = new Set<string>();
+  for (const e of parseRawZ(raw.stdout)) {
+    if (!e.paths.some((p) => want.has(p))) continue;
+    if (e.status === 'T') return { ok: false, detail: `${e.paths[0]} changed type, so it is not reverted automatically` };
+    if ([e.srcMode, e.dstMode].some((m) => m === '120000' || m === '160000')) return { ok: false, detail: `${e.paths[e.paths.length - 1]} is a symlink or submodule link, so it is not reverted automatically` };
+    const add = (op: 'remove' | 'restore', p: string): void => {
+      if (!seen.has(p)) {
+        seen.add(p);
+        todo.push({ op, path: p });
+      }
+    };
+    if (e.status === 'A') add('remove', e.paths[0]!);
+    else if (e.status === 'R') {
+      add('restore', e.paths[0]!);
+      add('remove', e.paths[1]!);
+    } else if (e.status === 'C') add('remove', e.paths[1]!);
+    else add('restore', e.paths[0]!); // M, D
+  }
+  for (const w of want) if (!seen.has(w)) return { ok: false, detail: `${w} is not part of the build's changes` };
+  for (const t of todo) {
+    if (!revertablePath(t.path)) return { ok: false, detail: `the path ${JSON.stringify(t.path)} is not one Conductor will revert automatically` };
+    const parent = await realpathLoose(dirname(join(top, t.path)));
+    if (parent !== top && !parent.startsWith(top + sep)) return { ok: false, detail: `the path ${JSON.stringify(t.path)} leads outside the build directory` };
+    try {
+      const st = await lstat(join(top, t.path));
+      if (st.isSymbolicLink()) return { ok: false, detail: `${t.path} is a symlink, so it is not reverted automatically` };
+    } catch {
+      /* absent is fine (deleted files are restored) */
+    }
+  }
+  for (const t of todo) {
+    const r =
+      t.op === 'remove'
+        ? await git(top, ['--literal-pathspecs', 'rm', '-f', '-q', '--', t.path])
+        : await git(top, ['--literal-pathspecs', 'checkout', base, '--', t.path]);
+    if (r.code !== 0) return { ok: false, detail: `could not revert ${t.path}: ${tail(r.stderr.trim(), 200)}` };
+  }
+  return { ok: true, reverted: todo.map((t) => t.path) };
+}
+
 // ───────────────────────────── backup refs (C5) + resets ─────────────────────────────
 
 async function putRef(cwd: string, base: string, sha: string, same: (existingSha: string) => Promise<boolean>): Promise<string> {
@@ -966,10 +1127,26 @@ export async function backupRefs(worktree: string, key: string, rev: number): Pr
   return { headRef, stashRef };
 }
 
-/** `reset --hard` + `clean -fd`. Ignored files (node_modules, copied env files, .conductor/) survive. Call `backupRefs` FIRST. */
+/** True when `worktree` is a repository's MAIN working tree (the person's own checkout), not a linked worktree. */
+export async function isMainCheckout(worktree: string): Promise<boolean> {
+  try {
+    const dir = (await git(worktree, ['rev-parse', '--path-format=absolute', '--git-dir'])).stdout.trim();
+    const common = (await git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim();
+    if (!dir || !common) return true; // cannot tell: treat as the person's
+    return (await realpath(dir)) === (await realpath(common));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * `reset --hard` + `clean -fd`. Ignored files (node_modules, copied env files, .conductor/) survive. Call `backupRefs` FIRST.
+ * NEVER on a repository's own (main) checkout: those are the person's files, untracked ones included. The guard lives here so no caller can skip it.
+ */
 export async function resetToCommit(worktree: string, sha: string): Promise<void> {
   assertRev(sha, 'commit');
   const top = await topLevel(worktree);
+  if (await isMainCheckout(top)) throw new GitError('refusing to reset or clean a repository’s own checkout', 1, '', ['reset', '--hard']);
   const commit = await resolveCommit(top, sha);
   await gitOk(top, ['reset', '--hard', '-q', commit]);
   await gitOk(top, ['clean', '-fdq']);

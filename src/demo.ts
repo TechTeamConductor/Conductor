@@ -72,7 +72,7 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
     ui: { port: opts.port ?? 4318, openBrowser: false },
     repos: [{ name: 'demo-app', path: repoDir, baseBranch: 'main', gates: [{ name: 'test', cmd: 'node --test', kind: 'test' }], copyFiles: [], envPassthrough: [] }],
     agents: { claude: { bin: fc, isolation: 'safe-mode', maxTurns: { plan: 40, review: 25, verify: 40 } }, cursor: { bin: fa } },
-    pipeline: { ...defaultConfig().pipeline, planApproval: 'first', planReview: 'always', timeoutsMin: { plan: 3, review: 3, build: 5, verify: 3, idle: 2, gate: 3 } },
+    pipeline: { ...defaultConfig().pipeline, runMode: 'per-settings', planApproval: 'first', planReview: 'always', timeoutsMin: { plan: 3, review: 3, build: 5, verify: 3, idle: 2, gate: 3 } },
     worktreeRoot: join(home, 'worktrees'),
   });
   const project = board.createProject({ key: 'DEMO', name: 'Demo app', repo: 'demo-app' });
@@ -109,7 +109,7 @@ export async function startDemo(opts: { port?: number; pollMs?: number; delayMs?
     rt,
     board,
     home,
-    url: rt.server.loginUrl(),
+    url: `http://127.0.0.1:${port}/`,
     async close() {
       await rt.close();
       board.close();
