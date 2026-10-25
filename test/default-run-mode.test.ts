@@ -2,7 +2,7 @@
 // the default never records the push consent (nothing is pushed until the one-time confirm).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultConfig, loadConfig, normalizeConfig, saveConfig, toSettings } from '../src/config.ts';
@@ -87,6 +87,7 @@ test('text: the confirm, the banner and the docs say Complete auto is the defaul
   }
   assert.match(readFileSync(join(ROOT, 'ui/app.js'), 'utf8'), /Complete auto is on by default[^']*Nothing is pushed until you confirm once[^']*Per settings/);
   for (const f of ['README.md', 'docs/GUIDE.md', 'docs/ARCHITECTURE.md', 'docs/API.md', 'docs/TROUBLESHOOTING.md', 'AGENTS.md', 'CLAUDE.md']) {
+    if (!existsSync(join(ROOT, f))) continue; // CLAUDE.md is gitignored (local only), so it is absent in CI
     const t = readFileSync(join(ROOT, f), 'utf8');
     assert.match(t, /Complete auto is (on )?(the )?default|on by default/i, f);
     assert.doesNotMatch(t, /Complete auto[^.\n]{0,40}\b(opt-in|safe)\b|\b(opt-in|safe)\b[^.\n]{0,40}Complete auto/i, f);
