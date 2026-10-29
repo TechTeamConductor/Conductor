@@ -13,7 +13,7 @@
     "dist:win": "node build-app.mjs && electron-builder --win nsis --config electron-builder.json"
   },
   "devDependencies": {
-    "electron": "44.9.2",
+    "electron": "45.0.0",
     "electron-builder": "26.15.3"
   }
 }
